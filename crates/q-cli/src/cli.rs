@@ -63,6 +63,7 @@ fn is_command(word: &str) -> bool {
             | "reopen"
             | "project"
             | "mcp"
+            | "skill"
             | "help"
     )
 }
@@ -111,6 +112,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--body-file"
             | "--to"
             | "--artifact"
+            | "--target"
             | "--capability"
             | "--capabilities"
             | "--allowed-kind"
@@ -312,6 +314,24 @@ pub enum Commands {
     },
     /// Serve the queue as an MCP server on stdio.
     Mcp,
+    /// Print or install the agent skill for q.
+    Skill {
+        #[command(subcommand)]
+        command: Option<SkillCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Install the q skill into common agent skill directories.
+    Install {
+        /// Limit install to agents, claude, cursor, codex, or all. Repeatable. Default: all.
+        #[arg(long = "target", value_name = "NAME")]
+        target: Vec<String>,
+        /// Accepted for scripts. Existing SKILL.md files are overwritten either way.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -349,6 +369,17 @@ mod tests {
                 "research"
             ]
         );
+    }
+
+    #[test]
+    fn skill_is_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "skill".into(),
+            "install".into(),
+            "--target".into(),
+            "agents".into(),
+        ]);
+        assert_eq!(args, vec!["skill", "install", "--target", "agents"]);
     }
 
     #[test]
