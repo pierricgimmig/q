@@ -104,17 +104,6 @@ fn now_parts() -> (OffsetDateTime, String) {
     (now, format_timestamp(now))
 }
 
-fn require_reason(reason: &str, action: &str) -> Result<String, QueueError> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        Err(QueueError::InvalidInput(format!(
-            "{action} requires a nonempty reason"
-        )))
-    } else {
-        Ok(reason.to_string())
-    }
-}
-
 fn dedupe_strings(items: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
@@ -392,15 +381,10 @@ fn set_status(
     Ok(())
 }
 
-fn retire_claim(
-    conn: &Connection,
-    claim_id: i64,
-    now: &str,
-    reason: &str,
-) -> Result<(), QueueError> {
+fn retire_claim(conn: &Connection, claim_id: i64, now: &str) -> Result<(), QueueError> {
     conn.execute(
-        "UPDATE claims SET released_at = ?, release_reason = ? WHERE id = ? AND released_at IS NULL",
-        params![now, reason, claim_id],
+        "UPDATE claims SET released_at = ?, release_reason = NULL WHERE id = ? AND released_at IS NULL",
+        params![now, claim_id],
     )
     .db()?;
     Ok(())
@@ -636,7 +620,6 @@ fn recover_expired(
     now: &str,
     override_to: Option<StaleDisposition>,
     actor: &Actor,
-    reason: &str,
 ) -> Result<Vec<RecoveryRecord>, QueueError> {
     let mut stmt = conn
         .prepare(
@@ -678,8 +661,8 @@ fn recover_expired(
         if to == TaskStatus::Blocked {
             let updated = conn
                 .execute(
-                    "UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ? AND status = ?",
-                    params![reason, now, task_id, from.as_str()],
+                    "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status = ?",
+                    params![now, task_id, from.as_str()],
                 )
                 .db()?;
             if updated != 1 {
@@ -690,7 +673,7 @@ fn recover_expired(
         } else {
             set_status(conn, task_id, from, to, now)?;
         }
-        retire_claim(conn, claim_id, now, reason)?;
+        retire_claim(conn, claim_id, now)?;
         insert_event(
             conn,
             Some(task_id),
@@ -700,7 +683,6 @@ fn recover_expired(
                 "from": from.as_str(),
                 "to": to.as_str(),
                 "agent_id": agent_id,
-                "reason": reason,
             }),
             now,
         )?;
@@ -709,7 +691,6 @@ fn recover_expired(
             previous_status: from,
             new_status: to,
             agent_id,
-            reason: reason.to_string(),
         });
     }
     Ok(recovered)
@@ -1251,7 +1232,6 @@ impl QueueService for Queue {
     }
 
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError> {
-        let reason = require_reason(&request.reason, "block")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1266,12 +1246,12 @@ impl QueueService for Queue {
             })?;
             let claim = require_active_claim(&tx, task.id, token, &now)?;
             actor = Actor::agent(claim.agent_id);
-            retire_claim(&tx, claim.id, &now, &reason)?;
+            retire_claim(&tx, claim.id, &now)?;
         }
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ? AND status = ?",
-                params![reason, now, task.id, task.status.as_str()],
+                "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status = ?",
+                params![now, task.id, task.status.as_str()],
             )
             .db()?;
         if updated != 1 {
@@ -1285,7 +1265,7 @@ impl QueueService for Queue {
             Some(task.id),
             "task_blocked",
             &actor,
-            json!({"from": task.status.as_str(), "to": "blocked", "reason": reason}),
+            json!({"from": task.status.as_str(), "to": "blocked"}),
             &now,
         )?;
         tx.commit().db()?;
@@ -1293,7 +1273,6 @@ impl QueueService for Queue {
     }
 
     fn cancel(&self, request: CancelRequest) -> Result<Task, QueueError> {
-        let reason = require_reason(&request.reason, "cancel")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1307,7 +1286,7 @@ impl QueueService for Queue {
             Some(task.id),
             "task_cancelled",
             &request.actor,
-            json!({"from": task.status.as_str(), "to": "cancelled", "reason": reason}),
+            json!({"from": task.status.as_str(), "to": "cancelled"}),
             &now,
         )?;
         tx.commit().db()?;
@@ -1315,7 +1294,6 @@ impl QueueService for Queue {
     }
 
     fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError> {
-        let reason = require_reason(&request.reason, "delete")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1388,7 +1366,6 @@ impl QueueService for Queue {
             public_id: task.public_id,
             title: task.title,
             status: task.status,
-            reason,
             forced: request.force,
             active_claim_cleared: active.is_some(),
             claims_removed,
@@ -1433,7 +1410,7 @@ impl QueueService for Queue {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .db()?;
         let (now_dt, now) = now_parts();
-        recover_expired(&tx, &now, None, &Actor::system(), "lease expired")?;
+        recover_expired(&tx, &now, None, &Actor::system())?;
         let Some(task_id) = select_eligible(&tx, &request)? else {
             tx.commit().db()?;
             tracing::info!(agent_id = %request.agent_id, found = false, "claim_next");
@@ -1606,7 +1583,7 @@ impl QueueService for Queue {
             }
             ensure_transition(status, target)?;
             set_status(&tx, task.id, status, target, &now)?;
-            retire_claim(&tx, claim.id, &now, "completed")?;
+            retire_claim(&tx, claim.id, &now)?;
             Actor::agent(claim.agent_id)
         } else if task.status == TaskStatus::Review {
             ensure_transition(task.status, target)?;
@@ -1651,7 +1628,6 @@ impl QueueService for Queue {
     }
 
     fn release(&self, request: ReleaseRequest) -> Result<Task, QueueError> {
-        let reason = require_reason(&request.reason, "release")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1661,13 +1637,13 @@ impl QueueService for Queue {
         ensure_transition(task.status, TaskStatus::Ready)?;
         let claim = require_active_claim(&tx, task.id, &request.claim_token, &now)?;
         set_status(&tx, task.id, task.status, TaskStatus::Ready, &now)?;
-        retire_claim(&tx, claim.id, &now, &reason)?;
+        retire_claim(&tx, claim.id, &now)?;
         insert_event(
             &tx,
             Some(task.id),
             "task_released",
             &Actor::agent(&claim.agent_id),
-            json!({"from": task.status.as_str(), "to": "ready", "reason": reason}),
+            json!({"from": task.status.as_str(), "to": "ready"}),
             &now,
         )?;
         tx.commit().db()?;
@@ -1675,13 +1651,12 @@ impl QueueService for Queue {
     }
 
     fn recover_stale(&self, request: RecoverRequest) -> Result<Vec<RecoveryRecord>, QueueError> {
-        let reason = require_reason(&request.reason, "stale recovery")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .db()?;
         let (_, now) = now_parts();
-        let recovered = recover_expired(&tx, &now, request.to, &request.actor, &reason)?;
+        let recovered = recover_expired(&tx, &now, request.to, &request.actor)?;
         tx.commit().db()?;
         Ok(recovered)
     }

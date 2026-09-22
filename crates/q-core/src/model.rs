@@ -483,7 +483,6 @@ pub struct RecoveryRecord {
     pub previous_status: TaskStatus,
     pub new_status: TaskStatus,
     pub agent_id: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,14 +610,12 @@ pub struct ReadyRequest {
 pub struct BlockRequest {
     pub task_id: i64,
     pub claim_token: Option<String>,
-    pub reason: String,
     pub actor: Actor,
 }
 
 #[derive(Debug, Clone)]
 pub struct CancelRequest {
     pub task_id: i64,
-    pub reason: String,
     pub actor: Actor,
 }
 
@@ -626,7 +623,6 @@ pub struct CancelRequest {
 #[derive(Debug, Clone)]
 pub struct DeleteRequest {
     pub task_id: i64,
-    pub reason: String,
     pub force: bool,
     pub actor: Actor,
 }
@@ -639,7 +635,6 @@ pub struct DeleteOutcome {
     pub public_id: Uuid,
     pub title: String,
     pub status: TaskStatus,
-    pub reason: String,
     pub forced: bool,
     pub active_claim_cleared: bool,
     pub claims_removed: i64,
@@ -706,13 +701,11 @@ pub struct CompleteRequest {
 pub struct ReleaseRequest {
     pub task_id: i64,
     pub claim_token: String,
-    pub reason: String,
     pub actor: Actor,
 }
 
 #[derive(Debug, Clone)]
 pub struct RecoverRequest {
-    pub reason: String,
     pub to: Option<StaleDisposition>,
     pub actor: Actor,
 }

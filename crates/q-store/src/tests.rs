@@ -249,7 +249,6 @@ fn expired_claims_are_recovered_with_events_and_can_be_reclaimed() {
 
     let recovered = queue
         .recover_stale(RecoverRequest {
-            reason: "agent went away".into(),
             to: None,
             actor: actor(),
         })
@@ -258,9 +257,9 @@ fn expired_claims_are_recovered_with_events_and_can_be_reclaimed() {
     assert_eq!(recovered[0].new_status, TaskStatus::Ready);
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
     let events = queue.events(id).unwrap();
-    assert!(events
-        .iter()
-        .any(|event| event.event_type == "task_recovered"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_recovered" && event.payload.get("reason").is_none()
+    }));
     assert!(queue.get(id).unwrap().claim.unwrap().branch.is_none());
 
     let second = claim(&queue, "agent-b");
@@ -279,9 +278,9 @@ fn claim_recovers_expired_work_inside_the_claim_transaction() {
     assert!(second.found);
     assert_eq!(second.claim.unwrap().agent_id, "agent-b");
     let events = queue.events(id).unwrap();
-    assert!(events
-        .iter()
-        .any(|event| event.event_type == "task_recovered"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_recovered" && event.payload.get("reason").is_none()
+    }));
     assert!(
         events
             .iter()
@@ -347,7 +346,6 @@ fn complete_release_and_block_require_the_claim_token() {
         .release(ReleaseRequest {
             task_id: id,
             claim_token: "nope".into(),
-            reason: "stopping".into(),
             actor: actor(),
         })
         .unwrap_err();
@@ -357,7 +355,6 @@ fn complete_release_and_block_require_the_claim_token() {
         .block(BlockRequest {
             task_id: id,
             claim_token: None,
-            reason: "need a decision".into(),
             actor: actor(),
         })
         .unwrap_err();
@@ -417,7 +414,6 @@ fn complete_release_and_block_require_the_claim_token() {
         .release(ReleaseRequest {
             task_id: id,
             claim_token: token.clone(),
-            reason: "Missing credentials for benchmark host".into(),
             actor: actor(),
         })
         .unwrap();
@@ -430,16 +426,18 @@ fn complete_release_and_block_require_the_claim_token() {
         .block(BlockRequest {
             task_id: id,
             claim_token: Some(token),
-            reason: "Need storage-format decision first".into(),
             actor: actor(),
         })
         .unwrap();
     let task = queue.get(id).unwrap().task;
     assert_eq!(task.status, TaskStatus::Blocked);
-    assert_eq!(
-        task.blocked_reason.as_deref(),
-        Some("Need storage-format decision first")
-    );
+    assert!(task.blocked_reason.is_none());
+    assert!(queue
+        .events(id)
+        .unwrap()
+        .iter()
+        .filter(|event| event.event_type == "task_blocked")
+        .all(|event| event.payload.get("reason").is_none()));
 }
 
 #[test]
@@ -512,7 +510,6 @@ fn release_claim(queue: &Queue, task_id: i64, token: &str) {
         .release(ReleaseRequest {
             task_id,
             claim_token: token.to_string(),
-            reason: "put it back".into(),
             actor: actor(),
         })
         .unwrap();
@@ -648,40 +645,35 @@ fn project_cap_limits_active_claims() {
 fn cancel_block_and_reopen_follow_the_state_machine() {
     let (queue, _) = queue();
     let id = capture(&queue, "triage");
-    let err = queue
-        .cancel(q_core::CancelRequest {
-            task_id: id,
-            reason: "   ".into(),
-            actor: actor(),
-        })
-        .unwrap_err();
-    assert!(matches!(err, QueueError::InvalidInput(_)));
     queue
         .block(BlockRequest {
             task_id: id,
             claim_token: None,
-            reason: "not yet".into(),
             actor: actor(),
         })
         .unwrap();
     queue
         .cancel(CancelRequest {
             task_id: id,
-            reason: "superseded".into(),
             actor: actor(),
         })
         .unwrap();
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Cancelled);
+    assert!(queue
+        .events(id)
+        .unwrap()
+        .iter()
+        .filter(|event| event.event_type == "task_cancelled")
+        .all(|event| event.payload.get("reason").is_none()));
     queue.reopen(id, actor()).unwrap();
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
-    let err = queue
+    let recovered = queue
         .recover_stale(RecoverRequest {
-            reason: " ".into(),
             to: Some(StaleDisposition::Blocked),
             actor: actor(),
         })
-        .unwrap_err();
-    assert!(matches!(err, QueueError::InvalidInput(_)));
+        .unwrap();
+    assert!(recovered.is_empty());
 }
 
 #[test]
@@ -731,20 +723,9 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
     edit.dependencies = Some(vec![inbox]);
     queue.edit(ready, edit).unwrap();
 
-    let err = queue
-        .delete(DeleteRequest {
-            task_id: inbox,
-            reason: "   ".into(),
-            force: false,
-            actor: actor(),
-        })
-        .unwrap_err();
-    assert!(matches!(err, QueueError::InvalidInput(_)));
-
     let removed = queue
         .delete(DeleteRequest {
             task_id: inbox,
-            reason: "duplicate capture".into(),
             force: false,
             actor: actor(),
         })
@@ -802,7 +783,6 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
     let done = queue
         .delete(DeleteRequest {
             task_id: ready,
-            reason: "no longer needed".into(),
             force: false,
             actor: actor(),
         })
@@ -849,7 +829,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let done = queue
         .delete(DeleteRequest {
             task_id: id,
-            reason: "throw away finished work".into(),
             force: false,
             actor: actor(),
         })
@@ -874,7 +853,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let err = queue
         .delete(DeleteRequest {
             task_id: active,
-            reason: "agent stuck".into(),
             force: false,
             actor: actor(),
         })
@@ -892,7 +870,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let removed = queue
         .delete(DeleteRequest {
             task_id: active,
-            reason: "agent stuck".into(),
             force: true,
             actor: actor(),
         })
@@ -929,7 +906,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let removed = queue
         .delete(DeleteRequest {
             task_id: expired_id,
-            reason: "lease already dead".into(),
             force: false,
             actor: actor(),
         })
@@ -1073,7 +1049,6 @@ fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
     queue
         .cancel(CancelRequest {
             task_id: beta_cancelled,
-            reason: "superseded".into(),
             actor: actor(),
         })
         .unwrap();

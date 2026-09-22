@@ -100,7 +100,6 @@ fn is_value_flag(arg: &str) -> bool {
             | "--status"
             | "--agent"
             | "--claim-token"
-            | "--reason"
             | "--summary"
             | "--branch"
             | "--worktree"
@@ -229,24 +228,16 @@ pub enum Commands {
     Block {
         id: i64,
         #[arg(long)]
-        reason: String,
-        #[arg(long)]
         claim_token: Option<String>,
     },
     /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
-    Cancel {
-        id: i64,
-        #[arg(long)]
-        reason: String,
-    },
+    Cancel { id: i64 },
     /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
     ///
     /// Unlike cancel, nothing remains in the queue database. Events cascade with
     /// the task and are not retained. An unexpired claim requires --force.
     Delete {
         id: i64,
-        #[arg(long)]
-        reason: String,
         /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
         #[arg(long)]
         force: bool,
@@ -303,15 +294,11 @@ pub enum Commands {
         id: i64,
         #[arg(long)]
         claim_token: String,
-        #[arg(long)]
-        reason: String,
     },
     /// Show queue counts and claim lease health.
     Status,
     /// Requeue expired claims and record a recovery event.
     RecoverStale {
-        #[arg(long)]
-        reason: String,
         /// ready or blocked. Defaults to each project's stale policy.
         #[arg(long, value_name = "ready|blocked")]
         to: Option<String>,
@@ -397,17 +384,8 @@ mod tests {
 
     #[test]
     fn delete_is_not_rewritten_as_capture() {
-        let args = preprocess(vec![
-            "delete".into(),
-            "12".into(),
-            "--reason".into(),
-            "duplicate".into(),
-            "--force".into(),
-        ]);
-        assert_eq!(
-            args,
-            vec!["delete", "12", "--reason", "duplicate", "--force"]
-        );
+        let args = preprocess(vec!["delete".into(), "12".into(), "--force".into()]);
+        assert_eq!(args, vec!["delete", "12", "--force"]);
     }
 
     #[test]

@@ -12,8 +12,8 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - Capture creates an **inbox** task. Inbox work is never claimable.
 - A human must run `q ready ID` before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, and release.
-- `block`, `release`, `cancel`, `delete`, and `recover-stale` need a nonempty reason.
-- `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction. The reason is printed, not stored: events cascade away with the task.
+- `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
+- `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason. Claim tokens are still required for claimed work.
 - Default claim risk is `medium`. `high` and `external_action` are excluded unless the claim sets `--max-risk` or MCP `maximum_risk`. `external_action` also needs the project flag `allow_external_actions`, which defaults to false.
 - If the claim sets an agent pool, the task must have that exact pool. Omit the pool to leave pool filtering unrestricted.
 - Required capabilities must be a subset of the worker capabilities. Dependencies must be `done`. Empty repo, project, and kind filters mean unrestricted.
@@ -34,10 +34,10 @@ q claim --agent codex-local-01 --capability rust --json
 q heartbeat 184 --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" --artifact report=./docs/benchmarks/trace-encoding.md
-q release 184 --claim-token TOKEN --reason "Missing credentials for benchmark host"
-q block 184 --claim-token TOKEN --reason "Need a storage-format decision"
-q cancel 184 --reason "Superseded by task 212"
-q delete 184 --reason "Captured twice"
+q release 184 --claim-token TOKEN
+q block 184 --claim-token TOKEN
+q cancel 184
+q delete 184
 ```
 
 `q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The table has project, priority, and `updated_at`. Tasks with no project are `(none)` and sort last. Within a project, the newest update is first.
@@ -54,10 +54,10 @@ q delete 184 --reason "Captured twice"
 - `queue_claim_next` — atomically claim one eligible ready task, or return no work
 - `queue_heartbeat` — extend a lease with the task id and claim token
 - `queue_start` — mark a claim in progress and record a branch or worktree
-- `queue_block` — block claimed work with a reason
+- `queue_block` — block claimed work with the claim token
 - `queue_complete` — complete or send to review, with a summary and artifacts
-- `queue_release` — return a claim to ready with a reason
-- `queue_delete` — hard-delete a task (`task_id`, `reason`, optional `force`). Unlike cancel, the row and its events are removed.
+- `queue_release` — return a claim to ready with the claim token
+- `queue_delete` — hard-delete a task (`task_id`, optional `force`). Unlike cancel, the row and its events are removed.
 
 `queue_claim_next` takes `agent_id`, `capabilities`, `allowed_repos`, `allowed_projects`, `allowed_kinds`, `maximum_risk`, `lease_minutes`, and `agent_pool`. Unknown argument keys are rejected. Invalid arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError` true.
 

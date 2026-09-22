@@ -247,33 +247,26 @@ fn dispatch(
             emit(json, &outcome, || println!("task {id} is ready"));
             Ok(())
         }
-        Commands::Block {
-            id,
-            reason,
-            claim_token,
-        } => {
+        Commands::Block { id, claim_token } => {
             let task = queue.block(BlockRequest {
                 task_id: id,
                 claim_token,
-                reason,
                 actor: human_actor(),
             })?;
             emit(json, &task, || println!("blocked #{}", task.id));
             Ok(())
         }
-        Commands::Cancel { id, reason } => {
+        Commands::Cancel { id } => {
             let task = queue.cancel(CancelRequest {
                 task_id: id,
-                reason,
                 actor: human_actor(),
             })?;
             emit(json, &task, || println!("cancelled #{}", task.id));
             Ok(())
         }
-        Commands::Delete { id, reason, force } => {
+        Commands::Delete { id, force } => {
             let outcome = queue.delete(DeleteRequest {
                 task_id: id,
-                reason,
                 force,
                 actor: human_actor(),
             })?;
@@ -292,7 +285,6 @@ fn dispatch(
                     outcome.artifacts_removed,
                     outcome.dependencies_removed
                 );
-                println!("reason: {}", outcome.reason);
             });
             Ok(())
         }
@@ -401,15 +393,10 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Release {
-            id,
-            claim_token,
-            reason,
-        } => {
+        Commands::Release { id, claim_token } => {
             let task = queue.release(ReleaseRequest {
                 task_id: id,
                 claim_token,
-                reason,
                 actor: human_actor(),
             })?;
             emit(json, &task, || {
@@ -440,13 +427,12 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::RecoverStale { reason, to } => {
+        Commands::RecoverStale { to } => {
             let to = match to {
                 Some(value) => Some(StaleDisposition::parse(&value)?),
                 None => None,
             };
             let recovered = queue.recover_stale(RecoverRequest {
-                reason,
                 to,
                 actor: human_actor(),
             })?;
@@ -456,11 +442,8 @@ fn dispatch(
                 } else {
                     for record in &recovered {
                         println!(
-                            "recovered #{} {} -> {} ({})",
-                            record.task_id,
-                            record.previous_status,
-                            record.new_status,
-                            record.reason
+                            "recovered #{} {} -> {}",
+                            record.task_id, record.previous_status, record.new_status,
                         );
                     }
                 }
