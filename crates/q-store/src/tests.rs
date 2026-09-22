@@ -8,9 +8,9 @@ use rusqlite::{params, Connection};
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
-    CompleteRequest, EditRequest, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError,
-    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition,
-    StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
+    CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest, ListFilter, ProjectPolicy,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -713,6 +713,235 @@ fn reopen_done_returns_to_ready_without_an_active_claim() {
     assert_eq!(task.id, id);
     assert_eq!(task.status, TaskStatus::Claimed);
     assert!(queue.get(id).unwrap().claim.unwrap().active);
+}
+
+fn count_rows(path: &PathBuf, sql: &str, task_id: i64) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(sql, params![task_id], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
+    let (queue, path) = queue();
+    let inbox = capture(&queue, "inbox task");
+    let ready = capture(&queue, "ready task");
+    make_ready(&queue, ready);
+    let mut edit = EditRequest::empty(actor());
+    edit.dependencies = Some(vec![inbox]);
+    queue.edit(ready, edit).unwrap();
+
+    let err = queue
+        .delete(DeleteRequest {
+            task_id: inbox,
+            reason: "   ".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, QueueError::InvalidInput(_)));
+
+    let removed = queue
+        .delete(DeleteRequest {
+            task_id: inbox,
+            reason: "duplicate capture".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(removed.task_id, inbox);
+    assert_eq!(removed.status, TaskStatus::Inbox);
+    assert!(!removed.active_claim_cleared);
+    assert!(removed.events_removed >= 1);
+    assert_eq!(removed.dependencies_removed, 1);
+    assert!(matches!(
+        queue.get(inbox).unwrap_err(),
+        QueueError::NotFound(_)
+    ));
+    let listed = queue
+        .list(ListFilter {
+            status: None,
+            project: None,
+            repo: None,
+            kind: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(listed.iter().all(|task| task.id != inbox));
+    assert!(listed.iter().any(|task| task.id == ready));
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM claims WHERE task_id = ?",
+            inbox
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM events WHERE task_id = ?",
+            inbox
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 OR depends_on_task_id = ?1",
+            inbox
+        ),
+        0
+    );
+    assert_eq!(
+        queue.get(ready).unwrap().task.dependencies,
+        Vec::<i64>::new()
+    );
+
+    let done = queue
+        .delete(DeleteRequest {
+            task_id: ready,
+            reason: "no longer needed".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Ready);
+    assert!(matches!(
+        queue.get(ready).unwrap_err(),
+        QueueError::NotFound(_)
+    ));
+    let listed = queue
+        .list(ListFilter {
+            status: Some(TaskStatus::Ready),
+            project: None,
+            repo: None,
+            kind: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(listed.is_empty());
+}
+
+#[test]
+fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
+    let (queue, path) = queue();
+    let id = capture(&queue, "claimed work");
+    make_ready(&queue, id);
+    let outcome = claim(&queue, "agent-a");
+    assert!(outcome.found);
+    let token = outcome.claim.unwrap().token;
+    queue
+        .complete(CompleteRequest {
+            task_id: id,
+            claim_token: Some(token),
+            summary: "shipped".into(),
+            target: Some(TaskStatus::Done),
+            artifacts: vec![ArtifactInput {
+                kind: "report".into(),
+                value: "notes".into(),
+            }],
+            actor: actor(),
+        })
+        .unwrap();
+    let done = queue
+        .delete(DeleteRequest {
+            task_id: id,
+            reason: "throw away finished work".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap();
+    assert!(done.artifacts_removed >= 1);
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM artifacts WHERE task_id = ?",
+            id
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(&path, "SELECT COUNT(*) FROM claims WHERE task_id = ?", id),
+        0
+    );
+
+    let active = capture(&queue, "still claimed");
+    make_ready(&queue, active);
+    assert!(claim(&queue, "agent-b").found);
+    let err = queue
+        .delete(DeleteRequest {
+            task_id: active,
+            reason: "agent stuck".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap_err();
+    match err {
+        QueueError::Conflict(message) => {
+            assert!(message.contains("active claim"), "{message}");
+            assert!(message.contains("agent-b"), "{message}");
+            assert!(message.contains("--force"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(queue.get(active).unwrap().task.status, TaskStatus::Claimed);
+
+    let removed = queue
+        .delete(DeleteRequest {
+            task_id: active,
+            reason: "agent stuck".into(),
+            force: true,
+            actor: actor(),
+        })
+        .unwrap();
+    assert!(removed.forced);
+    assert!(removed.active_claim_cleared);
+    assert!(removed.claims_removed >= 1);
+    assert!(matches!(
+        queue.get(active).unwrap_err(),
+        QueueError::NotFound(_)
+    ));
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM claims WHERE task_id = ?",
+            active
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM events WHERE task_id = ?",
+            active
+        ),
+        0
+    );
+
+    let expired = capture(&queue, "expired lease");
+    make_ready(&queue, expired);
+    let claimed = claim(&queue, "agent-c");
+    let expired_id = claimed.task.unwrap().task.id;
+    rewind_lease(&path, expired_id);
+    let removed = queue
+        .delete(DeleteRequest {
+            task_id: expired_id,
+            reason: "lease already dead".into(),
+            force: false,
+            actor: actor(),
+        })
+        .unwrap();
+    assert!(!removed.active_claim_cleared);
+    assert!(removed.claims_removed >= 1);
+    assert_eq!(
+        count_rows(
+            &path,
+            "SELECT COUNT(*) FROM claims WHERE task_id = ?",
+            expired_id
+        ),
+        0
+    );
 }
 
 #[test]

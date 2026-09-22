@@ -1,7 +1,8 @@
 use crate::model::{
     BlockRequest, CancelRequest, CaptureRequest, ClaimOutcome, ClaimRequest, CompleteRequest,
-    EditRequest, Event, HeartbeatRequest, ListFilter, QueueStatus, ReadyOutcome, ReadyRequest,
-    RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary,
+    DeleteOutcome, DeleteRequest, EditRequest, Event, HeartbeatRequest, ListFilter, QueueStatus,
+    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task,
+    TaskDetail, TaskSummary,
 };
 use crate::QueueError;
 
@@ -17,6 +18,13 @@ pub trait QueueService: Send + Sync {
     fn mark_ready(&self, request: ReadyRequest) -> Result<ReadyOutcome, QueueError>;
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError>;
     fn cancel(&self, request: CancelRequest) -> Result<Task, QueueError>;
+    /// Hard-delete a task and rows that reference it.
+    ///
+    /// Claims, events, artifacts, and dependency edges cascade with the task
+    /// (or are deleted in the same transaction). The event log does not survive,
+    /// so there is no retained `task_deleted` record. An unexpired claim is
+    /// rejected unless `force` is set, in which case that claim is cleared too.
+    fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError>;
     fn claim_next(&self, request: ClaimRequest) -> Result<ClaimOutcome, QueueError>;
     fn heartbeat(&self, request: HeartbeatRequest) -> Result<crate::model::Claim, QueueError>;
     fn start(&self, request: StartRequest) -> Result<TaskDetail, QueueError>;

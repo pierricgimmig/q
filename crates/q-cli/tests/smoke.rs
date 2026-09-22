@@ -219,6 +219,56 @@ fn mcp_stdio_is_protocol_clean() {
 }
 
 #[test]
+fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
+    let db = temp_root("delete").join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let captured = run(bin().args(["--db", db_arg, "--json", "Throwaway inbox task"]));
+    let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    let id = created["id"].as_i64().unwrap().to_string();
+
+    let deleted = run(bin().args(["--db", db_arg, "delete", &id, "--reason", "captured twice"]));
+    let text = String::from_utf8(deleted.stdout).unwrap();
+    assert!(text.contains(&format!("deleted #{id}")), "{text}");
+    assert!(text.contains("[inbox]"), "{text}");
+    assert!(text.contains("claims="), "{text}");
+    assert!(text.contains("reason: captured twice"), "{text}");
+
+    let missing = bin().args(["--db", db_arg, "show", &id]).output().unwrap();
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8(missing.stderr).unwrap();
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    let listed = run(bin().args(["--db", db_arg, "ls"]));
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("no tasks"), "{listed}");
+
+    let captured = run(bin().args(["--db", db_arg, "--json", "Claimed work"]));
+    let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    let id = created["id"].as_i64().unwrap().to_string();
+    run(bin().args(["--db", db_arg, "ready", &id]));
+    run(bin().args(["--db", db_arg, "claim", "--agent", "codex-local-01"]));
+    let rejected = bin()
+        .args(["--db", db_arg, "delete", &id, "--reason", "stuck"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8(rejected.stderr).unwrap();
+    assert!(stderr.contains("active claim"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+
+    let forced = run(bin().args([
+        "--db", db_arg, "--json", "delete", &id, "--reason", "stuck", "--force",
+    ]));
+    let body: Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert_eq!(body["active_claim_cleared"], true);
+    assert!(body["claims_removed"].as_i64().unwrap() >= 1);
+    assert_eq!(body["status"], "claimed");
+    let missing = bin().args(["--db", db_arg, "show", &id]).output().unwrap();
+    assert!(!missing.status.success());
+    let _ = fs::remove_dir_all(db.parent().unwrap());
+}
+
+#[test]
 fn skill_prints_frontmatter_and_install_help() {
     let home = temp_root("skill-home");
     let db = temp_root("skill-db").join("queue.db");
