@@ -77,6 +77,7 @@ q add --feature "Cross-repo rollout" "Add the migration"
 q edit 12 --feature 1
 q edit 12 --clear-feature
 q ls --feature "Cross-repo rollout"
+q tree --feature "Cross-repo rollout"
 q feature delete 1
 ```
 
@@ -90,6 +91,7 @@ q ls --all
 q ls --status inbox
 q ls --status cancelled
 q show 184
+q tree 184
 q edit 184 --body-file task.md
 q ready 184
 q block 184
@@ -111,6 +113,29 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
 
 `q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
+
+## Dependency tree
+
+`q tree` shows what has to be finished first. Each child is a task the parent depends on. Read downward.
+
+```bash
+q tree 12
+q tree --feature "Cross-repo rollout"
+q tree 12 --json
+```
+
+A task with no dependencies is one line. `--feature` prints every task in that feature. Roots are the tasks that no other task in the feature depends on, including tasks that depend on nothing. A dependency outside the feature is marked `(external)` and still expanded. A feature name in `{braces}` appears when it is not the feature you asked for. If a task would show up twice, the later copy says `(already shown)` and is not expanded again. An empty feature prints `no tasks in <title>`.
+
+Titles use the same 64-character ellipsis as `q ls`.
+
+```text
+#3  inbox        Ship the rollout  [api]
+├── #1  done         Shared schema  [db]  {Other}  (external)
+└── #2  ready        Write the schema  [api]
+    └── #4  inbox        Add the types  [api]
+```
+
+`--json` prints `{"roots":[...]}`. A feature tree also includes `feature`. Each node has `id`, `status`, `title`, and `depends_on`. `project`, `feature`, `external`, `already_shown`, and `cycle` are left out when they would be empty or false.
 
 ## Claim lifecycle
 
@@ -155,6 +180,7 @@ Without `--to`, each task follows its project's stale policy (`ready` by default
 q claim --agent codex-local-01 --json
 q show 184 --json
 q ls --status ready --json
+q tree --feature "Cross-repo rollout" --json
 ```
 
 ## MCP
@@ -182,6 +208,7 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_feature_list` | List features. |
 | `queue_feature_get` | Fetch one feature by id. |
 | `queue_get` | One task plus claim, artifacts, and recent events. |
+| `queue_tree` | Dependency tree for a task id, or a forest for a feature id or unique title. Children are tasks that must be done first. |
 | `queue_claim_next` | Atomically claim one eligible ready task, or return no work. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |
 | `queue_start` | Mark a claim in progress and record branch or worktree. |

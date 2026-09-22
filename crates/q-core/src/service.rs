@@ -3,7 +3,7 @@ use crate::model::{
     CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
     EditRequest, Event, Feature, HeartbeatRequest, ListFilter, QueueStatus, ReadyOutcome,
     ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail,
-    TaskSummary,
+    TaskSummary, TaskTree, TreeQuery,
 };
 use crate::QueueError;
 
@@ -52,4 +52,15 @@ pub trait QueueService: Send + Sync {
     fn edit_feature(&self, id: i64, request: EditFeatureRequest) -> Result<Feature, QueueError>;
     /// Delete a feature. Tasks that referenced it keep their rows; `feature_id` is set to null.
     fn delete_feature(&self, id: i64) -> Result<DeleteFeatureOutcome, QueueError>;
+
+    /// Dependency tree. Read-only.
+    ///
+    /// Children are tasks the parent depends on, so reading downward is the
+    /// order to finish work. Pass a task id for one tree, or a feature id or
+    /// unique title for a forest of that feature. Feature roots are tasks in
+    /// the feature that no other task in the feature depends on. Dependencies
+    /// outside the feature are included and marked external. A node expanded
+    /// earlier is returned again with `already_shown` and no children. A cycle
+    /// sets `cycle` and stops. An empty feature is an empty forest, not an error.
+    fn tree(&self, query: TreeQuery) -> Result<TaskTree, QueueError>;
 }

@@ -11,14 +11,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use q_core::{
-    acceptance_criteria, default_lease, ensure_transition, format_timestamp, lease_from_minutes,
-    normalize_repo_url, parse_timestamp, readiness_warnings, Actor, Artifact, ArtifactInput,
-    BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease, ClaimOutcome, ClaimRequest,
-    ClaimTask, CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome,
-    DeleteRequest, EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter,
-    ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest,
-    RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
-    StatusCounts, Task, TaskDetail, TaskKind, TaskStatus, TaskSummary,
+    acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
+    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
+    Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
+    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
+    DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
+    Feature, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus,
+    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus,
+    TaskSummary, TaskTree, TreeQuery, TreeTask,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -1998,6 +1999,84 @@ impl QueueService for Queue {
             tasks_detached,
         })
     }
+
+    fn tree(&self, query: TreeQuery) -> Result<TaskTree, QueueError> {
+        let feature = query
+            .feature
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        match (query.task_id, feature) {
+            (Some(_), Some(_)) => Err(QueueError::InvalidInput(
+                "pass a task id or a feature, not both".into(),
+            )),
+            (None, None) => Err(QueueError::InvalidInput(
+                "pass a task id or a feature".into(),
+            )),
+            (Some(id), None) => {
+                let conn = open_connection(&self.path)?;
+                let snapshot = load_tree_snapshot(&conn)?;
+                build_task_tree(&snapshot.tasks, &snapshot.edges, id)
+            }
+            (None, Some(selector)) => {
+                let conn = open_connection(&self.path)?;
+                let feature = load_feature(&conn, resolve_feature_id(&conn, selector)?)?;
+                let snapshot = load_tree_snapshot(&conn)?;
+                Ok(build_feature_forest(
+                    &snapshot.tasks,
+                    &snapshot.edges,
+                    feature.id,
+                    &feature.title,
+                ))
+            }
+        }
+    }
+}
+
+struct TreeSnapshot {
+    tasks: Vec<TreeTask>,
+    edges: Vec<(i64, i64)>,
+}
+
+fn load_tree_snapshot(conn: &Connection) -> Result<TreeSnapshot, QueueError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tasks.id, tasks.title, tasks.status, tasks.project_name, tasks.feature_id, \
+             features.title \
+             FROM tasks \
+             LEFT JOIN features ON features.id = tasks.feature_id \
+             ORDER BY tasks.id",
+        )
+        .db()?;
+    let rows = stmt
+        .query_map([], |row| {
+            let status: String = row.get(2)?;
+            Ok(TreeTask {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                status: parse_status(2, &status)?,
+                project: row.get(3)?,
+                feature_id: row.get(4)?,
+                feature: row.get(5)?,
+            })
+        })
+        .db()?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        tasks.push(row.db()?);
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT task_id, depends_on_task_id FROM task_dependencies")
+        .db()?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .db()?;
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row.db()?);
+    }
+    Ok(TreeSnapshot { tasks, edges })
 }
 
 #[cfg(test)]

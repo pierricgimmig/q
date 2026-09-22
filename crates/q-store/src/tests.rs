@@ -11,7 +11,7 @@ use q_core::{
     CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
     HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, ReadyRequest,
     RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, TaskKind,
-    TaskStatus, NO_ELIGIBLE_REASON,
+    TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -1485,4 +1485,204 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
         )
         .unwrap();
     assert!(feature_id.is_none());
+}
+
+fn depend_on(queue: &Queue, id: i64, deps: &[i64]) {
+    let mut edit = EditRequest::empty(actor());
+    edit.dependencies = Some(deps.to_vec());
+    queue.edit(id, edit).unwrap();
+}
+
+#[test]
+fn tree_chain_and_diamond_keep_shared_dependencies_once() {
+    let (queue, _) = queue();
+    let base = capture(&queue, "Add the types");
+    let left = capture(&queue, "Write the schema");
+    let right = capture(&queue, "Write the client");
+    let top = capture(&queue, "Ship the rollout");
+    depend_on(&queue, left, &[base]);
+    depend_on(&queue, right, &[base]);
+    depend_on(&queue, top, &[left, right]);
+
+    let chain = queue
+        .tree(TreeQuery {
+            task_id: Some(left),
+            feature: None,
+        })
+        .unwrap();
+    assert!(chain.feature.is_none());
+    assert_eq!(chain.roots[0].id, left);
+    assert_eq!(chain.roots[0].title, "Write the schema");
+    assert_eq!(chain.roots[0].status, TaskStatus::Inbox);
+    assert_eq!(chain.roots[0].depends_on[0].id, base);
+    assert!(chain.roots[0].depends_on[0].depends_on.is_empty());
+
+    let diamond = queue
+        .tree(TreeQuery {
+            task_id: Some(top),
+            feature: None,
+        })
+        .unwrap();
+    let root = &diamond.roots[0];
+    assert_eq!(
+        root.depends_on
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        vec![left, right]
+    );
+    assert_eq!(root.depends_on[0].depends_on[0].id, base);
+    assert!(!root.depends_on[0].depends_on[0].already_shown);
+    assert_eq!(root.depends_on[1].depends_on[0].id, base);
+    assert!(root.depends_on[1].depends_on[0].already_shown);
+
+    let value = serde_json::to_value(&diamond).unwrap();
+    assert!(value.get("feature").is_none());
+    assert_eq!(
+        value["roots"][0]["depends_on"][1]["depends_on"][0]["already_shown"],
+        true
+    );
+    assert!(value["roots"][0]["depends_on"][0]["depends_on"][0]
+        .get("already_shown")
+        .is_none());
+
+    let missing = queue
+        .tree(TreeQuery {
+            task_id: Some(999),
+            feature: None,
+        })
+        .unwrap_err();
+    assert!(matches!(missing, QueueError::NotFound(999)));
+    let both = queue
+        .tree(TreeQuery {
+            task_id: Some(top),
+            feature: Some("nope".into()),
+        })
+        .unwrap_err();
+    assert!(matches!(both, QueueError::InvalidInput(_)));
+}
+
+#[test]
+fn tree_feature_forest_includes_external_deps_and_empty_features() {
+    let (queue, _) = queue();
+    let rollout = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Rollout".into(),
+            body: None,
+        })
+        .unwrap();
+    let other = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Other".into(),
+            body: None,
+        })
+        .unwrap();
+    let empty = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Empty".into(),
+            body: None,
+        })
+        .unwrap();
+
+    let external = capture_in(&queue, "Shared schema", Some("db"), None, Some("Other"));
+    let leaf = capture_in(
+        &queue,
+        "Add the types",
+        Some("api"),
+        None,
+        Some(&rollout.id.to_string()),
+    );
+    let mid = capture_in(
+        &queue,
+        "Write the schema",
+        Some("api"),
+        None,
+        Some("rollout"),
+    );
+    let top = capture_in(
+        &queue,
+        "Ship the rollout",
+        Some("api"),
+        None,
+        Some("Rollout"),
+    );
+    let notes = capture_in(
+        &queue,
+        "Write the notes",
+        Some("web"),
+        None,
+        Some("Rollout"),
+    );
+    depend_on(&queue, external, &[leaf]);
+    depend_on(&queue, mid, &[leaf]);
+    depend_on(&queue, top, &[external, mid]);
+
+    let forest = queue
+        .tree(TreeQuery {
+            task_id: None,
+            feature: Some(rollout.title.clone()),
+        })
+        .unwrap();
+    assert_eq!(forest.feature.as_ref().unwrap().id, rollout.id);
+    assert_eq!(
+        forest.roots.iter().map(|node| node.id).collect::<Vec<_>>(),
+        vec![top, notes]
+    );
+    let ship = &forest.roots[0];
+    assert_eq!(
+        ship.depends_on
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        vec![external, mid]
+    );
+    assert!(ship.depends_on[0].external);
+    assert_eq!(ship.depends_on[0].feature.as_deref(), Some("Other"));
+    assert_eq!(ship.depends_on[0].project.as_deref(), Some("db"));
+    assert_eq!(ship.depends_on[0].depends_on[0].id, leaf);
+    assert!(!ship.depends_on[0].depends_on[0].external);
+    assert!(ship.depends_on[1].depends_on[0].already_shown);
+    assert!(!forest
+        .roots
+        .iter()
+        .any(|node| node.feature_id == Some(other.id) && node.id != external));
+
+    let value = serde_json::to_value(&forest).unwrap();
+    assert_eq!(value["feature"]["title"], "Rollout");
+    assert_eq!(value["roots"][0]["depends_on"][0]["external"], true);
+
+    let none = queue
+        .tree(TreeQuery {
+            task_id: None,
+            feature: Some(empty.id.to_string()),
+        })
+        .unwrap();
+    assert!(none.roots.is_empty());
+    assert_eq!(none.feature.unwrap().title, "Empty");
+}
+
+#[test]
+fn tree_cycle_from_a_raw_edge_does_not_panic() {
+    let (queue, path) = queue();
+    let left = capture(&queue, "loop left");
+    let right = capture(&queue, "loop right");
+    depend_on(&queue, left, &[right]);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?1, ?2)",
+        params![right, left],
+    )
+    .unwrap();
+    drop(conn);
+
+    let tree = queue
+        .tree(TreeQuery {
+            task_id: Some(left),
+            feature: None,
+        })
+        .unwrap();
+    let back = &tree.roots[0].depends_on[0].depends_on[0];
+    assert_eq!(back.id, left);
+    assert!(back.cycle);
+    assert!(back.depends_on.is_empty());
 }

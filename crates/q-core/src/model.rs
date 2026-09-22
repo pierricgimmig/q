@@ -776,6 +776,64 @@ pub struct RecoverRequest {
     pub actor: Actor,
 }
 
+fn skip_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Request for [`crate::QueueService::tree`].
+///
+/// Set `task_id` or `feature`, not both. `feature` is an id or a unique title.
+#[derive(Debug, Clone)]
+pub struct TreeQuery {
+    pub task_id: Option<i64>,
+    pub feature: Option<String>,
+}
+
+/// A feature named on a [`TaskTree`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeFeature {
+    pub id: i64,
+    pub title: String,
+}
+
+/// Dependency tree or feature forest.
+///
+/// `roots` holds one task when the query was a task id. For a feature it holds
+/// every task in that feature that no other task in the feature depends on.
+/// Children live in [`TreeNode::depends_on`]: work that must be done first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTree {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature: Option<TreeFeature>,
+    pub roots: Vec<TreeNode>,
+}
+
+/// One task in a [`TaskTree`].
+///
+/// `depends_on` lists tasks that must be done before this one. `already_shown`
+/// means this node was expanded earlier; its children are omitted. `cycle`
+/// means the walk hit this task again on the current path. `external` means
+/// the task is outside the feature the forest was built for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeNode {
+    pub id: i64,
+    pub status: TaskStatus,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub external: bool,
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub already_shown: bool,
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub cycle: bool,
+    pub depends_on: Vec<TreeNode>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

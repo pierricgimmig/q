@@ -48,6 +48,7 @@ fn is_command(word: &str) -> bool {
             | "ls"
             | "list"
             | "show"
+            | "tree"
             | "edit"
             | "ready"
             | "block"
@@ -203,6 +204,23 @@ pub enum Commands {
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show { id: i64 },
+    /// Show what must be done before a task, or before the tasks in a feature.
+    ///
+    /// Children are dependencies (do these first). A repeated node is marked
+    /// already shown. With --feature, tasks outside that feature are marked external.
+    Tree {
+        /// Task to root the tree at.
+        #[arg(value_name = "TASK_ID", required_unless_present = "feature")]
+        id: Option<i64>,
+        /// Feature id or unique title. One tree per task that nothing else in the feature depends on.
+        #[arg(
+            long,
+            value_name = "ID|TITLE",
+            required_unless_present = "id",
+            conflicts_with = "id"
+        )]
+        feature: Option<String>,
+    },
     /// Edit task fields. With no flags, open $VISUAL or $EDITOR on the body.
     Edit {
         id: i64,
@@ -472,6 +490,38 @@ mod tests {
                 "Ship it"
             ]
         );
+    }
+
+    #[test]
+    fn tree_is_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "tree".into(),
+            "--feature".into(),
+            "Cross-repo rollout".into(),
+        ]);
+        assert_eq!(args, vec!["tree", "--feature", "Cross-repo rollout"]);
+    }
+
+    #[test]
+    fn tree_accepts_a_task_or_a_feature() {
+        let task = Cli::try_parse_from(["q", "tree", "12"]).unwrap();
+        match task.command {
+            Commands::Tree { id, feature } => {
+                assert_eq!(id, Some(12));
+                assert!(feature.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let feature = Cli::try_parse_from(["q", "tree", "--feature", "Rollout"]).unwrap();
+        match feature.command {
+            Commands::Tree { id, feature } => {
+                assert!(id.is_none());
+                assert_eq!(feature.as_deref(), Some("Rollout"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["q", "tree"]).is_err());
+        assert!(Cli::try_parse_from(["q", "tree", "12", "--feature", "Rollout"]).is_err());
     }
 
     #[test]

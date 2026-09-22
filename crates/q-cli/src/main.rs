@@ -13,7 +13,7 @@ use q_core::{
     CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
     EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
     ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
-    TaskKind, TaskStatus, TaskSummary,
+    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
 };
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
@@ -184,6 +184,14 @@ fn dispatch(
         Commands::Show { id } => {
             let detail = queue.get(id)?;
             emit(json, &detail, || print_detail(&detail));
+            Ok(())
+        }
+        Commands::Tree { id, feature } => {
+            let tree = queue.tree(TreeQuery {
+                task_id: id,
+                feature,
+            })?;
+            emit(json, &tree, || print_tree(&tree));
             Ok(())
         }
         Commands::Edit {
@@ -893,6 +901,102 @@ fn print_feature(feature: &q_core::Feature) {
     }
 }
 
+const TREE_STATUS_WIDTH: usize = 11;
+
+fn print_tree(tree: &TaskTree) {
+    println!("{}", render_tree(tree));
+}
+
+fn render_tree(tree: &TaskTree) -> String {
+    if tree.roots.is_empty() {
+        return match &tree.feature {
+            Some(feature) => format!("no tasks in {}", feature.title),
+            None => "no tasks".into(),
+        };
+    }
+    let anchor = tree
+        .feature
+        .as_ref()
+        .map(|feature| feature.id)
+        .or_else(|| tree.roots.first().and_then(|node| node.feature_id));
+    tree.roots
+        .iter()
+        .map(|root| render_tree_node(root, "", true, true, anchor))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_tree_node(
+    node: &TreeNode,
+    prefix: &str,
+    is_root: bool,
+    is_last: bool,
+    anchor: Option<i64>,
+) -> String {
+    let connector = if is_root {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+    let status = format!("{:<TREE_STATUS_WIDTH$}", node.status.as_str());
+    let mut line = format!(
+        "{prefix}{connector}#{id}  {status}  {title}",
+        id = node.id,
+        title = format_list_title(&node.title),
+    );
+    if let Some(project) = node
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        line.push_str("  [");
+        line.push_str(project);
+        line.push(']');
+    }
+    if let Some(feature) = node
+        .feature
+        .as_deref()
+        .filter(|_| show_tree_feature(node, anchor))
+    {
+        line.push_str("  {");
+        line.push_str(&format_list_title(feature));
+        line.push('}');
+    }
+    if node.external {
+        line.push_str("  (external)");
+    }
+    if node.already_shown {
+        line.push_str("  (already shown)");
+    }
+    if node.cycle {
+        line.push_str("  (cycle)");
+    }
+    let child_prefix = if is_root {
+        String::new()
+    } else if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}│   ")
+    };
+    let mut lines = vec![line];
+    for (index, child) in node.depends_on.iter().enumerate() {
+        let last = index + 1 == node.depends_on.len();
+        lines.push(render_tree_node(child, &child_prefix, false, last, anchor));
+    }
+    lines.join("\n")
+}
+
+fn show_tree_feature(node: &TreeNode, anchor: Option<i64>) -> bool {
+    match (node.feature_id, anchor) {
+        (Some(id), Some(anchor_id)) => id != anchor_id,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn print_detail(detail: &q_core::TaskDetail) {
     let task = &detail.task;
     println!("#{} {} [{}]", task.id, task.title, task.status);
@@ -973,9 +1077,10 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_project, format_list_title, render_task_rows, truncate_chars, TaskListRow,
-        TITLE_MAX_CHARS,
+        display_project, format_list_title, render_task_rows, render_tree, truncate_chars,
+        TaskListRow, TITLE_MAX_CHARS,
     };
+    use q_core::{TaskStatus, TaskTree, TreeFeature, TreeNode};
 
     #[test]
     fn unassigned_project_uses_a_stable_label() {
@@ -1089,6 +1194,111 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
  2  ready   (none)   beta       1  2026-09-22T20:02:00Z  Compare encodings
  1  inbox   (none)   (none)     0  2026-09-22T20:01:00Z  Unassigned capture"
         );
+    }
+
+    #[test]
+    fn tree_layout_marks_external_repeats_and_empty_features() {
+        let types = TreeNode {
+            id: 4,
+            status: TaskStatus::Inbox,
+            title: "Add the types".into(),
+            project: Some("api".into()),
+            feature_id: Some(1),
+            feature: Some("Rollout".into()),
+            external: false,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![],
+        };
+        let mut repeated = types.clone();
+        repeated.already_shown = true;
+        let schema = TreeNode {
+            id: 2,
+            status: TaskStatus::Ready,
+            title: "Write the schema".into(),
+            project: Some("api".into()),
+            feature_id: Some(1),
+            feature: Some("Rollout".into()),
+            external: false,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![types],
+        };
+        let shared = TreeNode {
+            id: 1,
+            status: TaskStatus::Done,
+            title: "Shared schema".into(),
+            project: Some("db".into()),
+            feature_id: Some(2),
+            feature: Some("Other".into()),
+            external: true,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![repeated],
+        };
+        let ship = TreeNode {
+            id: 3,
+            status: TaskStatus::Inbox,
+            title: "Ship the rollout".into(),
+            project: Some("api".into()),
+            feature_id: Some(1),
+            feature: Some("Rollout".into()),
+            external: false,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![shared, schema],
+        };
+        let notes = TreeNode {
+            id: 5,
+            status: TaskStatus::Blocked,
+            title: "  Write\nthe notes  ".into(),
+            project: None,
+            feature_id: Some(1),
+            feature: Some("Rollout".into()),
+            external: false,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![TreeNode {
+                id: 3,
+                status: TaskStatus::Inbox,
+                title: "Ship the rollout".into(),
+                project: Some("api".into()),
+                feature_id: Some(1),
+                feature: Some("Rollout".into()),
+                external: false,
+                already_shown: false,
+                cycle: true,
+                depends_on: vec![],
+            }],
+        };
+        let tree = TaskTree {
+            feature: Some(TreeFeature {
+                id: 1,
+                title: "Rollout".into(),
+            }),
+            roots: vec![ship, notes],
+        };
+        assert_eq!(
+            render_tree(&tree),
+            "\
+#3  inbox        Ship the rollout  [api]
+├── #1  done         Shared schema  [db]  {Other}  (external)
+│   └── #4  inbox        Add the types  [api]  (already shown)
+└── #2  ready        Write the schema  [api]
+    └── #4  inbox        Add the types  [api]
+
+#5  blocked      Write the notes
+└── #3  inbox        Ship the rollout  [api]  (cycle)"
+        );
+
+        let empty = TaskTree {
+            feature: Some(TreeFeature {
+                id: 9,
+                title: "Empty".into(),
+            }),
+            roots: vec![],
+        };
+        assert_eq!(render_tree(&empty), "no tasks in Empty");
     }
 
     fn char_index(line: &str, needle: &str) -> usize {
