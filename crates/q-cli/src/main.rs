@@ -1,4 +1,5 @@
 mod cli;
+mod skill;
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -57,6 +58,13 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
         }
+        Commands::Skill { command } => match command {
+            None => skill::print_skill(json).map_err(CliError::message),
+            Some(cli::SkillCommand::Install { target, force }) => {
+                let home = skill::home_dir().map_err(CliError::message)?;
+                skill::install_skill(&home, &target, force, json).map_err(CliError::message)
+            }
+        },
         Commands::Project { command } => match command {
             ProjectCommand::Show => {
                 let context = resolve_context(directory.as_deref(), repo, project)?;
@@ -460,7 +468,9 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Project { .. } | Commands::Mcp => unreachable!("handled before queue open"),
+        Commands::Project { .. } | Commands::Mcp | Commands::Skill { .. } => {
+            unreachable!("handled before queue open")
+        }
     }
 }
 

@@ -166,6 +166,27 @@ Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`
 }
 ```
 
+## Agent skill
+
+`q skill` prints the agent skill on stdout, then a short install guide. `q skill --json` prints `skill`, `install_targets`, and `install_help`.
+
+```bash
+q skill
+q skill install
+q skill install --target cursor --target agents
+```
+
+`q skill install` writes `SKILL.md` into the user-level skill directories, creating parents as needed. Existing files are overwritten (`created` or `updated`). Unwritable targets are skipped. The command fails only when every selected target was skipped.
+
+| Target | Path |
+|---|---|
+| `agents` | `~/.agents/skills/q/SKILL.md` |
+| `claude` | `~/.claude/skills/q/SKILL.md` |
+| `cursor` | `~/.cursor/skills/q/SKILL.md` |
+| `codex` | `~/.codex/skills/q/SKILL.md` |
+
+Grok and similar agents that read Cursor skills or `~/.agents/skills` are covered by those two directories. `--target` accepts `agents`, `claude`, `cursor`, `codex`, or `all` (the default). `--force` is accepted; overwrite does not depend on it.
+
 ## Safety defaults
 
 - Capture is local and always creates an inbox task at low risk unless you set a higher risk.
