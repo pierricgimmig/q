@@ -303,7 +303,7 @@ pub enum Commands {
     },
     /// Show the append-only event log for a task.
     Events { id: i64 },
-    /// Reopen done work to in_progress, or cancelled work to inbox.
+    /// Reopen done work to ready, or cancelled work to inbox.
     Reopen { id: i64 },
     /// Project discovery and .agentqueue.toml.
     Project {

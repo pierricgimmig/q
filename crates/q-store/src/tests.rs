@@ -696,6 +696,37 @@ fn cancel_block_and_reopen_follow_the_state_machine() {
 }
 
 #[test]
+fn reopen_done_returns_to_ready_without_an_active_claim() {
+    let (queue, _) = queue();
+    let id = capture(&queue, "finished");
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-a").claim.unwrap().token;
+    queue
+        .complete(CompleteRequest {
+            task_id: id,
+            claim_token: Some(token),
+            summary: "shipped".into(),
+            target: Some(TaskStatus::Done),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+
+    let reopened = queue.reopen(id, actor()).unwrap();
+    assert_eq!(reopened.status, TaskStatus::Ready);
+    let detail = queue.get(id).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Ready);
+    assert!(detail.claim.is_none_or(|claim| !claim.active));
+
+    let outcome = claim(&queue, "agent-b");
+    assert!(outcome.found);
+    let task = outcome.task.unwrap().task;
+    assert_eq!(task.id, id);
+    assert_eq!(task.status, TaskStatus::Claimed);
+    assert!(queue.get(id).unwrap().claim.unwrap().active);
+}
+
+#[test]
 fn empty_claim_is_success_and_list_filters() {
     let (queue, _) = queue();
     let outcome = claim(&queue, "nobody");

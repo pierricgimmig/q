@@ -54,11 +54,19 @@ pub fn is_eligible(
     if !request.allowed_kinds.is_empty() && !request.allowed_kinds.contains(&task.kind) {
         return false;
     }
-    if let Some(pool) = request.agent_pool.as_deref() {
-        if let Some(task_pool) = task.agent_pool.as_deref() {
-            if task_pool != pool {
-                return false;
-            }
+    if let Some(pool) = request
+        .agent_pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|pool| !pool.is_empty())
+    {
+        let task_pool = task
+            .agent_pool
+            .as_deref()
+            .map(str::trim)
+            .filter(|pool| !pool.is_empty());
+        if task_pool != Some(pool) {
+            return false;
         }
     }
     if task.risk > request.maximum_risk {
@@ -169,6 +177,30 @@ mod tests {
         assert!(!is_eligible(&pooled, &req, 0, None, false));
         req.agent_pool = Some("frontend".into());
         assert!(is_eligible(&pooled, &req, 0, None, false));
+    }
+
+    #[test]
+    fn agent_pool_filter_requires_an_exact_task_pool() {
+        let mut candidate = task();
+        let mut req = request();
+        req.agent_pool = Some("rust".into());
+        assert!(!is_eligible(&candidate, &req, 0, None, false));
+
+        candidate.agent_pool = Some("  ".into());
+        assert!(!is_eligible(&candidate, &req, 0, None, false));
+
+        candidate.agent_pool = Some("Rust".into());
+        assert!(!is_eligible(&candidate, &req, 0, None, false));
+
+        candidate.agent_pool = Some(" rust ".into());
+        req.agent_pool = Some(" rust ".into());
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+
+        req.agent_pool = None;
+        candidate.agent_pool = Some("frontend".into());
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+        candidate.agent_pool = None;
+        assert!(is_eligible(&candidate, &req, 0, None, false));
     }
 
     #[test]

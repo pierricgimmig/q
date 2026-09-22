@@ -24,7 +24,7 @@ pub fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
             | (Blocked, Inbox)
             | (Blocked, Ready)
             | (Blocked, Cancelled)
-            | (Done, InProgress)
+            | (Done, Ready)
             | (Cancelled, Inbox)
     )
 }
@@ -68,7 +68,7 @@ mod tests {
             (Blocked, Inbox),
             (Blocked, Ready),
             (Blocked, Cancelled),
-            (Done, InProgress),
+            (Done, Ready),
             (Cancelled, Inbox),
         ];
         for (from, to) in legal {
@@ -92,7 +92,7 @@ mod tests {
             (Claimed, Done),
             (Claimed, Review),
             (Claimed, Cancelled),
-            (Done, Ready),
+            (Done, InProgress),
             (Done, Inbox),
             (Cancelled, Ready),
             (Cancelled, Done),

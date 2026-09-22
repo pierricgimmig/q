@@ -1654,7 +1654,7 @@ impl QueueService for Queue {
         let (_, now) = now_parts();
         let task = load_task_in(&tx, id)?;
         let to = match task.status {
-            TaskStatus::Done => TaskStatus::InProgress,
+            TaskStatus::Done => TaskStatus::Ready,
             TaskStatus::Cancelled => TaskStatus::Inbox,
             other => {
                 return Err(QueueError::InvalidInput(format!(
