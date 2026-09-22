@@ -259,6 +259,7 @@ mod tests {
     fn skill_markdown_has_frontmatter_and_install_pointer() {
         let skill = skill_markdown();
         assert!(skill.contains("name: q"));
+        assert!(skill.contains("q feature create"));
         assert!(skill.contains("q skill install"));
         assert!(install_help().contains("q skill install"));
         assert!(install_help().contains("~/.agents/skills/q/SKILL.md"));

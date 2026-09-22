@@ -302,6 +302,11 @@ pub struct Task {
     pub dependencies: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<i64>,
+    /// Feature title. A feature groups tasks that may span repos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
     #[serde(with = "ts")]
     pub created_at: OffsetDateTime,
     #[serde(with = "ts")]
@@ -323,6 +328,11 @@ pub struct TaskSummary {
     pub repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_pool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature_id: Option<i64>,
+    /// Feature title. Empty when the task is not in a feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feature: Option<String>,
     #[serde(with = "ts")]
     pub created_at: OffsetDateTime,
     #[serde(with = "ts")]
@@ -507,6 +517,8 @@ pub struct CaptureRequest {
     pub agent_pool: Option<String>,
     pub required_capabilities: Vec<String>,
     pub dependencies: Vec<i64>,
+    /// Feature id or unique title. Resolved by the service.
+    pub feature: Option<String>,
     pub policy: Option<ProjectPolicy>,
     pub actor: Actor,
     pub context_source: Option<String>,
@@ -518,15 +530,19 @@ pub struct CaptureRequest {
 /// and `cancelled`, and `include_terminal` is ignored. When `status` is unset
 /// and `include_terminal` is false, those two terminal statuses are omitted.
 ///
-/// Rows are ordered by project name (case-insensitive). Null and blank
-/// projects sort last. Within a project, `updated_at` is newest first, then
-/// id descending.
+/// Rows are ordered by feature title (case-insensitive, unset last), then
+/// project name (case-insensitive, unset last), then `updated_at` newest
+/// first, then id descending.
+///
+/// `feature`, when set, is a feature id or a unique title.
 #[derive(Debug, Clone)]
 pub struct ListFilter {
     pub status: Option<TaskStatus>,
     pub project: Option<String>,
     pub repo: Option<String>,
     pub kind: Option<TaskKind>,
+    /// Feature id or unique title.
+    pub feature: Option<String>,
     pub limit: u32,
     /// Include `done` and `cancelled` when `status` is unset.
     pub include_terminal: bool,
@@ -539,6 +555,7 @@ impl Default for ListFilter {
             project: None,
             repo: None,
             kind: None,
+            feature: None,
             limit: 100,
             include_terminal: false,
         }
@@ -557,9 +574,12 @@ pub struct EditRequest {
     pub agent_pool: Option<String>,
     pub required_capabilities: Option<Vec<String>>,
     pub dependencies: Option<Vec<i64>>,
+    /// Feature id or unique title.
+    pub feature: Option<String>,
     pub clear_project: bool,
     pub clear_repo: bool,
     pub clear_agent_pool: bool,
+    pub clear_feature: bool,
     pub actor: Actor,
 }
 
@@ -576,9 +596,11 @@ impl EditRequest {
             agent_pool: None,
             required_capabilities: None,
             dependencies: None,
+            feature: None,
             clear_project: false,
             clear_repo: false,
             clear_agent_pool: false,
+            clear_feature: false,
             actor,
         }
     }
@@ -594,10 +616,54 @@ impl EditRequest {
             || self.agent_pool.is_some()
             || self.required_capabilities.is_some()
             || self.dependencies.is_some()
+            || self.feature.is_some()
             || self.clear_project
             || self.clear_repo
             || self.clear_agent_pool
+            || self.clear_feature
     }
+}
+
+/// A named group of tasks. Tasks keep their own repo and project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feature {
+    pub id: i64,
+    pub public_id: Uuid,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub task_count: i64,
+    #[serde(with = "ts")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "ts")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateFeatureRequest {
+    pub title: String,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditFeatureRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+impl EditFeatureRequest {
+    pub fn has_changes(&self) -> bool {
+        self.title.is_some() || self.body.is_some()
+    }
+}
+
+/// Result of deleting a feature. Tasks that referenced it have `feature_id` set to null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteFeatureOutcome {
+    pub id: i64,
+    pub public_id: Uuid,
+    pub title: String,
+    pub tasks_detached: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -737,6 +803,8 @@ mod tests {
             required_capabilities: vec!["rust".into()],
             dependencies: vec![],
             blocked_reason: None,
+            feature_id: None,
+            feature: None,
             created_at: datetime!(2026-09-22 0:00:00 UTC),
             updated_at: datetime!(2026-09-22 0:00:00 UTC),
         }

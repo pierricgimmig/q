@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService, ReleaseRequest,
-    RiskLevel, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
+    ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -181,6 +181,9 @@ fn dispatch_tool(
         "queue_capture" => queue_capture(queue, base_dir, args),
         "queue_list" => queue_list(queue, args),
         "queue_get" => queue_get(queue, args),
+        "queue_feature_create" => queue_feature_create(queue, args),
+        "queue_feature_list" => queue_feature_list(queue, args),
+        "queue_feature_get" => queue_feature_get(queue, args),
         "queue_claim_next" => queue_claim_next(queue, args),
         "queue_heartbeat" => queue_heartbeat(queue, args),
         "queue_start" => queue_start(queue, args),
@@ -211,6 +214,7 @@ fn queue_capture(
             "capabilities",
             "dependencies",
             "agent_pool",
+            "feature",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -249,6 +253,7 @@ fn queue_capture(
         agent_pool: optional_string(args, "agent_pool")?.or(context.agent_pool),
         required_capabilities: optional_string_array(args, "capabilities")?,
         dependencies: optional_i64_array(args, "dependencies")?,
+        feature: optional_feature(args)?,
         policy: context.policy,
         actor: Actor::agent("mcp"),
         context_source: serde_json::to_value(context.source)
@@ -269,6 +274,7 @@ fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Val
             "limit",
             "include_terminal",
             "all",
+            "feature",
         ],
     )?;
     let status = match optional_string(args, "status")? {
@@ -288,10 +294,41 @@ fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Val
         project: optional_string(args, "project")?,
         repo: optional_string(args, "repo")?,
         kind,
+        feature: optional_feature(args)?,
         limit,
         include_terminal,
     })?;
     Ok(json!({ "tasks": tasks }))
+}
+
+fn queue_feature_create(
+    queue: &dyn QueueService,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["title", "body"])?;
+    let feature = queue.create_feature(CreateFeatureRequest {
+        title: required_string(args, "title")?,
+        body: optional_string(args, "body")?,
+    })?;
+    Ok(serde_json::to_value(feature).unwrap_or(Value::Null))
+}
+
+fn queue_feature_list(
+    queue: &dyn QueueService,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &[])?;
+    Ok(json!({ "features": queue.list_features()? }))
+}
+
+fn queue_feature_get(
+    queue: &dyn QueueService,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["id"])?;
+    let id =
+        optional_i64(args, "id")?.ok_or_else(|| ToolFailure::Invalid("id is required".into()))?;
+    Ok(serde_json::to_value(queue.get_feature(id)?).unwrap_or(Value::Null))
 }
 
 fn queue_get(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
@@ -495,6 +532,22 @@ fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<bool, ToolFailu
     }
 }
 
+fn optional_feature(args: &Map<String, Value>) -> Result<Option<String>, ToolFailure> {
+    match args.get("feature") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Number(number)) => {
+            let id = number
+                .as_i64()
+                .ok_or_else(|| ToolFailure::Invalid("feature must be an id or title".into()))?;
+            Ok(Some(id.to_string()))
+        }
+        Some(_) => Err(ToolFailure::Invalid(
+            "feature must be an id or title".into(),
+        )),
+    }
+}
+
 fn optional_string(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolFailure> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -624,14 +677,18 @@ fn tool_definitions() -> Vec<Value> {
                     "risk": {"type": "string", "enum": ["low", "medium", "high", "external_action"]},
                     "capabilities": {"type": "array", "items": {"type": "string"}},
                     "dependencies": {"type": "array", "items": {"type": "integer"}},
-                    "agent_pool": {"type": "string"}
+                    "agent_pool": {"type": "string"},
+                    "feature": {
+                        "description": "Feature id or unique title. The task keeps its own repo and project.",
+                        "anyOf": [{"type": "string"}, {"type": "integer"}]
+                    }
                 },
                 "additionalProperties": false
             }),
         ),
         tool(
             "queue_list",
-            "List bounded task summaries. Done and cancelled tasks are omitted unless status is set or include_terminal (alias all) is true. Ordered by project, blank projects last, then updated_at descending.",
+            "List bounded task summaries. Done and cancelled tasks are omitted unless status is set or include_terminal (alias all) is true. Ordered by feature (blank last), then project (blank last), then updated_at descending. Optional feature filters by id or unique title.",
             json!({
                 "type": "object",
                 "properties": {
@@ -647,7 +704,45 @@ fn tool_definitions() -> Vec<Value> {
                     "all": {
                         "type": "boolean",
                         "description": "Alias of include_terminal. Either flag set to true includes terminal tasks."
+                    },
+                    "feature": {
+                        "description": "Feature id or unique title.",
+                        "anyOf": [{"type": "string"}, {"type": "integer"}]
                     }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_feature_create",
+            "Create a feature. A feature groups tasks that may span repos; each task keeps its own repo and project.",
+            json!({
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_feature_list",
+            "List features ordered by title.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_feature_get",
+            "Fetch one feature by id, including how many tasks reference it.",
+            json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "integer"}
                 },
                 "additionalProperties": false
             }),
@@ -871,6 +966,9 @@ mod tests {
             "queue_capture",
             "queue_list",
             "queue_get",
+            "queue_feature_create",
+            "queue_feature_list",
+            "queue_feature_get",
             "queue_claim_next",
             "queue_heartbeat",
             "queue_start",
@@ -961,6 +1059,7 @@ mod tests {
                 agent_pool: None,
                 required_capabilities: vec![],
                 dependencies: vec![],
+                feature: None,
                 policy: None,
                 actor: Actor::agent("mcp"),
                 context_source: None,
@@ -1099,6 +1198,113 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("include_terminal"));
+    }
+
+    #[test]
+    fn features_are_created_and_filter_capture_across_repos() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+
+        let created = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_feature_create", "arguments": {"title": "Cross-repo rollout", "body": "span services"}}),
+        );
+        assert_eq!(created["result"]["isError"], false);
+        let feature = tool_body(&created);
+        let feature_id = feature["id"].as_i64().unwrap();
+        assert_eq!(feature["title"], "Cross-repo rollout");
+
+        let first = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {
+                "title": "Migration",
+                "repo": "github.com/acme/queue",
+                "project": "queue",
+                "feature": "cross-repo rollout"
+            }}),
+        );
+        let second = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_capture", "arguments": {
+                "title": "Client",
+                "repo": "github.com/acme/client",
+                "project": "client",
+                "feature": feature_id
+            }}),
+        );
+        let other = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_capture", "arguments": {"title": "Loose note", "project": "notes"}}),
+        );
+        let first_id = tool_body(&first)["id"].as_i64().unwrap();
+        let second_id = tool_body(&second)["id"].as_i64().unwrap();
+        let other_id = tool_body(&other)["id"].as_i64().unwrap();
+        assert_eq!(tool_body(&first)["feature"], "Cross-repo rollout");
+        assert_eq!(tool_body(&second)["repo"], "github.com/acme/client");
+
+        let filtered = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_list", "arguments": {"feature": "Cross-repo rollout"}}),
+        );
+        let ids = task_ids(&tool_body(&filtered));
+        assert!(
+            ids.contains(&first_id) && ids.contains(&second_id),
+            "{ids:?}"
+        );
+        assert!(!ids.contains(&other_id));
+
+        let listed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_feature_list", "arguments": {}}),
+        );
+        let listed_body = tool_body(&listed);
+        let features = listed_body["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0]["task_count"], 2);
+
+        let fetched = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            8,
+            json!({"name": "queue_feature_get", "arguments": {"id": feature_id}}),
+        );
+        assert_eq!(tool_body(&fetched)["title"], "Cross-repo rollout");
+
+        let missing = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            9,
+            json!({"name": "queue_list", "arguments": {"feature": "no such feature"}}),
+        );
+        assert_eq!(missing["result"]["isError"], true);
+        assert_eq!(tool_body(&missing)["code"], "not_found");
     }
 
     fn task_ids(body: &Value) -> Vec<i64> {

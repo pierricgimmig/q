@@ -10,14 +10,15 @@ use std::sync::Arc;
 use clap::Parser;
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
-    CaptureRequest, ClaimRequest, CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest,
-    ListFilter, QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, TaskKind, TaskStatus, TaskSummary,
+    CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
+    EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
+    ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
+    TaskKind, TaskStatus, TaskSummary,
 };
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
 
-use crate::cli::{Commands, ProjectCommand};
+use crate::cli::{Commands, FeatureCommand, ProjectCommand};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -111,6 +112,7 @@ fn dispatch(
             capability,
             agent_pool,
             depends_on,
+            feature,
         } => {
             let context = resolve_context(directory, repo, project)?;
             let body = read_body(body, body_file.as_deref())?;
@@ -137,6 +139,7 @@ fn dispatch(
                 agent_pool: agent_pool.or(context.agent_pool),
                 required_capabilities: split_caps(capability),
                 dependencies: parse_ids(depends_on.as_deref())?,
+                feature,
                 policy: context.policy,
                 actor: human_actor(),
                 context_source: serde_json::to_value(context.source)
@@ -154,6 +157,7 @@ fn dispatch(
             kind,
             limit,
             all,
+            feature,
         } => {
             let status = match status {
                 Some(status) => Some(TaskStatus::parse(&status)?),
@@ -168,6 +172,7 @@ fn dispatch(
                 project: project.clone(),
                 repo: repo.clone(),
                 kind,
+                feature,
                 limit,
                 include_terminal: all,
             })?;
@@ -195,6 +200,8 @@ fn dispatch(
             clear_project,
             clear_repo,
             clear_agent_pool,
+            feature,
+            clear_feature,
         } => {
             let mut request = EditRequest::empty(human_actor());
             request.title = title;
@@ -220,6 +227,8 @@ fn dispatch(
             request.clear_project = clear_project;
             request.clear_repo = clear_repo;
             request.clear_agent_pool = clear_agent_pool;
+            request.feature = feature;
+            request.clear_feature = clear_feature;
             if !request.has_changes() {
                 let current = queue.get(id)?;
                 let edited = edit_in_editor(current.task.body.as_deref().unwrap_or(""))?;
@@ -469,8 +478,54 @@ fn dispatch(
             });
             Ok(())
         }
+        Commands::Feature { command } => dispatch_feature(queue, command, json),
         Commands::Project { .. } | Commands::Mcp | Commands::Skill { .. } => {
             unreachable!("handled before queue open")
+        }
+    }
+}
+
+fn dispatch_feature(queue: &Queue, command: FeatureCommand, json: bool) -> Result<(), CliError> {
+    match command {
+        FeatureCommand::Create { title, body } => {
+            let feature = queue.create_feature(CreateFeatureRequest {
+                title: title.join(" "),
+                body,
+            })?;
+            let id = feature.id;
+            emit(json, &feature, || {
+                println!("created feature #{id} {}", feature.title);
+            });
+            Ok(())
+        }
+        FeatureCommand::Ls => {
+            let features = queue.list_features()?;
+            emit(json, &serde_json::json!({"features": features}), || {
+                print_feature_list(&features);
+            });
+            Ok(())
+        }
+        FeatureCommand::Show { id } => {
+            let feature = queue.get_feature(id)?;
+            emit(json, &feature, || print_feature(&feature));
+            Ok(())
+        }
+        FeatureCommand::Edit { id, title, body } => {
+            let feature = queue.edit_feature(id, EditFeatureRequest { title, body })?;
+            emit(json, &feature, || {
+                println!("updated feature #{}", feature.id);
+            });
+            Ok(())
+        }
+        FeatureCommand::Delete { id } => {
+            let outcome = queue.delete_feature(id)?;
+            emit(json, &outcome, || {
+                println!(
+                    "deleted feature #{} {} ({} tasks detached)",
+                    outcome.id, outcome.title, outcome.tasks_detached
+                );
+            });
+            Ok(())
         }
     }
 }
@@ -668,6 +723,7 @@ const UNASSIGNED_PROJECT: &str = "(none)";
 struct TaskListRow {
     id: String,
     status: String,
+    feature: String,
     project: String,
     priority: String,
     updated: String,
@@ -691,6 +747,7 @@ fn task_list_row(task: &TaskSummary) -> TaskListRow {
     TaskListRow {
         id: task.id.to_string(),
         status: task.status.to_string(),
+        feature: display_project(task.feature.as_deref()),
         project: display_project(task.project.as_deref()),
         priority: task.priority.to_string(),
         updated: format_timestamp(task.updated_at),
@@ -721,32 +778,34 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 fn render_task_rows(rows: &[TaskListRow]) -> String {
-    let id_w = column_width("ID", rows.iter().map(|row| row.id.as_str()));
-    let status_w = column_width("STATUS", rows.iter().map(|row| row.status.as_str()));
-    let project_w = column_width("PROJECT", rows.iter().map(|row| row.project.as_str()));
-    let priority_w = column_width("PRI", rows.iter().map(|row| row.priority.as_str()));
-    let updated_w = column_width("UPDATED", rows.iter().map(|row| row.updated.as_str()));
-    let title_w = column_width("TITLE", rows.iter().map(|row| row.title.as_str()));
-    let widths = [id_w, status_w, project_w, priority_w, updated_w, title_w];
-    let align_right = [true, false, false, true, false, false];
+    let headers = [
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
+    ];
+    let align_right = [true, false, false, false, true, false, false];
+    let widths = [
+        column_width("ID", rows.iter().map(|row| row.id.as_str())),
+        column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
+        column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
+        column_width("PROJECT", rows.iter().map(|row| row.project.as_str())),
+        column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
+        column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
+        column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
+    ];
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push(format_task_line(
-        &["ID", "STATUS", "PROJECT", "PRI", "UPDATED", "TITLE"],
-        widths,
-        align_right,
-    ));
+    lines.push(format_task_line(&headers, &widths, &align_right));
     for row in rows {
         lines.push(format_task_line(
             &[
                 row.id.as_str(),
                 row.status.as_str(),
+                row.feature.as_str(),
                 row.project.as_str(),
                 row.priority.as_str(),
                 row.updated.as_str(),
                 row.title.as_str(),
             ],
-            widths,
-            align_right,
+            &widths,
+            &align_right,
         ));
     }
     lines.join("\n")
@@ -760,7 +819,7 @@ fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usiz
         .unwrap_or(0)
 }
 
-fn format_task_line(cells: &[&str], widths: [usize; 6], align_right: [bool; 6]) -> String {
+fn format_task_line(cells: &[&str], widths: &[usize], align_right: &[bool]) -> String {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index > 0 {
@@ -776,6 +835,64 @@ fn format_task_line(cells: &[&str], widths: [usize; 6], align_right: [bool; 6]) 
     line
 }
 
+fn print_feature_list(features: &[q_core::Feature]) {
+    if features.is_empty() {
+        println!("no features");
+        return;
+    }
+    let rows: Vec<FeatureListRow> = features
+        .iter()
+        .map(|feature| FeatureListRow {
+            id: feature.id.to_string(),
+            tasks: feature.task_count.to_string(),
+            updated: format_timestamp(feature.updated_at),
+            title: format_list_title(&feature.title),
+        })
+        .collect();
+    let headers = ["ID", "TASKS", "UPDATED", "TITLE"];
+    let align_right = [true, true, false, false];
+    let widths = [
+        column_width("ID", rows.iter().map(|row| row.id.as_str())),
+        column_width("TASKS", rows.iter().map(|row| row.tasks.as_str())),
+        column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
+        column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
+    ];
+    println!("{}", format_task_line(&headers, &widths, &align_right));
+    for row in &rows {
+        println!(
+            "{}",
+            format_task_line(
+                &[
+                    row.id.as_str(),
+                    row.tasks.as_str(),
+                    row.updated.as_str(),
+                    row.title.as_str(),
+                ],
+                &widths,
+                &align_right,
+            )
+        );
+    }
+}
+
+struct FeatureListRow {
+    id: String,
+    tasks: String,
+    updated: String,
+    title: String,
+}
+
+fn print_feature(feature: &q_core::Feature) {
+    println!("#{} {}", feature.id, feature.title);
+    println!("tasks: {}", feature.task_count);
+    println!("public_id: {}", feature.public_id);
+    println!("created_at: {}", format_timestamp(feature.created_at));
+    println!("updated_at: {}", format_timestamp(feature.updated_at));
+    if let Some(body) = &feature.body {
+        println!("\n{body}");
+    }
+}
+
 fn print_detail(detail: &q_core::TaskDetail) {
     let task = &detail.task;
     println!("#{} {} [{}]", task.id, task.title, task.status);
@@ -785,6 +902,7 @@ fn print_detail(detail: &q_core::TaskDetail) {
     );
     println!("project: {}", task.project.as_deref().unwrap_or("-"));
     println!("repo: {}", task.repo.as_deref().unwrap_or("-"));
+    println!("feature: {}", task.feature.as_deref().unwrap_or("-"));
     println!("capture_path: {}", task.capture_path);
     if let Some(relative) = &task.repo_relative_path {
         println!("repo_relative_path: {relative}");
@@ -884,6 +1002,7 @@ mod tests {
             TaskListRow {
                 id: "12".into(),
                 status: "inbox".into(),
+                feature: "rollout".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
                 updated: "2026-09-22T20:00:00Z".into(),
@@ -892,6 +1011,7 @@ mod tests {
             TaskListRow {
                 id: "3".into(),
                 status: "in_progress".into(),
+                feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "10".into(),
                 updated: "2026-09-22T19:00:00Z".into(),
@@ -903,16 +1023,20 @@ mod tests {
         assert_eq!(lines.len(), 3);
         let width = lines[0].chars().count();
         assert!(lines.iter().all(|line| line.chars().count() == width));
+        let feature_at = char_index(lines[0], "FEATURE");
         let project_at = char_index(lines[0], "PROJECT");
+        assert_eq!(char_index(lines[1], "rollout"), feature_at);
         assert_eq!(char_index(lines[1], "alpha"), project_at);
-        assert_eq!(char_index(lines[2], "(none)"), project_at);
+        assert!(chars_at(lines[2], feature_at).starts_with("(none)"));
+        assert!(chars_at(lines[2], project_at).starts_with("(none)"));
         let updated_at = char_index(lines[0], "UPDATED");
         assert_eq!(char_index(lines[1], "2026-09-22T20:00:00Z"), updated_at);
         assert_eq!(char_index(lines[2], "2026-09-22T19:00:00Z"), updated_at);
         assert!(lines[2].contains('…'));
         assert!(!table.contains(&long));
         assert!(lines[0].find("ID").unwrap() < lines[0].find("STATUS").unwrap());
-        assert!(lines[0].find("STATUS").unwrap() < lines[0].find("PROJECT").unwrap());
+        assert!(lines[0].find("STATUS").unwrap() < lines[0].find("FEATURE").unwrap());
+        assert!(lines[0].find("FEATURE").unwrap() < lines[0].find("PROJECT").unwrap());
         assert!(lines[0].find("PROJECT").unwrap() < lines[0].find("PRI").unwrap());
         assert!(lines[0].find("PRI").unwrap() < lines[0].find("UPDATED").unwrap());
         assert!(lines[0].find("UPDATED").unwrap() < lines[0].find("TITLE").unwrap());
@@ -926,6 +1050,7 @@ mod tests {
             TaskListRow {
                 id: "4".into(),
                 status: "inbox".into(),
+                feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
                 updated: "2026-09-22T20:04:00Z".into(),
@@ -934,6 +1059,7 @@ mod tests {
             TaskListRow {
                 id: "2".into(),
                 status: "ready".into(),
+                feature: "(none)".into(),
                 project: "beta".into(),
                 priority: "1".into(),
                 updated: "2026-09-22T20:02:00Z".into(),
@@ -942,6 +1068,7 @@ mod tests {
             TaskListRow {
                 id: "1".into(),
                 status: "inbox".into(),
+                feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "0".into(),
                 updated: "2026-09-22T20:01:00Z".into(),
@@ -957,10 +1084,10 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  PROJECT  PRI  UPDATED               TITLE
- 4  inbox   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
- 2  ready   beta       1  2026-09-22T20:02:00Z  Compare encodings
- 1  inbox   (none)     0  2026-09-22T20:01:00Z  Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
+ 4  inbox   (none)   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
+ 2  ready   (none)   beta       1  2026-09-22T20:02:00Z  Compare encodings
+ 1  inbox   (none)   (none)     0  2026-09-22T20:01:00Z  Unassigned capture"
         );
     }
 
@@ -969,5 +1096,14 @@ ID  STATUS  PROJECT  PRI  UPDATED               TITLE
             .find(needle)
             .unwrap_or_else(|| panic!("missing {needle} in {line}"));
         line[..byte].chars().count()
+    }
+
+    fn chars_at(line: &str, at: usize) -> &str {
+        let byte = line
+            .char_indices()
+            .nth(at)
+            .map(|(index, _)| index)
+            .unwrap_or(line.len());
+        &line[byte..]
     }
 }

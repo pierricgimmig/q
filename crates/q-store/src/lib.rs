@@ -14,8 +14,9 @@ use q_core::{
     acceptance_criteria, default_lease, ensure_transition, format_timestamp, lease_from_minutes,
     normalize_repo_url, parse_timestamp, readiness_warnings, Actor, Artifact, ArtifactInput,
     BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease, ClaimOutcome, ClaimRequest,
-    ClaimTask, CompleteRequest, DeleteOutcome, DeleteRequest, EditRequest, Event, HeartbeatRequest,
-    ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest,
+    ClaimTask, CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome,
+    DeleteRequest, EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter,
+    ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest,
     RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
     StatusCounts, Task, TaskDetail, TaskKind, TaskStatus, TaskSummary,
 };
@@ -28,10 +29,19 @@ use uuid::Uuid;
 pub use dbpath::{default_db_path, resolve_db_path};
 
 const TASK_SELECT: &str = "\
-SELECT id, public_id, title, body, original_capture, status, kind, priority, risk, \
-project_name, repo, capture_path, repo_relative_path, git_root, git_head, agent_pool, \
-required_capabilities_json, blocked_reason, created_at, updated_at \
-FROM tasks";
+SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_capture, tasks.status, \
+tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.capture_path, \
+tasks.repo_relative_path, tasks.git_root, tasks.git_head, tasks.agent_pool, \
+tasks.required_capabilities_json, tasks.blocked_reason, tasks.created_at, tasks.updated_at, \
+tasks.feature_id, features.title \
+FROM tasks \
+LEFT JOIN features ON features.id = tasks.feature_id";
+
+const FEATURE_SELECT: &str = "\
+SELECT features.id, features.public_id, features.title, features.body, features.created_at, \
+features.updated_at, \
+(SELECT COUNT(*) FROM tasks WHERE tasks.feature_id = features.id) \
+FROM features";
 
 const CLAIM_SELECT: &str = "\
 SELECT id, task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at, \
@@ -215,6 +225,8 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         required_capabilities,
         dependencies: Vec::new(),
         blocked_reason: row.get(17)?,
+        feature_id: row.get(20)?,
+        feature: row.get(21)?,
         created_at: parse_time(18, &created_at)?,
         updated_at: parse_time(19, &updated_at)?,
     })
@@ -264,7 +276,7 @@ fn load_dependencies(conn: &Connection, task_id: i64) -> Result<Vec<i64>, QueueE
 fn load_task(conn: &Connection, id: i64) -> Result<Task, QueueError> {
     let mut task = conn
         .query_row(
-            &format!("{TASK_SELECT} WHERE id = ?"),
+            &format!("{TASK_SELECT} WHERE tasks.id = ?"),
             params![id],
             map_task,
         )
@@ -875,6 +887,98 @@ fn count_for_task(conn: &Connection, sql: &str, task_id: i64) -> Result<i64, Que
     conn.query_row(sql, params![task_id], |row| row.get(0)).db()
 }
 
+fn clean_feature_title(title: &str) -> Result<String, QueueError> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(QueueError::InvalidInput("title is required".into()));
+    }
+    if title.chars().any(|ch| ch == '\n' || ch == '\r') {
+        return Err(QueueError::InvalidInput(
+            "feature title must be a single line".into(),
+        ));
+    }
+    Ok(title.to_string())
+}
+
+fn optional_body(body: Option<&str>) -> Option<String> {
+    body.map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_feature_id(conn: &Connection, selector: &str) -> Result<i64, QueueError> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(QueueError::InvalidInput("feature is required".into()));
+    }
+    if let Ok(id) = selector.parse::<i64>() {
+        let exists: Option<i64> = conn
+            .query_row("SELECT id FROM features WHERE id = ?", params![id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .db()?;
+        if exists.is_some() {
+            return Ok(id);
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT id FROM features WHERE title = ?1 COLLATE NOCASE")
+        .db()?;
+    let rows = stmt.query_map(params![selector], |row| row.get(0)).db()?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.db()?);
+    }
+    match ids.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(QueueError::FeatureNotFound(selector.to_string())),
+        _ => Err(QueueError::Conflict(format!(
+            "feature title '{selector}' matches more than one feature; pass the id"
+        ))),
+    }
+}
+
+fn optional_feature_id(
+    conn: &Connection,
+    selector: Option<&str>,
+) -> Result<Option<i64>, QueueError> {
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(QueueError::InvalidInput("feature is required".into()));
+    }
+    Ok(Some(resolve_feature_id(conn, selector)?))
+}
+
+fn map_feature(row: &rusqlite::Row<'_>) -> rusqlite::Result<Feature> {
+    let public_id: String = row.get(1)?;
+    let created_at: String = row.get(4)?;
+    let updated_at: String = row.get(5)?;
+    Ok(Feature {
+        id: row.get(0)?,
+        public_id: parse_uuid(1, &public_id)?,
+        title: row.get(2)?,
+        body: row.get(3)?,
+        created_at: parse_time(4, &created_at)?,
+        updated_at: parse_time(5, &updated_at)?,
+        task_count: row.get(6)?,
+    })
+}
+
+fn load_feature(conn: &Connection, id: i64) -> Result<Feature, QueueError> {
+    conn.query_row(
+        &format!("{FEATURE_SELECT} WHERE features.id = ?"),
+        params![id],
+        map_feature,
+    )
+    .optional()
+    .db()?
+    .ok_or_else(|| QueueError::FeatureNotFound(id.to_string()))
+}
+
 fn ensure_exists(conn: &Connection, id: i64) -> Result<(), QueueError> {
     let exists: i64 = conn
         .query_row(
@@ -931,13 +1035,15 @@ impl QueueService for Queue {
         } else {
             None
         };
+        let feature_id = optional_feature_id(&tx, request.feature.as_deref())?;
         let public_id = Uuid::now_v7().to_string();
         tx.execute(
             "INSERT INTO tasks (
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
-                git_head, agent_pool, required_capabilities_json, blocked_reason, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             params![
                 public_id,
                 title,
@@ -955,6 +1061,7 @@ impl QueueService for Queue {
                 &request.git_head,
                 &request.agent_pool,
                 caps,
+                feature_id,
                 &now,
                 &now
             ],
@@ -976,6 +1083,7 @@ impl QueueService for Queue {
                 "risk": request.risk.as_str(),
                 "project": project,
                 "repo": repo,
+                "feature_id": feature_id,
                 "capture_path": request.capture_path,
                 "source": request.context_source,
             }),
@@ -996,34 +1104,57 @@ impl QueueService for Queue {
             .map(str::to_string);
         let repo = norm_repo(filter.repo.as_deref());
         let kind = filter.kind.map(|kind| kind.as_str().to_string());
+        let feature_id = optional_feature_id(&conn, filter.feature.as_deref())?;
         let limit = i64::from(clamp_limit(filter.limit));
         // `include_terminal` applies only when status is unset. An explicit
         // status, including done or cancelled, is honored on its own.
         let include_terminal = i64::from(filter.include_terminal);
         let mut stmt = conn
             .prepare(
-                "SELECT id, public_id, title, status, kind, priority, risk, project_name, repo, \
-                 agent_pool, created_at, updated_at \
+                "SELECT tasks.id, tasks.public_id, tasks.title, tasks.status, tasks.kind, \
+                 tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.agent_pool, \
+                 tasks.created_at, tasks.updated_at, tasks.feature_id, features.title \
                  FROM tasks \
-                 WHERE ((?1 IS NOT NULL AND status = ?1) \
-                     OR (?1 IS NULL AND (?6 != 0 OR status NOT IN ('done', 'cancelled')))) \
-                   AND (?2 IS NULL OR project_name = ?2) \
-                   AND (?3 IS NULL OR repo = ?3) \
-                   AND (?4 IS NULL OR kind = ?4) \
+                 LEFT JOIN features ON features.id = tasks.feature_id \
+                 WHERE ((?1 IS NOT NULL AND tasks.status = ?1) \
+                     OR (?1 IS NULL AND (?6 != 0 OR tasks.status NOT IN ('done', 'cancelled')))) \
+                   AND (?2 IS NULL OR tasks.project_name = ?2) \
+                   AND (?3 IS NULL OR tasks.repo = ?3) \
+                   AND (?4 IS NULL OR tasks.kind = ?4) \
+                   AND (?7 IS NULL OR tasks.feature_id = ?7) \
                  ORDER BY \
-                   CASE WHEN project_name IS NULL OR TRIM(project_name) = '' THEN 1 ELSE 0 END, \
                    CASE \
-                     WHEN project_name IS NULL OR TRIM(project_name) = '' THEN '' \
-                     ELSE project_name \
+                     WHEN features.title IS NULL OR TRIM(features.title) = '' THEN 1 \
+                     ELSE 0 \
+                   END, \
+                   CASE \
+                     WHEN features.title IS NULL OR TRIM(features.title) = '' THEN '' \
+                     ELSE features.title \
                    END COLLATE NOCASE, \
-                   updated_at DESC, \
-                   id DESC \
+                   CASE \
+                     WHEN tasks.project_name IS NULL OR TRIM(tasks.project_name) = '' THEN 1 \
+                     ELSE 0 \
+                   END, \
+                   CASE \
+                     WHEN tasks.project_name IS NULL OR TRIM(tasks.project_name) = '' THEN '' \
+                     ELSE tasks.project_name \
+                   END COLLATE NOCASE, \
+                   tasks.updated_at DESC, \
+                   tasks.id DESC \
                  LIMIT ?5",
             )
             .db()?;
         let rows = stmt
             .query_map(
-                params![status, project, repo, kind, limit, include_terminal],
+                params![
+                    status,
+                    project,
+                    repo,
+                    kind,
+                    limit,
+                    include_terminal,
+                    feature_id
+                ],
                 |row| {
                     let public_id: String = row.get(1)?;
                     let status: String = row.get(3)?;
@@ -1044,6 +1175,8 @@ impl QueueService for Queue {
                         agent_pool: row.get(9)?,
                         created_at: parse_time(10, &created_at)?,
                         updated_at: parse_time(11, &updated_at)?,
+                        feature_id: row.get(12)?,
+                        feature: row.get(13)?,
                     })
                 },
             )
@@ -1063,6 +1196,11 @@ impl QueueService for Queue {
     fn edit(&self, id: i64, request: EditRequest) -> Result<Task, QueueError> {
         if !request.has_changes() {
             return Err(QueueError::InvalidInput("no changes specified".into()));
+        }
+        if request.clear_feature && request.feature.is_some() {
+            return Err(QueueError::InvalidInput(
+                "pass either a feature or clear_feature, not both".into(),
+            ));
         }
         let mut conn = open_connection(&self.path)?;
         let tx = conn
@@ -1151,13 +1289,21 @@ impl QueueService for Queue {
             }
             fields.push("project");
         }
+        if request.clear_feature {
+            task.feature_id = None;
+            task.feature = None;
+            fields.push("feature");
+        } else if let Some(selector) = request.feature.as_deref() {
+            task.feature_id = Some(resolve_feature_id(&tx, selector)?);
+            fields.push("feature");
+        }
         let caps = serde_json::to_string(&task.required_capabilities)
             .map_err(|err| QueueError::InvalidInput(err.to_string()))?;
         tx.execute(
             "UPDATE tasks SET
                 title = ?, body = ?, kind = ?, priority = ?, risk = ?, project_id = ?,
                 project_name = ?, repo = ?, agent_pool = ?, required_capabilities_json = ?,
-                updated_at = ?
+                feature_id = ?, updated_at = ?
              WHERE id = ?",
             params![
                 task.title,
@@ -1170,6 +1316,7 @@ impl QueueService for Queue {
                 task.repo,
                 task.agent_pool,
                 caps,
+                task.feature_id,
                 now,
                 id
             ],
@@ -1753,6 +1900,103 @@ impl QueueService for Queue {
         )?;
         tx.commit().db()?;
         self.with_conn(|conn| load_task(conn, id))
+    }
+
+    fn create_feature(&self, request: CreateFeatureRequest) -> Result<Feature, QueueError> {
+        let title = clean_feature_title(&request.title)?;
+        let body = optional_body(request.body.as_deref());
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let public_id = Uuid::now_v7().to_string();
+        tx.execute(
+            "INSERT INTO features (public_id, title, body, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![public_id, title, body, now, now],
+        )
+        .db()?;
+        let id = tx.last_insert_rowid();
+        tx.commit().db()?;
+        self.with_conn(|conn| load_feature(conn, id))
+    }
+
+    fn list_features(&self) -> Result<Vec<Feature>, QueueError> {
+        let conn = open_connection(&self.path)?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "{FEATURE_SELECT} ORDER BY features.title COLLATE NOCASE, features.id"
+            ))
+            .db()?;
+        let rows = stmt.query_map(params![], map_feature).db()?;
+        let mut features = Vec::new();
+        for row in rows {
+            features.push(row.db()?);
+        }
+        Ok(features)
+    }
+
+    fn get_feature(&self, id: i64) -> Result<Feature, QueueError> {
+        self.with_conn(|conn| load_feature(conn, id))
+    }
+
+    fn edit_feature(&self, id: i64, request: EditFeatureRequest) -> Result<Feature, QueueError> {
+        if !request.has_changes() {
+            return Err(QueueError::InvalidInput("no changes specified".into()));
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let mut feature = load_feature(&tx, id)?;
+        if let Some(title) = request.title.as_deref() {
+            feature.title = clean_feature_title(title)?;
+        }
+        if let Some(body) = request.body.as_deref() {
+            feature.body = optional_body(Some(body));
+        }
+        tx.execute(
+            "UPDATE features SET title = ?, body = ?, updated_at = ? WHERE id = ?",
+            params![feature.title, feature.body, now, id],
+        )
+        .db()?;
+        tx.commit().db()?;
+        self.with_conn(|conn| load_feature(conn, id))
+    }
+
+    fn delete_feature(&self, id: i64) -> Result<DeleteFeatureOutcome, QueueError> {
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let feature = load_feature(&tx, id)?;
+        let tasks_detached: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE feature_id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .db()?;
+        tx.execute(
+            "UPDATE tasks SET feature_id = NULL WHERE feature_id = ?",
+            params![id],
+        )
+        .db()?;
+        let deleted = tx
+            .execute("DELETE FROM features WHERE id = ?", params![id])
+            .db()?;
+        if deleted != 1 {
+            return Err(QueueError::FeatureNotFound(id.to_string()));
+        }
+        tx.commit().db()?;
+        Ok(DeleteFeatureOutcome {
+            id: feature.id,
+            public_id: feature.public_id,
+            title: feature.title,
+            tasks_detached,
+        })
     }
 }
 

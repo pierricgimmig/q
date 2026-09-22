@@ -8,9 +8,10 @@ use rusqlite::{params, Connection};
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
-    CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest, ListFilter, ProjectPolicy,
-    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
+    CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
+    HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, ReadyRequest,
+    RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, TaskKind,
+    TaskStatus, NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -76,6 +77,7 @@ fn capture_with(queue: &Queue, title: &str, risk: RiskLevel, policy: Option<Proj
             agent_pool: None,
             required_capabilities: vec![],
             dependencies: vec![],
+            feature: None,
             policy,
             actor: actor(),
             context_source: Some("test".into()),
@@ -136,7 +138,15 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
+    let feature_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(feature_column, 1);
 
     let (queue, _) = (Queue::open(&path).unwrap(), path.clone());
     let id = capture(&queue, "persist me");
@@ -600,6 +610,7 @@ fn project_cap_limits_active_claims() {
             agent_pool: None,
             required_capabilities: vec![],
             dependencies: vec![],
+            feature: None,
             policy: Some(policy),
             actor: actor(),
             context_source: None,
@@ -621,6 +632,7 @@ fn project_cap_limits_active_claims() {
             agent_pool: None,
             required_capabilities: vec![],
             dependencies: vec![],
+            feature: None,
             policy: None,
             actor: actor(),
             context_source: None,
@@ -745,6 +757,7 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
             project: None,
             repo: None,
             kind: None,
+            feature: None,
             limit: 100,
             include_terminal: false,
         })
@@ -798,6 +811,7 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
             project: None,
             repo: None,
             kind: None,
+            feature: None,
             limit: 100,
             include_terminal: false,
         })
@@ -934,6 +948,7 @@ fn empty_claim_is_success_and_list_filters() {
             project: Some("demo".into()),
             repo: Some("https://github.com/acme/demo.git".into()),
             kind: Some(TaskKind::Implementation),
+            feature: None,
             limit: 10,
             include_terminal: false,
         })
@@ -962,6 +977,7 @@ fn capture_named(queue: &Queue, title: &str, project: Option<&str>) -> i64 {
             agent_pool: None,
             required_capabilities: vec![],
             dependencies: vec![],
+            feature: None,
             policy: None,
             actor: actor(),
             context_source: Some("test".into()),
@@ -1028,6 +1044,7 @@ fn listed(
             project: None,
             repo: None,
             kind: None,
+            feature: None,
             limit,
             include_terminal,
         })
@@ -1124,6 +1141,7 @@ fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
             project: Some("beta".into()),
             repo: None,
             kind: None,
+            feature: None,
             limit: 100,
             include_terminal: true,
         })
@@ -1134,4 +1152,337 @@ fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
     );
     let blank_row = queue.get(blank).unwrap().task;
     assert_eq!(blank_row.project.as_deref(), Some("   "));
+}
+
+fn capture_in(
+    queue: &Queue,
+    title: &str,
+    project: Option<&str>,
+    repo: Option<&str>,
+    feature: Option<&str>,
+) -> i64 {
+    queue
+        .capture(CaptureRequest {
+            title: title.into(),
+            body: None,
+            kind: TaskKind::Implementation,
+            priority: 0,
+            risk: RiskLevel::Low,
+            project: project.map(str::to_string),
+            repo: repo.map(str::to_string),
+            capture_path: "/tmp/demo".into(),
+            repo_relative_path: None,
+            git_root: None,
+            git_head: None,
+            agent_pool: None,
+            required_capabilities: vec![],
+            dependencies: vec![],
+            feature: feature.map(str::to_string),
+            policy: None,
+            actor: actor(),
+            context_source: Some("test".into()),
+        })
+        .unwrap()
+        .id
+}
+
+fn feature_ids(queue: &Queue, feature: Option<&str>, include_terminal: bool) -> Vec<i64> {
+    queue
+        .list(ListFilter {
+            status: None,
+            project: None,
+            repo: None,
+            kind: None,
+            feature: feature.map(str::to_string),
+            limit: 100,
+            include_terminal,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|task| task.id)
+        .collect()
+}
+
+#[test]
+fn features_group_tasks_across_repos_and_resolve_by_id_or_title() {
+    let (queue, _) = queue();
+    let rollout = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Cross-repo rollout".into(),
+            body: Some("Ship the queue across services".into()),
+        })
+        .unwrap();
+    assert_eq!(rollout.task_count, 0);
+    assert!(!rollout.public_id.is_nil());
+
+    let one = capture_in(
+        &queue,
+        "Add the migration",
+        Some("queue"),
+        Some("github.com/acme/queue"),
+        Some("cross-repo rollout"),
+    );
+    let two = capture_in(
+        &queue,
+        "Wire the client",
+        Some("client"),
+        Some("git@github.com:acme/client.git"),
+        Some(&rollout.id.to_string()),
+    );
+    let other = capture_in(
+        &queue,
+        "Unrelated inbox note",
+        Some("notes"),
+        Some("github.com/acme/notes"),
+        None,
+    );
+    let done = capture_in(
+        &queue,
+        "Already shipped",
+        Some("queue"),
+        Some("github.com/acme/queue"),
+        Some("Cross-repo rollout"),
+    );
+    finish(&queue, done);
+
+    let open = feature_ids(&queue, Some("Cross-repo rollout"), false);
+    assert_eq!(open, vec![two, one]);
+    assert!(!open.contains(&other));
+    assert!(!open.contains(&done));
+    assert_eq!(
+        feature_ids(&queue, Some(&rollout.id.to_string()), true),
+        vec![two, done, one]
+    );
+
+    let listed = queue
+        .list(ListFilter {
+            feature: Some(rollout.id.to_string()),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert!(listed
+        .iter()
+        .all(|task| task.feature_id == Some(rollout.id)));
+    assert!(listed
+        .iter()
+        .all(|task| task.feature.as_deref() == Some("Cross-repo rollout")));
+    let repos: Vec<_> = listed.iter().filter_map(|task| task.repo.clone()).collect();
+    assert!(repos.iter().any(|repo| repo == "github.com/acme/queue"));
+    assert!(repos.iter().any(|repo| repo == "github.com/acme/client"));
+
+    let default_rows = queue.list(ListFilter::default()).unwrap();
+    let default_ids: Vec<_> = default_rows.iter().map(|task| task.id).collect();
+    assert!(default_ids.contains(&one) && default_ids.contains(&other));
+    assert!(!default_ids.contains(&done));
+    assert!(default_rows.iter().any(|task| task.feature.is_none()));
+
+    let missing = queue.list(ListFilter {
+        feature: Some("missing feature".into()),
+        ..ListFilter::default()
+    });
+    assert!(matches!(missing, Err(QueueError::FeatureNotFound(_))));
+
+    let duplicate = queue
+        .create_feature(CreateFeatureRequest {
+            title: "cross-repo rollout".into(),
+            body: None,
+        })
+        .unwrap();
+    let ambiguous = queue.capture(CaptureRequest {
+        title: "should not land".into(),
+        body: None,
+        kind: TaskKind::Other,
+        priority: 0,
+        risk: RiskLevel::Low,
+        project: None,
+        repo: None,
+        capture_path: "/tmp".into(),
+        repo_relative_path: None,
+        git_root: None,
+        git_head: None,
+        agent_pool: None,
+        required_capabilities: vec![],
+        dependencies: vec![],
+        feature: Some("Cross-repo rollout".into()),
+        policy: None,
+        actor: actor(),
+        context_source: None,
+    });
+    assert!(matches!(ambiguous, Err(QueueError::Conflict(_))));
+
+    let by_id = capture_in(
+        &queue,
+        "Still attached by id",
+        Some("queue"),
+        Some("github.com/acme/queue"),
+        Some(&duplicate.id.to_string()),
+    );
+    assert_eq!(
+        queue.get(by_id).unwrap().task.feature_id,
+        Some(duplicate.id)
+    );
+
+    let mut edit = EditRequest::empty(actor());
+    edit.feature = Some(rollout.id.to_string());
+    edit.clear_feature = true;
+    assert!(matches!(
+        queue.edit(one, edit),
+        Err(QueueError::InvalidInput(_))
+    ));
+    let mut clear = EditRequest::empty(actor());
+    clear.clear_feature = true;
+    let cleared = queue.edit(two, clear).unwrap();
+    assert!(cleared.feature_id.is_none());
+    assert!(cleared.feature.is_none());
+
+    let renamed = queue
+        .edit_feature(
+            rollout.id,
+            EditFeatureRequest {
+                title: Some("Rollout".into()),
+                body: Some("  ".into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(renamed.title, "Rollout");
+    assert!(renamed.body.is_none());
+    assert!(renamed.task_count >= 1);
+
+    let removed = queue.delete_feature(rollout.id).unwrap();
+    assert!(removed.tasks_detached >= 1);
+    assert!(queue.get(one).unwrap().task.feature_id.is_none());
+    assert!(matches!(
+        queue.get_feature(rollout.id),
+        Err(QueueError::FeatureNotFound(_))
+    ));
+    assert_eq!(
+        queue.get(by_id).unwrap().task.feature_id,
+        Some(duplicate.id)
+    );
+}
+
+#[test]
+fn list_sorts_by_feature_then_project_then_updated_at() {
+    let (queue, path) = queue();
+    let alpha = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Alpha".into(),
+            body: None,
+        })
+        .unwrap();
+    let beta = queue
+        .create_feature(CreateFeatureRequest {
+            title: "beta".into(),
+            body: None,
+        })
+        .unwrap();
+    let alpha_m = capture_in(&queue, "alpha m", Some("m"), None, Some("Alpha"));
+    let alpha_old = capture_in(&queue, "alpha old", Some("a"), None, Some("Alpha"));
+    let alpha_new = capture_in(&queue, "alpha new", Some("a"), None, Some("Alpha"));
+    let beta_live = capture_in(&queue, "beta live", Some("a"), None, Some("beta"));
+    let none_new = capture_in(&queue, "none new", Some("a"), None, None);
+    let none_old = capture_in(&queue, "none old", Some("z"), None, None);
+    set_updated(&path, alpha_m, "2026-03-01T00:00:00Z");
+    set_updated(&path, alpha_old, "2026-01-01T00:00:00Z");
+    set_updated(&path, alpha_new, "2026-06-01T00:00:00Z");
+    set_updated(&path, beta_live, "2026-12-01T00:00:00Z");
+    set_updated(&path, none_new, "2026-12-15T00:00:00Z");
+    set_updated(&path, none_old, "2026-02-01T00:00:00Z");
+
+    assert_eq!(
+        feature_ids(&queue, None, false),
+        vec![alpha_new, alpha_old, alpha_m, beta_live, none_new, none_old]
+    );
+    assert_eq!(
+        alpha.id,
+        queue.get(alpha_new).unwrap().task.feature_id.unwrap()
+    );
+    assert_eq!(
+        beta.id,
+        queue.get(beta_live).unwrap().task.feature_id.unwrap()
+    );
+
+    let features = queue.list_features().unwrap();
+    assert_eq!(
+        features
+            .iter()
+            .map(|feature| feature.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "beta"]
+    );
+}
+
+#[test]
+fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
+    let path = temp_db();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(super::schema::SCHEMA_V1).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+         );
+         INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tasks (
+            public_id, title, original_capture, status, kind, priority, risk, capture_path,
+            required_capabilities_json, created_at, updated_at
+         ) VALUES (
+            '018f1a7e-7b6a-7c10-8000-000000000001', 'legacy', 'legacy', 'inbox',
+            'implementation', 0, 'low', '/tmp', '[]', '2026-01-01T00:00:00Z',
+            '2026-01-01T00:00:00Z'
+         )",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let queue = Queue::open(&path).unwrap();
+    let legacy = queue.list(ListFilter::default()).unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert!(legacy[0].feature_id.is_none());
+    assert!(legacy[0].feature.is_none());
+    let task_id = legacy[0].id;
+
+    let feature = queue
+        .create_feature(CreateFeatureRequest {
+            title: "Legacy group".into(),
+            body: None,
+        })
+        .unwrap();
+    let mut edit = EditRequest::empty(actor());
+    edit.feature = Some(feature.title.clone());
+    queue.edit(task_id, edit).unwrap();
+    assert_eq!(
+        queue.get(task_id).unwrap().task.feature.as_deref(),
+        Some("Legacy group")
+    );
+
+    let conn = super::open_connection(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 2);
+    let rejected = conn.execute(
+        "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
+        params![task_id],
+    );
+    assert!(
+        rejected.is_err(),
+        "feature_id foreign key should be enforced"
+    );
+    conn.execute("DELETE FROM features WHERE id = ?1", params![feature.id])
+        .unwrap();
+    let feature_id: Option<i64> = conn
+        .query_row(
+            "SELECT feature_id FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(feature_id.is_none());
 }
