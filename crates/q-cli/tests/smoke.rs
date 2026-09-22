@@ -113,31 +113,20 @@ fn capture_ready_and_claim_json_stay_on_protocol_streams() {
     assert_eq!(claim["reason"], "no_eligible_ready_tasks");
     assert!(!String::from_utf8_lossy(&empty.stdout).contains("INFO"));
 
-    let not_ready = bin()
-        .args(["--db", db.to_str().unwrap(), "ready", &id.to_string()])
-        .output()
-        .unwrap();
-    assert!(!not_ready.status.success());
-    let ready_err = String::from_utf8_lossy(&not_ready.stderr);
+    let ready = run(bin().args(["--db", db.to_str().unwrap(), "ready", &id.to_string()]));
+    let ready_out = String::from_utf8_lossy(&ready.stdout);
+    assert!(ready_out.contains("ready"), "{ready_out}");
+    let ready_err = String::from_utf8_lossy(&ready.stderr);
     assert!(ready_err.contains("Goal"), "{ready_err}");
-    assert!(ready_err.contains("force"), "{ready_err}");
-    let still = run(bin().args([
+    let shown = run(bin().args([
         "--db",
         db.to_str().unwrap(),
         "show",
         &id.to_string(),
         "--json",
     ]));
-    let still: Value = serde_json::from_slice(&still.stdout).unwrap();
-    assert_eq!(still["status"], "inbox");
-
-    run(bin().args([
-        "--db",
-        db.to_str().unwrap(),
-        "ready",
-        &id.to_string(),
-        "--force",
-    ]));
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["status"], "ready");
     let claimed = run(bin().env("RUST_LOG", "info").args([
         "--db",
         db.to_str().unwrap(),

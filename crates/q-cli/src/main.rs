@@ -243,10 +243,9 @@ fn dispatch(
             emit(json, &task, || println!("updated #{}", task.id));
             Ok(())
         }
-        Commands::Ready { id, force } => {
+        Commands::Ready { id } => {
             let outcome = queue.mark_ready(ReadyRequest {
                 task_id: id,
-                force,
                 actor: human_actor(),
             })?;
             for warning in &outcome.warnings {

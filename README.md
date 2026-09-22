@@ -75,7 +75,7 @@ q block 184 --reason "Need storage-format decision first"
 q cancel 184 --reason "Superseded by task 212"
 ```
 
-`q ready` is the permission boundary. A task is sufficiently specified when the body contains Goal, Scope, Deliverable, and Acceptance criteria. Sparse tasks print the missing recommended sections and require `--force`. Recommended sections also include Repository/target, Constraints, and Dependencies. The original capture text is kept after later edits.
+`q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
 
 ## Claim lifecycle
 

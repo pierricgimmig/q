@@ -17,10 +17,7 @@ pub use repo::normalize_repo_url;
 pub use service::QueueService;
 pub use timeutil::{format_timestamp, parse_timestamp};
 pub use transition::{ensure_transition, transition_allowed};
-pub use validate::{
-    acceptance_criteria, is_sufficiently_specified, missing_recommended_sections,
-    readiness_warnings,
-};
+pub use validate::{acceptance_criteria, missing_recommended_sections, readiness_warnings};
 
 pub const DEFAULT_LEASE_MINUTES: u64 = 45;
 pub const MIN_LEASE_MINUTES: u64 = 1;

@@ -592,7 +592,6 @@ impl EditRequest {
 #[derive(Debug, Clone)]
 pub struct ReadyRequest {
     pub task_id: i64,
-    pub force: bool,
     pub actor: Actor,
 }
 

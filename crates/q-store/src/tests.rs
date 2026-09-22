@@ -95,7 +95,6 @@ fn make_ready(queue: &Queue, id: i64) {
     queue
         .mark_ready(ReadyRequest {
             task_id: id,
-            force: false,
             actor: actor(),
         })
         .unwrap();
@@ -176,36 +175,28 @@ fn capture_preserves_original_text_and_normalizes_repo() {
 }
 
 #[test]
-fn ready_requires_force_when_sparse_and_records_ready_event() {
+fn sparse_inbox_task_can_be_marked_ready() {
     let (queue, _) = queue();
     let id = capture(&queue, "sparse idea");
-    let err = queue
-        .mark_ready(ReadyRequest {
-            task_id: id,
-            force: false,
-            actor: actor(),
-        })
-        .unwrap_err();
-    match err {
-        QueueError::Insufficient(message) => {
-            assert!(message.contains("Goal"));
-            assert!(message.contains("--force"));
-        }
-        other => panic!("unexpected {other}"),
-    }
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
-    queue
+    let outcome = queue
         .mark_ready(ReadyRequest {
             task_id: id,
-            force: true,
             actor: actor(),
         })
         .unwrap();
+    assert_eq!(outcome.task.status, TaskStatus::Ready);
+    assert!(outcome
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("Goal")));
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
+    let events = queue.events(id).unwrap();
+    assert!(events.iter().any(|event| event.event_type == "task_ready"));
 }
 
 #[test]
-fn specified_task_can_be_marked_ready_without_force() {
+fn specified_task_can_be_marked_ready() {
     let (queue, _) = queue();
     let id = capture(&queue, "specified");
     make_ready(&queue, id);
@@ -508,7 +499,6 @@ fn inbox_and_high_risk_tasks_are_not_claimed_by_default() {
     queue
         .mark_ready(ReadyRequest {
             task_id: external,
-            force: true,
             actor: actor(),
         })
         .unwrap();
@@ -643,7 +633,6 @@ fn project_cap_limits_active_claims() {
         queue
             .mark_ready(ReadyRequest {
                 task_id: id,
-                force: false,
                 actor: actor(),
             })
             .unwrap();

@@ -8,8 +8,6 @@ const RECOMMENDED: &[(&str, &str)] = &[
     ("Dependencies", "dependenc"),
 ];
 
-const CORE: &[&str] = &["Goal", "Scope", "Deliverable", "Acceptance criteria"];
-
 pub fn missing_recommended_sections(body: Option<&str>) -> Vec<String> {
     let headings = headings(body.unwrap_or(""));
     RECOMMENDED
@@ -17,12 +15,6 @@ pub fn missing_recommended_sections(body: Option<&str>) -> Vec<String> {
         .filter(|(_, needle)| !headings.iter().any(|heading| heading.contains(needle)))
         .map(|(label, _)| (*label).to_string())
         .collect()
-}
-
-pub fn is_sufficiently_specified(body: Option<&str>) -> bool {
-    let missing = missing_recommended_sections(body);
-    CORE.iter()
-        .all(|core| !missing.iter().any(|item| item == core))
 }
 
 pub fn readiness_warnings(body: Option<&str>, risk_note: Option<String>) -> Vec<String> {
@@ -130,9 +122,8 @@ A markdown report
 "#;
 
     #[test]
-    fn full_body_is_sufficient_and_parses_criteria() {
+    fn full_body_has_no_missing_sections_and_parses_criteria() {
         assert!(missing_recommended_sections(Some(FULL)).is_empty());
-        assert!(is_sufficiently_specified(Some(FULL)));
         assert_eq!(
             acceptance_criteria(Some(FULL)),
             vec![
@@ -143,16 +134,17 @@ A markdown report
     }
 
     #[test]
-    fn sparse_body_lists_missing_sections_and_is_not_sufficient() {
+    fn sparse_body_lists_missing_sections() {
         let missing = missing_recommended_sections(Some("just an idea"));
         assert!(missing.iter().any(|item| item == "Goal"));
         assert!(missing.iter().any(|item| item == "Acceptance criteria"));
-        assert!(!is_sufficiently_specified(None));
-        assert!(!is_sufficiently_specified(Some("just an idea")));
+        assert!(missing_recommended_sections(None)
+            .iter()
+            .any(|item| item == "Goal"));
     }
 
     #[test]
-    fn core_sections_are_enough_even_if_optional_sections_are_missing() {
+    fn optional_sections_are_still_listed_when_other_headings_are_present() {
         let body = r#"
 ## Goal
 G
@@ -163,8 +155,8 @@ D
 ## Acceptance criteria
 - one
 "#;
-        assert!(is_sufficiently_specified(Some(body)));
         let missing = missing_recommended_sections(Some(body));
+        assert!(!missing.iter().any(|item| item == "Goal"));
         assert!(missing.iter().any(|item| item.contains("Constraints")));
         assert!(missing.iter().any(|item| item.contains("Dependencies")));
     }

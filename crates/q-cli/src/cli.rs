@@ -218,12 +218,7 @@ pub enum Commands {
         clear_agent_pool: bool,
     },
     /// Move a task to ready so agents may claim it.
-    Ready {
-        id: i64,
-        /// Mark ready even when recommended sections are missing.
-        #[arg(long)]
-        force: bool,
-    },
+    Ready { id: i64 },
     /// Block a task. Claimed work also requires --claim-token.
     Block {
         id: i64,
