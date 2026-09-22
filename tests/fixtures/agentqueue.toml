@@ -1,0 +1,20 @@
+project = "profiler-core"
+repo = "github.com/acme/profiler-core"
+default_kind = "implementation"
+default_agent_pool = "coding"
+max_parallel_jobs = 2
+
+[policy]
+require_pr = true
+allow_external_actions = false
+stale_disposition = "ready"
+
+[[paths]]
+match = "crates/collector/**"
+project = "collector"
+agent_pool = "rust"
+
+[[paths]]
+match = "web/**"
+project = "viewer"
+agent_pool = "frontend"
