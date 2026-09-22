@@ -73,8 +73,8 @@ q ls --status cancelled
 q show 184
 q edit 184 --body-file task.md
 q ready 184
-q block 184 --reason "Need storage-format decision first"
-q cancel 184 --reason "Superseded by task 212"
+q block 184
+q cancel 184
 q delete 184
 ```
 
@@ -91,7 +91,7 @@ ID  STATUS  PROJECT  PRI  UPDATED               TITLE
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
 
-`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Delete does not take a reason. Events cascade with the task, so nothing is written to the event log.
+`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
 
 ## Claim lifecycle
 
@@ -102,7 +102,7 @@ q heartbeat 184 --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
   --artifact report=./docs/benchmarks/trace-encoding.md
-q release 184 --claim-token TOKEN --reason "Missing credentials for benchmark host"
+q release 184 --claim-token TOKEN
 ```
 
 `q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. No eligible work is success, not an error:
@@ -121,12 +121,12 @@ If the project sets `require_pr` and the task kind is implementation, `complete`
 
 ```bash
 q status
-q recover-stale --reason "lease expired after agent restart"
-q recover-stale --reason "host went away" --to blocked
+q recover-stale
+q recover-stale --to blocked
 q events 184
 ```
 
-`recover-stale` requires a nonempty reason. Without `--to`, each task follows its project's stale policy (`ready` by default). Claim also recovers expired leases in the same transaction, using the reason `lease expired`. There is no background daemon in v1.
+Without `--to`, each task follows its project's stale policy (`ready` by default). Claim also recovers expired leases in the same transaction. There is no background daemon in v1. `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason, and events do not store one.
 
 ## JSON output
 
@@ -163,9 +163,9 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_claim_next` | Atomically claim one eligible ready task, or return no work. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |
 | `queue_start` | Mark a claim in progress and record branch or worktree. |
-| `queue_block` | Block claimed work with a reason. |
+| `queue_block` | Block claimed work. Requires the claim token. |
 | `queue_complete` | Complete or send to review, with summary and artifacts. |
-| `queue_release` | Return a claim to ready with a reason. |
+| `queue_release` | Return a claim to ready. Requires the claim token. |
 | `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |
 
 Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError: true`. There is no free-form update tool.
@@ -210,8 +210,8 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 - Only an explicit ready transition makes work claimable.
 - High-risk and external-action tasks are excluded from default claims.
 - External action also needs the project policy flag.
-- `block`, `release`, `cancel`, and `recover-stale` require a nonempty reason.
-- `delete` removes the task from the database and does not take a reason. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
+- `delete` removes the task from the database. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
+- `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason.
 - The queue does not launch agents, create worktrees, open pull requests, merge, deploy, or call GitHub or Linear.
 
 ## Layout

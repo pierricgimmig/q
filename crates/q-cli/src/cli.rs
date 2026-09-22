@@ -100,7 +100,6 @@ fn is_value_flag(arg: &str) -> bool {
             | "--status"
             | "--agent"
             | "--claim-token"
-            | "--reason"
             | "--summary"
             | "--branch"
             | "--worktree"
@@ -229,16 +228,10 @@ pub enum Commands {
     Block {
         id: i64,
         #[arg(long)]
-        reason: String,
-        #[arg(long)]
         claim_token: Option<String>,
     },
     /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
-    Cancel {
-        id: i64,
-        #[arg(long)]
-        reason: String,
-    },
+    Cancel { id: i64 },
     /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
     ///
     /// Unlike cancel, nothing remains in the queue database. Events cascade with
@@ -301,15 +294,11 @@ pub enum Commands {
         id: i64,
         #[arg(long)]
         claim_token: String,
-        #[arg(long)]
-        reason: String,
     },
     /// Show queue counts and claim lease health.
     Status,
     /// Requeue expired claims and record a recovery event.
     RecoverStale {
-        #[arg(long)]
-        reason: String,
         /// ready or blocked. Defaults to each project's stale policy.
         #[arg(long, value_name = "ready|blocked")]
         to: Option<String>,

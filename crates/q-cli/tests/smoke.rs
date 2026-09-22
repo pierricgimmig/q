@@ -351,14 +351,9 @@ fn ls_hides_terminal_tasks_unless_all_or_status_and_prints_a_table() {
     let _long = capture(&long_title, Some("proj-alpha"));
     let floating = capture("Floating capture", None);
     let cancelled = capture("Drop superseded work", Some("proj-alpha"));
-    run(bin().current_dir(&work).args([
-        "--db",
-        db_arg,
-        "cancel",
-        &cancelled.to_string(),
-        "--reason",
-        "superseded",
-    ]));
+    run(bin()
+        .current_dir(&work)
+        .args(["--db", db_arg, "cancel", &cancelled.to_string()]));
     let done = capture("Ship finished report", Some("proj-beta"));
     run(bin()
         .current_dir(&work)

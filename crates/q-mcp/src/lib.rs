@@ -383,11 +383,10 @@ fn queue_start(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Va
 }
 
 fn queue_block(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
-    expect_keys(args, &["task_id", "id", "claim_token", "reason"])?;
+    expect_keys(args, &["task_id", "id", "claim_token"])?;
     let task = queue.block(BlockRequest {
         task_id: required_task_id(args)?,
         claim_token: Some(required_string(args, "claim_token")?),
-        reason: required_string(args, "reason")?,
         actor: Actor::agent("mcp"),
     })?;
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
@@ -453,11 +452,10 @@ fn queue_release(
     queue: &dyn QueueService,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
-    expect_keys(args, &["task_id", "id", "claim_token", "reason"])?;
+    expect_keys(args, &["task_id", "id", "claim_token"])?;
     let task = queue.release(ReleaseRequest {
         task_id: required_task_id(args)?,
         claim_token: required_string(args, "claim_token")?,
-        reason: required_string(args, "reason")?,
         actor: Actor::agent("mcp"),
     })?;
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
@@ -716,14 +714,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "queue_block",
-            "Block claimed work with a nonempty reason.",
+            "Block claimed work. Requires the task id and matching claim token.",
             json!({
                 "type": "object",
-                "required": ["task_id", "claim_token", "reason"],
+                "required": ["task_id", "claim_token"],
                 "properties": {
                     "task_id": {"type": "integer"},
-                    "claim_token": {"type": "string"},
-                    "reason": {"type": "string"}
+                    "claim_token": {"type": "string"}
                 },
                 "additionalProperties": false
             }),
@@ -769,14 +766,13 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "queue_release",
-            "Release a claim back to ready with a nonempty reason.",
+            "Release a claim back to ready. Requires the task id and matching claim token.",
             json!({
                 "type": "object",
-                "required": ["task_id", "claim_token", "reason"],
+                "required": ["task_id", "claim_token"],
                 "properties": {
                     "task_id": {"type": "integer"},
-                    "claim_token": {"type": "string"},
-                    "reason": {"type": "string"}
+                    "claim_token": {"type": "string"}
                 },
                 "additionalProperties": false
             }),
@@ -1044,7 +1040,6 @@ mod tests {
         queue
             .cancel(q_core::CancelRequest {
                 task_id: hidden_id,
-                reason: "superseded".into(),
                 actor: Actor::agent("mcp"),
             })
             .unwrap();
