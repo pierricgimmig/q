@@ -731,20 +731,9 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
     edit.dependencies = Some(vec![inbox]);
     queue.edit(ready, edit).unwrap();
 
-    let err = queue
-        .delete(DeleteRequest {
-            task_id: inbox,
-            reason: "   ".into(),
-            force: false,
-            actor: actor(),
-        })
-        .unwrap_err();
-    assert!(matches!(err, QueueError::InvalidInput(_)));
-
     let removed = queue
         .delete(DeleteRequest {
             task_id: inbox,
-            reason: "duplicate capture".into(),
             force: false,
             actor: actor(),
         })
@@ -802,7 +791,6 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
     let done = queue
         .delete(DeleteRequest {
             task_id: ready,
-            reason: "no longer needed".into(),
             force: false,
             actor: actor(),
         })
@@ -849,7 +837,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let done = queue
         .delete(DeleteRequest {
             task_id: id,
-            reason: "throw away finished work".into(),
             force: false,
             actor: actor(),
         })
@@ -874,7 +861,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let err = queue
         .delete(DeleteRequest {
             task_id: active,
-            reason: "agent stuck".into(),
             force: false,
             actor: actor(),
         })
@@ -892,7 +878,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let removed = queue
         .delete(DeleteRequest {
             task_id: active,
-            reason: "agent stuck".into(),
             force: true,
             actor: actor(),
         })
@@ -929,7 +914,6 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
     let removed = queue
         .delete(DeleteRequest {
             task_id: expired_id,
-            reason: "lease already dead".into(),
             force: false,
             actor: actor(),
         })

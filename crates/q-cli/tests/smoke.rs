@@ -226,12 +226,12 @@ fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
     let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
     let id = created["id"].as_i64().unwrap().to_string();
 
-    let deleted = run(bin().args(["--db", db_arg, "delete", &id, "--reason", "captured twice"]));
+    let deleted = run(bin().args(["--db", db_arg, "delete", &id]));
     let text = String::from_utf8(deleted.stdout).unwrap();
     assert!(text.contains(&format!("deleted #{id}")), "{text}");
     assert!(text.contains("[inbox]"), "{text}");
     assert!(text.contains("claims="), "{text}");
-    assert!(text.contains("reason: captured twice"), "{text}");
+    assert!(!text.contains("reason:"), "{text}");
 
     let missing = bin().args(["--db", db_arg, "show", &id]).output().unwrap();
     assert!(!missing.status.success());
@@ -248,7 +248,7 @@ fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
     run(bin().args(["--db", db_arg, "ready", &id]));
     run(bin().args(["--db", db_arg, "claim", "--agent", "codex-local-01"]));
     let rejected = bin()
-        .args(["--db", db_arg, "delete", &id, "--reason", "stuck"])
+        .args(["--db", db_arg, "delete", &id])
         .output()
         .unwrap();
     assert!(!rejected.status.success());
@@ -256,10 +256,9 @@ fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
     assert!(stderr.contains("active claim"), "{stderr}");
     assert!(stderr.contains("--force"), "{stderr}");
 
-    let forced = run(bin().args([
-        "--db", db_arg, "--json", "delete", &id, "--reason", "stuck", "--force",
-    ]));
+    let forced = run(bin().args(["--db", db_arg, "--json", "delete", &id, "--force"]));
     let body: Value = serde_json::from_slice(&forced.stdout).unwrap();
+    assert!(body.get("reason").is_none());
     assert_eq!(body["active_claim_cleared"], true);
     assert!(body["claims_removed"].as_i64().unwrap() >= 1);
     assert_eq!(body["status"], "claimed");

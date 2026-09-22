@@ -270,10 +270,9 @@ fn dispatch(
             emit(json, &task, || println!("cancelled #{}", task.id));
             Ok(())
         }
-        Commands::Delete { id, reason, force } => {
+        Commands::Delete { id, force } => {
             let outcome = queue.delete(DeleteRequest {
                 task_id: id,
-                reason,
                 force,
                 actor: human_actor(),
             })?;
@@ -292,7 +291,6 @@ fn dispatch(
                     outcome.artifacts_removed,
                     outcome.dependencies_removed
                 );
-                println!("reason: {}", outcome.reason);
             });
             Ok(())
         }

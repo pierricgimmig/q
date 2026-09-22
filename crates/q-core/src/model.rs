@@ -626,7 +626,6 @@ pub struct CancelRequest {
 #[derive(Debug, Clone)]
 pub struct DeleteRequest {
     pub task_id: i64,
-    pub reason: String,
     pub force: bool,
     pub actor: Actor,
 }
@@ -639,7 +638,6 @@ pub struct DeleteOutcome {
     pub public_id: Uuid,
     pub title: String,
     pub status: TaskStatus,
-    pub reason: String,
     pub forced: bool,
     pub active_claim_cleared: bool,
     pub claims_removed: i64,

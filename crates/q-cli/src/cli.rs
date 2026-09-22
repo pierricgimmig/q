@@ -245,8 +245,6 @@ pub enum Commands {
     /// the task and are not retained. An unexpired claim requires --force.
     Delete {
         id: i64,
-        #[arg(long)]
-        reason: String,
         /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
         #[arg(long)]
         force: bool,
@@ -397,17 +395,8 @@ mod tests {
 
     #[test]
     fn delete_is_not_rewritten_as_capture() {
-        let args = preprocess(vec![
-            "delete".into(),
-            "12".into(),
-            "--reason".into(),
-            "duplicate".into(),
-            "--force".into(),
-        ]);
-        assert_eq!(
-            args,
-            vec!["delete", "12", "--reason", "duplicate", "--force"]
-        );
+        let args = preprocess(vec!["delete".into(), "12".into(), "--force".into()]);
+        assert_eq!(args, vec!["delete", "12", "--force"]);
     }
 
     #[test]

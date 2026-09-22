@@ -1315,7 +1315,6 @@ impl QueueService for Queue {
     }
 
     fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError> {
-        let reason = require_reason(&request.reason, "delete")?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1388,7 +1387,6 @@ impl QueueService for Queue {
             public_id: task.public_id,
             title: task.title,
             status: task.status,
-            reason,
             forced: request.force,
             active_claim_cleared: active.is_some(),
             claims_removed,

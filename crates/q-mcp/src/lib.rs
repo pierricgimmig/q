@@ -440,10 +440,9 @@ fn queue_complete(
 }
 
 fn queue_delete(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
-    expect_keys(args, &["task_id", "id", "reason", "force"])?;
+    expect_keys(args, &["task_id", "force"])?;
     let outcome = queue.delete(DeleteRequest {
         task_id: required_task_id(args)?,
-        reason: required_string(args, "reason")?,
         force: optional_bool(args, "force")?,
         actor: Actor::agent("mcp"),
     })?;
@@ -760,10 +759,9 @@ fn tool_definitions() -> Vec<Value> {
             "Hard-delete a task and its claims, events, artifacts, and dependency rows. Unlike cancel, nothing remains in the database. An unexpired claim is rejected unless force is true.",
             json!({
                 "type": "object",
-                "required": ["task_id", "reason"],
+                "required": ["task_id"],
                 "properties": {
                     "task_id": {"type": "integer"},
-                    "reason": {"type": "string"},
                     "force": {"type": "boolean"}
                 },
                 "additionalProperties": false
@@ -922,17 +920,32 @@ mod tests {
         let created = tool_body(&captured);
         let id = created["id"].as_i64().unwrap();
 
+        let with_reason = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_delete", "arguments": {"task_id": id, "reason": "duplicate"}}),
+        );
+        assert_eq!(with_reason["error"]["code"], -32602);
+        assert!(with_reason["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("reason"));
+        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
+
         let deleted = call(
             &mut session,
             &queue,
             "tools/call",
             3,
-            json!({"name": "queue_delete", "arguments": {"task_id": id, "reason": "duplicate"}}),
+            json!({"name": "queue_delete", "arguments": {"task_id": id}}),
         );
         assert_eq!(deleted["result"]["isError"], false);
         let body = tool_body(&deleted);
         assert_eq!(body["task_id"], id);
         assert_eq!(body["status"], "inbox");
+        assert!(body.get("reason").is_none());
         assert_eq!(body["active_claim_cleared"], false);
         assert!(matches!(queue.get(id), Err(QueueError::NotFound(_))));
 
@@ -975,7 +988,7 @@ mod tests {
             &queue,
             "tools/call",
             4,
-            json!({"name": "queue_delete", "arguments": {"task_id": again.id, "reason": "stuck"}}),
+            json!({"name": "queue_delete", "arguments": {"task_id": again.id}}),
         );
         assert_eq!(rejected["result"]["isError"], true);
         let error = tool_body(&rejected);
@@ -991,7 +1004,7 @@ mod tests {
             &queue,
             "tools/call",
             5,
-            json!({"name": "queue_delete", "arguments": {"task_id": again.id, "reason": "stuck", "force": true}}),
+            json!({"name": "queue_delete", "arguments": {"task_id": again.id, "force": true}}),
         );
         assert_eq!(forced["result"]["isError"], false);
         let body = tool_body(&forced);

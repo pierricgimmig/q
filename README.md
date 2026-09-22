@@ -75,7 +75,7 @@ q edit 184 --body-file task.md
 q ready 184
 q block 184 --reason "Need storage-format decision first"
 q cancel 184 --reason "Superseded by task 212"
-q delete 184 --reason "Captured twice"
+q delete 184
 ```
 
 `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`.
@@ -91,7 +91,7 @@ ID  STATUS  PROJECT  PRI  UPDATED               TITLE
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
 
-`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. A nonempty `--reason` is required and printed in the confirmation. Because events cascade with the task, the reason is not stored afterward and there is no surviving `task_deleted` event.
+`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Delete does not take a reason. Events cascade with the task, so nothing is written to the event log.
 
 ## Claim lifecycle
 
@@ -166,7 +166,7 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_block` | Block claimed work with a reason. |
 | `queue_complete` | Complete or send to review, with summary and artifacts. |
 | `queue_release` | Return a claim to ready with a reason. |
-| `queue_delete` | Hard-delete a task. Requires `reason`. `force` clears an unexpired claim. |
+| `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |
 
 Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError: true`. There is no free-form update tool.
 
@@ -210,8 +210,8 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 - Only an explicit ready transition makes work claimable.
 - High-risk and external-action tasks are excluded from default claims.
 - External action also needs the project policy flag.
-- `block`, `release`, `cancel`, `delete`, and `recover-stale` require a nonempty reason.
-- `delete` removes the task from the database. `cancel` keeps it. An active claim blocks `delete` unless `--force` is set.
+- `block`, `release`, `cancel`, and `recover-stale` require a nonempty reason.
+- `delete` removes the task from the database and does not take a reason. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
 - The queue does not launch agents, create worktrees, open pull requests, merge, deploy, or call GitHub or Linear.
 
 ## Layout

@@ -28,8 +28,9 @@ pub trait QueueService: Send + Sync {
     ///
     /// Claims, events, artifacts, and dependency edges cascade with the task
     /// (or are deleted in the same transaction). The event log does not survive,
-    /// so there is no retained `task_deleted` record. An unexpired claim is
-    /// rejected unless `force` is set, in which case that claim is cleared too.
+    /// so delete does not take a reason and there is no retained `task_deleted`
+    /// record. An unexpired claim is rejected unless `force` is set, in which
+    /// case that claim is cleared too.
     fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError>;
     fn claim_next(&self, request: ClaimRequest) -> Result<ClaimOutcome, QueueError>;
     fn heartbeat(&self, request: HeartbeatRequest) -> Result<crate::model::Claim, QueueError>;
