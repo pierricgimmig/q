@@ -10,9 +10,9 @@ use std::sync::Arc;
 use clap::Parser;
 use q_core::{
     lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
-    ClaimRequest, CompleteRequest, EditRequest, HeartbeatRequest, ListFilter, QueueError,
-    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition,
-    StartRequest, TaskKind, TaskStatus,
+    ClaimRequest, CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest, ListFilter,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus,
 };
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
@@ -275,6 +275,32 @@ fn dispatch(
                 actor: human_actor(),
             })?;
             emit(json, &task, || println!("cancelled #{}", task.id));
+            Ok(())
+        }
+        Commands::Delete { id, reason, force } => {
+            let outcome = queue.delete(DeleteRequest {
+                task_id: id,
+                reason,
+                force,
+                actor: human_actor(),
+            })?;
+            emit(json, &outcome, || {
+                println!(
+                    "deleted #{} [{}] {}",
+                    outcome.task_id, outcome.status, outcome.title
+                );
+                if outcome.active_claim_cleared {
+                    println!("cleared active claim");
+                }
+                println!(
+                    "removed claims={} events={} artifacts={} dependencies={}",
+                    outcome.claims_removed,
+                    outcome.events_removed,
+                    outcome.artifacts_removed,
+                    outcome.dependencies_removed
+                );
+                println!("reason: {}", outcome.reason);
+            });
             Ok(())
         }
         Commands::Claim {

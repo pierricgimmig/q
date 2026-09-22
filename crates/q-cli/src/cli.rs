@@ -52,6 +52,7 @@ fn is_command(word: &str) -> bool {
             | "ready"
             | "block"
             | "cancel"
+            | "delete"
             | "claim"
             | "heartbeat"
             | "start"
@@ -227,11 +228,23 @@ pub enum Commands {
         #[arg(long)]
         claim_token: Option<String>,
     },
-    /// Cancel a task that is inbox, ready, or blocked.
+    /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
     Cancel {
         id: i64,
         #[arg(long)]
         reason: String,
+    },
+    /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
+    ///
+    /// Unlike cancel, nothing remains in the queue database. Events cascade with
+    /// the task and are not retained. An unexpired claim requires --force.
+    Delete {
+        id: i64,
+        #[arg(long)]
+        reason: String,
+        /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
+        #[arg(long)]
+        force: bool,
     },
     /// Atomically claim one eligible ready task.
     Claim {
@@ -375,6 +388,22 @@ mod tests {
             "agents".into(),
         ]);
         assert_eq!(args, vec!["skill", "install", "--target", "agents"]);
+    }
+
+    #[test]
+    #[test]
+    fn delete_is_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "delete".into(),
+            "12".into(),
+            "--reason".into(),
+            "duplicate".into(),
+            "--force".into(),
+        ]);
+        assert_eq!(
+            args,
+            vec!["delete", "12", "--reason", "duplicate", "--force"]
+        );
     }
 
     #[test]

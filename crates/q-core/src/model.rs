@@ -610,6 +610,32 @@ pub struct CancelRequest {
     pub actor: Actor,
 }
 
+/// Hard-delete. Distinct from [`CancelRequest`], which keeps the task row.
+#[derive(Debug, Clone)]
+pub struct DeleteRequest {
+    pub task_id: i64,
+    pub reason: String,
+    pub force: bool,
+    pub actor: Actor,
+}
+
+/// Confirmation of a hard delete. Related rows are gone with the task, including
+/// events, so this outcome is the caller's record of what was removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteOutcome {
+    pub task_id: i64,
+    pub public_id: Uuid,
+    pub title: String,
+    pub status: TaskStatus,
+    pub reason: String,
+    pub forced: bool,
+    pub active_claim_cleared: bool,
+    pub claims_removed: i64,
+    pub events_removed: i64,
+    pub artifacts_removed: i64,
+    pub dependencies_removed: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimRequest {
     pub agent_id: String,

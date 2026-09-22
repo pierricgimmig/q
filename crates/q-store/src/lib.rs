@@ -14,10 +14,10 @@ use q_core::{
     acceptance_criteria, default_lease, ensure_transition, format_timestamp, lease_from_minutes,
     normalize_repo_url, parse_timestamp, readiness_warnings, Actor, Artifact, ArtifactInput,
     BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease, ClaimOutcome, ClaimRequest,
-    ClaimTask, CompleteRequest, EditRequest, Event, HeartbeatRequest, ListFilter, ProjectPolicy,
-    QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
-    RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task,
-    TaskDetail, TaskKind, TaskStatus, TaskSummary,
+    ClaimTask, CompleteRequest, DeleteOutcome, DeleteRequest, EditRequest, Event, HeartbeatRequest,
+    ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest,
+    RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
+    StatusCounts, Task, TaskDetail, TaskKind, TaskStatus, TaskSummary,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -890,6 +890,10 @@ fn insert_artifact(
     Ok(())
 }
 
+fn count_for_task(conn: &Connection, sql: &str, task_id: i64) -> Result<i64, QueueError> {
+    conn.query_row(sql, params![task_id], |row| row.get(0)).db()
+}
+
 fn ensure_exists(conn: &Connection, id: i64) -> Result<(), QueueError> {
     let exists: i64 = conn
         .query_row(
@@ -1293,6 +1297,90 @@ impl QueueService for Queue {
         )?;
         tx.commit().db()?;
         self.with_conn(|conn| load_task(conn, request.task_id))
+    }
+
+    fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError> {
+        let reason = require_reason(&request.reason, "delete")?;
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        let active = tx
+            .query_row(
+                "SELECT agent_id, lease_expires_at FROM claims
+                 WHERE task_id = ?1 AND released_at IS NULL AND lease_expires_at > ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![task.id, now],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .db()?;
+        if let Some((agent_id, lease_expires_at)) = &active {
+            if !request.force {
+                return Err(QueueError::Conflict(format!(
+                    "task {} has an active claim held by {agent_id} until {lease_expires_at}; pass --force to delete the task and clear the claim",
+                    task.id
+                )));
+            }
+        }
+        let claims_removed = count_for_task(
+            &tx,
+            "SELECT COUNT(*) FROM claims WHERE task_id = ?",
+            task.id,
+        )?;
+        let events_removed = count_for_task(
+            &tx,
+            "SELECT COUNT(*) FROM events WHERE task_id = ?",
+            task.id,
+        )?;
+        let artifacts_removed = count_for_task(
+            &tx,
+            "SELECT COUNT(*) FROM artifacts WHERE task_id = ?",
+            task.id,
+        )?;
+        let dependencies_removed: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 OR depends_on_task_id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .db()?;
+        // Schema FKs use ON DELETE CASCADE. Delete dependents explicitly in this
+        // same transaction so a schema without cascade still leaves no orphans.
+        // Events reference the task, so a task_deleted row cannot survive.
+        tx.execute("DELETE FROM claims WHERE task_id = ?", params![task.id])
+            .db()?;
+        tx.execute("DELETE FROM artifacts WHERE task_id = ?", params![task.id])
+            .db()?;
+        tx.execute("DELETE FROM events WHERE task_id = ?", params![task.id])
+            .db()?;
+        tx.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1 OR depends_on_task_id = ?1",
+            params![task.id],
+        )
+        .db()?;
+        let deleted = tx
+            .execute("DELETE FROM tasks WHERE id = ?", params![task.id])
+            .db()?;
+        if deleted != 1 {
+            return Err(QueueError::NotFound(task.id));
+        }
+        tx.commit().db()?;
+        Ok(DeleteOutcome {
+            task_id: task.id,
+            public_id: task.public_id,
+            title: task.title,
+            status: task.status,
+            reason,
+            forced: request.force,
+            active_claim_cleared: active.is_some(),
+            claims_removed,
+            events_removed,
+            artifacts_removed,
+            dependencies_removed,
+        })
     }
 
     fn claim_next(&self, request: ClaimRequest) -> Result<ClaimOutcome, QueueError> {

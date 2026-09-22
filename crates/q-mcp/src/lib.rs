@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    HeartbeatRequest, ListFilter, QueueError, QueueService, ReleaseRequest, RiskLevel,
-    StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
+    DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService, ReleaseRequest,
+    RiskLevel, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -187,6 +187,7 @@ fn dispatch_tool(
         "queue_block" => queue_block(queue, args),
         "queue_complete" => queue_complete(queue, args),
         "queue_release" => queue_release(queue, args),
+        "queue_delete" => queue_delete(queue, args),
         other => Err(ToolFailure::Invalid(format!("unknown tool {other}"))),
     }
 }
@@ -423,6 +424,17 @@ fn queue_complete(
     Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
 }
 
+fn queue_delete(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id", "reason", "force"])?;
+    let outcome = queue.delete(DeleteRequest {
+        task_id: required_task_id(args)?,
+        reason: required_string(args, "reason")?,
+        force: optional_bool(args, "force")?,
+        actor: Actor::agent("mcp"),
+    })?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
 fn queue_release(
     queue: &dyn QueueService,
     args: &Map<String, Value>,
@@ -460,6 +472,14 @@ fn required_string(args: &Map<String, Value>, key: &str) -> Result<String, ToolF
     match optional_string(args, key)? {
         Some(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(ToolFailure::Invalid(format!("{key} is required"))),
+    }
+}
+
+fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<bool, ToolFailure> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ToolFailure::Invalid(format!("{key} must be a boolean"))),
     }
 }
 
@@ -713,6 +733,20 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "queue_delete",
+            "Hard-delete a task and its claims, events, artifacts, and dependency rows. Unlike cancel, nothing remains in the database. An unexpired claim is rejected unless force is true.",
+            json!({
+                "type": "object",
+                "required": ["task_id", "reason"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "reason": {"type": "string"},
+                    "force": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "queue_release",
             "Release a claim back to ready with a nonempty reason.",
             json!({
@@ -826,8 +860,120 @@ mod tests {
             "queue_block",
             "queue_complete",
             "queue_release",
+            "queue_delete",
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }
+    }
+
+    fn tool_body(response: &Value) -> Value {
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn queue_delete_removes_the_task_and_honors_force() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        assert!(session
+            .handle_line(
+                &queue,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            )
+            .is_none());
+
+        let captured = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "drop me"}}),
+        );
+        let created = tool_body(&captured);
+        let id = created["id"].as_i64().unwrap();
+
+        let deleted = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_delete", "arguments": {"task_id": id, "reason": "duplicate"}}),
+        );
+        assert_eq!(deleted["result"]["isError"], false);
+        let body = tool_body(&deleted);
+        assert_eq!(body["task_id"], id);
+        assert_eq!(body["status"], "inbox");
+        assert_eq!(body["active_claim_cleared"], false);
+        assert!(matches!(queue.get(id), Err(QueueError::NotFound(_))));
+
+        let again = queue
+            .capture(q_core::CaptureRequest {
+                title: "claimed".into(),
+                body: None,
+                kind: TaskKind::Research,
+                priority: 0,
+                risk: RiskLevel::Low,
+                project: None,
+                repo: None,
+                capture_path: "/tmp".into(),
+                repo_relative_path: None,
+                git_root: None,
+                git_head: None,
+                agent_pool: None,
+                required_capabilities: vec![],
+                dependencies: vec![],
+                policy: None,
+                actor: Actor::agent("mcp"),
+                context_source: None,
+            })
+            .unwrap();
+        queue
+            .mark_ready(q_core::ReadyRequest {
+                task_id: again.id,
+                actor: Actor::agent("mcp"),
+            })
+            .unwrap();
+        assert!(
+            queue
+                .claim_next(q_core::ClaimRequest::new("mcp-agent"))
+                .unwrap()
+                .found
+        );
+
+        let rejected = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_delete", "arguments": {"task_id": again.id, "reason": "stuck"}}),
+        );
+        assert_eq!(rejected["result"]["isError"], true);
+        let error = tool_body(&rejected);
+        assert_eq!(error["code"], "conflict");
+        assert!(error["error"].as_str().unwrap().contains("active claim"));
+        assert_eq!(
+            queue.get(again.id).unwrap().task.status,
+            TaskStatus::Claimed
+        );
+
+        let forced = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_delete", "arguments": {"task_id": again.id, "reason": "stuck", "force": true}}),
+        );
+        assert_eq!(forced["result"]["isError"], false);
+        let body = tool_body(&forced);
+        assert_eq!(body["active_claim_cleared"], true);
+        assert!(body["claims_removed"].as_i64().unwrap() >= 1);
+        assert!(matches!(queue.get(again.id), Err(QueueError::NotFound(_))));
     }
 }
