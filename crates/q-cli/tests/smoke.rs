@@ -413,8 +413,8 @@ fn ls_hides_terminal_tasks_unless_all_or_status_and_prints_a_table() {
     assert!(all.contains("Keep visible work"), "{all}");
     let alpha_at = all.find("proj-alpha").unwrap();
     let beta_at = all.find("proj-beta").unwrap();
-    let none_at = all.find("(none)").unwrap();
-    assert!(alpha_at < beta_at && beta_at < none_at, "{all}");
+    let floating_at = all.find("Floating capture").unwrap();
+    assert!(alpha_at < beta_at && beta_at < floating_at, "{all}");
     assert_aligned_table(&all);
 
     let only_cancelled =
@@ -485,11 +485,14 @@ fn assert_aligned_table(table: &str) {
     let lines: Vec<&str> = table.lines().filter(|line| !line.is_empty()).collect();
     assert!(lines.len() >= 2, "{table}");
     let header = lines[0];
-    for label in ["ID", "STATUS", "PROJECT", "PRI", "UPDATED", "TITLE"] {
+    for label in [
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
+    ] {
         assert!(header.contains(label), "{header}");
     }
     assert!(header.find("ID").unwrap() < header.find("STATUS").unwrap());
-    assert!(header.find("STATUS").unwrap() < header.find("PROJECT").unwrap());
+    assert!(header.find("STATUS").unwrap() < header.find("FEATURE").unwrap());
+    assert!(header.find("FEATURE").unwrap() < header.find("PROJECT").unwrap());
     assert!(header.find("PROJECT").unwrap() < header.find("PRI").unwrap());
     assert!(header.find("PRI").unwrap() < header.find("UPDATED").unwrap());
     assert!(header.find("UPDATED").unwrap() < header.find("TITLE").unwrap());
@@ -512,6 +515,206 @@ fn assert_aligned_table(table: &str) {
             "{line}"
         );
     }
+}
+
+#[test]
+fn features_group_tasks_across_repos_and_resolve_titles() {
+    let root = temp_root("feature");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    let created = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "feature",
+        "create",
+        "Cross-repo rollout",
+        "--body",
+        "Ship the queue across services",
+    ]));
+    let feature: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let feature_id = feature["id"].as_i64().unwrap();
+    assert_eq!(feature["title"], "Cross-repo rollout");
+
+    let capture = |title: &str, repo: &str, project: &str, feature: &str| -> i64 {
+        let output = run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "--repo",
+            repo,
+            "--project",
+            project,
+            "add",
+            "--feature",
+            feature,
+            title,
+        ]));
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["repo"], repo);
+        assert_eq!(body["project"], project);
+        assert_eq!(body["feature"], "Cross-repo rollout");
+        body["id"].as_i64().unwrap()
+    };
+    let queue_task = capture(
+        "Add the migration",
+        "github.com/acme/queue",
+        "queue",
+        "cross-repo rollout",
+    );
+    let client_task = capture(
+        "Wire the client",
+        "github.com/acme/client",
+        "client",
+        &feature_id.to_string(),
+    );
+    let loose = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "--repo",
+        "github.com/acme/notes",
+        "--project",
+        "notes",
+        "add",
+        "Loose note",
+    ]));
+    let loose: Value = serde_json::from_slice(&loose.stdout).unwrap();
+    let loose_id = loose["id"].as_i64().unwrap();
+    assert!(loose.get("feature").is_none());
+
+    let listed = run(bin().args(["--db", db_arg, "ls", "--feature", "Cross-repo rollout"]));
+    let table = String::from_utf8(listed.stdout).unwrap();
+    assert!(table.contains("FEATURE"), "{table}");
+    assert!(table.contains("Cross-repo rollout"), "{table}");
+    assert!(table.contains("Add the migration"), "{table}");
+    assert!(table.contains("Wire the client"), "{table}");
+    assert!(!table.contains("Loose note"), "{table}");
+    let lines: Vec<&str> = table.lines().filter(|line| !line.is_empty()).collect();
+    let width = lines[0].chars().count();
+    assert!(
+        lines.iter().all(|line| line.chars().count() == width),
+        "{table}"
+    );
+
+    let json = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "ls",
+        "--feature",
+        &feature_id.to_string(),
+    ]));
+    let body: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let ids: Vec<i64> = body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![client_task, queue_task]);
+
+    run(bin().args(["--db", db_arg, "cancel", &queue_task.to_string()]));
+    let hidden = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "ls",
+        "--feature",
+        "Cross-repo rollout",
+    ]));
+    let hidden: Value = serde_json::from_slice(&hidden.stdout).unwrap();
+    let ids: Vec<i64> = hidden["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![client_task]);
+    let all = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "ls",
+        "--all",
+        "--feature",
+        "Cross-repo rollout",
+    ]));
+    let all: Value = serde_json::from_slice(&all.stdout).unwrap();
+    let ids: Vec<i64> = all["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&queue_task) && ids.contains(&client_task));
+    assert!(!ids.contains(&loose_id));
+
+    let duplicate = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "feature",
+        "create",
+        "Cross-repo rollout",
+    ]));
+    let duplicate: Value = serde_json::from_slice(&duplicate.stdout).unwrap();
+    let duplicate_id = duplicate["id"].as_i64().unwrap();
+    let ambiguous = bin()
+        .args([
+            "--db",
+            db_arg,
+            "add",
+            "--feature",
+            "Cross-repo rollout",
+            "Should fail",
+        ])
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(stderr.contains("more than one feature"), "{stderr}");
+
+    let edited = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "edit",
+        &client_task.to_string(),
+        "--feature",
+        &duplicate_id.to_string(),
+    ]));
+    let edited: Value = serde_json::from_slice(&edited.stdout).unwrap();
+    assert_eq!(edited["feature_id"], duplicate_id);
+
+    let cleared = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "edit",
+        &client_task.to_string(),
+        "--clear-feature",
+    ]));
+    let cleared: Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert!(cleared.get("feature").is_none());
+    assert!(cleared.get("feature_id").is_none());
+
+    let removed = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "feature",
+        "delete",
+        &feature_id.to_string(),
+    ]));
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert!(removed["tasks_detached"].as_i64().unwrap() >= 1);
+    let shown = run(bin().args(["--db", db_arg, "--json", "show", &queue_task.to_string()]));
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(shown.get("feature_id").is_none());
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn char_index(line: &str, needle: &str) -> usize {

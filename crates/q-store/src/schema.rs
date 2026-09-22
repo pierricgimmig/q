@@ -3,7 +3,7 @@ use time::OffsetDateTime;
 
 use q_core::{format_timestamp, QueueError};
 
-const SCHEMA_V1: &str = r#"
+pub(crate) const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -93,6 +93,12 @@ CREATE INDEX IF NOT EXISTS events_task_idx
 ON events(task_id, id);
 "#;
 
+const SCHEMA_V2_TASKS: &str = r#"
+ALTER TABLE tasks ADD COLUMN feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);
+"#;
+
 pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -111,16 +117,54 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
             |row| row.get(0),
         )
         .map_err(|err| QueueError::Database(err.to_string()))?;
+    let applied_at = format_timestamp(OffsetDateTime::now_utc());
     if current < 1 {
         tx.execute_batch(SCHEMA_V1)
             .map_err(|err| QueueError::Database(err.to_string()))?;
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
-            params![format_timestamp(OffsetDateTime::now_utc())],
+            params![applied_at],
         )
         .map_err(|err| QueueError::Database(err.to_string()))?;
     }
+    if current < 2 {
+        apply_v2(&tx, &applied_at)?;
+    }
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+fn apply_v2(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS features (
+            id INTEGER PRIMARY KEY,
+            public_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            body TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );",
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    let has_feature_id: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueueError::Database(err.to_string()))?;
+    if has_feature_id == 0 {
+        tx.execute_batch(SCHEMA_V2_TASKS)
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    } else {
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
 }

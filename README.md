@@ -43,6 +43,7 @@ q "Compare KV-cache quantization approaches" --kind research
 q -C ~/src/agent-orchestrator "Add stale-job recovery"
 q --repo github.com/acme/agent-orchestrator "Add stale-job recovery"
 q --project agent-orchestrator "Add stale-job recovery"
+q add --feature "Cross-repo rollout" "Add the migration"
 ```
 
 Discovery precedence:
@@ -63,6 +64,24 @@ q project show
 
 `q project init` writes `.agentqueue.toml` at the git root. Without `--yes` it asks for confirmation on a terminal. `--force` overwrites an existing file.
 
+## Features
+
+A feature is an optional parent label. It groups tasks that may span repos. Each task still has its own `repo` and `project` from discovery. Deleting a feature clears `feature_id` on those tasks and leaves the tasks in place.
+
+```bash
+q feature create "Cross-repo rollout" --body "Ship the queue across services"
+q feature ls
+q feature show 1
+q feature edit 1 --title "Rollout"
+q add --feature "Cross-repo rollout" "Add the migration"
+q edit 12 --feature 1
+q edit 12 --clear-feature
+q ls --feature "Cross-repo rollout"
+q feature delete 1
+```
+
+`--feature` accepts an id or a unique title (case-insensitive). A title that matches more than one feature is an error; pass the id. `q ls` sorts by feature (unset last), then project (unset last), then newest `updated_at`.
+
 ## Triage
 
 ```bash
@@ -80,13 +99,13 @@ q delete 184
 
 `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`.
 
-Human output is an aligned table: `ID`, `STATUS`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no project is shown as `(none)` and sorted after named projects. Projects are ordered by name, case-insensitively. Within a project, the newest `updated_at` is first. Titles longer than 64 characters are truncated with an ellipsis. `--json` prints the same rows as `{"tasks":[...]}`.
+Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `--json` prints the same rows as `{"tasks":[...]}`.
 
 ```text
-ID  STATUS  PROJECT  PRI  UPDATED               TITLE
- 4  inbox   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
- 2  ready   beta       1  2026-09-22T20:02:00Z  Compare encodings
- 1  inbox   (none)     0  2026-09-22T20:01:00Z  Unassigned capture
+ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
+ 4  inbox   (none)   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
+ 2  ready   (none)   beta       1  2026-09-22T20:02:00Z  Compare encodings
+ 1  inbox   (none)   (none)     0  2026-09-22T20:01:00Z  Unassigned capture
 ```
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
@@ -157,8 +176,11 @@ Tools, all backed by the same service methods as the CLI:
 
 | Tool | Purpose |
 |---|---|
-| `queue_capture` | Create an inbox task. Optional repo, project, path, kind, priority, risk. |
-| `queue_list` | Bounded summaries with status, project, repo, and kind filters. Omits `done` and `cancelled` unless `status` is set or `include_terminal` (alias `all`) is true. |
+| `queue_capture` | Create an inbox task. Optional repo, project, path, kind, priority, risk, and feature (id or unique title). |
+| `queue_list` | Bounded summaries with status, project, repo, kind, and feature filters. Omits `done` and `cancelled` unless `status` is set or `include_terminal` (alias `all`) is true. |
+| `queue_feature_create` | Create a feature (title, optional body). |
+| `queue_feature_list` | List features. |
+| `queue_feature_get` | Fetch one feature by id. |
 | `queue_get` | One task plus claim, artifacts, and recent events. |
 | `queue_claim_next` | Atomically claim one eligible ready task, or return no work. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |

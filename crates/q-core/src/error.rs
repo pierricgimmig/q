@@ -4,6 +4,8 @@ use crate::model::TaskStatus;
 pub enum QueueError {
     #[error("task {0} not found")]
     NotFound(i64),
+    #[error("feature not found: {0}")]
+    FeatureNotFound(String),
     #[error("invalid transition from {from} to {to}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
     #[error("claim token does not match an active claim")]
@@ -21,7 +23,7 @@ pub enum QueueError {
 impl QueueError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NotFound(_) => "not_found",
+            Self::NotFound(_) | Self::FeatureNotFound(_) => "not_found",
             Self::InvalidTransition { .. } => "invalid_transition",
             Self::TokenMismatch => "token_mismatch",
             Self::ClaimExpired => "claim_expired",

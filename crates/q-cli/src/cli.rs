@@ -63,6 +63,7 @@ fn is_command(word: &str) -> bool {
             | "events"
             | "reopen"
             | "project"
+            | "feature"
             | "mcp"
             | "skill"
             | "help"
@@ -83,6 +84,7 @@ fn is_bool_flag(arg: &str) -> bool {
             | "--clear-project"
             | "--clear-repo"
             | "--clear-agent-pool"
+            | "--clear-feature"
     )
 }
 
@@ -119,6 +121,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--allowed-kind"
             | "--set-project"
             | "--set-repo"
+            | "--feature"
     )
 }
 
@@ -177,6 +180,9 @@ pub enum Commands {
         agent_pool: Option<String>,
         #[arg(long, value_name = "IDS")]
         depends_on: Option<String>,
+        /// Feature id or unique title.
+        #[arg(long, value_name = "ID|TITLE")]
+        feature: Option<String>,
     },
     /// List tasks. Done and cancelled are hidden unless --all or --status is set.
     #[command(alias = "list")]
@@ -191,6 +197,9 @@ pub enum Commands {
         /// Include done and cancelled tasks. Ignored when --status is set.
         #[arg(long)]
         all: bool,
+        /// Show only tasks in this feature. Id or unique title.
+        #[arg(long, value_name = "ID|TITLE")]
+        feature: Option<String>,
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show { id: i64 },
@@ -221,6 +230,12 @@ pub enum Commands {
         clear_repo: bool,
         #[arg(long)]
         clear_agent_pool: bool,
+        /// Feature id or unique title.
+        #[arg(long, value_name = "ID|TITLE")]
+        feature: Option<String>,
+        /// Detach the task from its feature.
+        #[arg(long)]
+        clear_feature: bool,
     },
     /// Move a task to ready so agents may claim it.
     Ready { id: i64 },
@@ -307,6 +322,11 @@ pub enum Commands {
     Events { id: i64 },
     /// Reopen done work to ready, or cancelled work to inbox.
     Reopen { id: i64 },
+    /// Named groups of tasks that may span repos.
+    Feature {
+        #[command(subcommand)]
+        command: FeatureCommand,
+    },
     /// Project discovery and .agentqueue.toml.
     Project {
         #[command(subcommand)]
@@ -332,6 +352,33 @@ pub enum SkillCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FeatureCommand {
+    /// Create a feature.
+    Create {
+        /// Title words. Quoted text is the usual form.
+        #[arg(required = true, num_args = 1.., value_name = "TITLE")]
+        title: Vec<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// List features.
+    #[command(alias = "list")]
+    Ls,
+    /// Show one feature.
+    Show { id: i64 },
+    /// Edit a feature title or body.
+    Edit {
+        id: i64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Delete a feature. Tasks stay; their feature is cleared.
+    Delete { id: i64 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -404,6 +451,27 @@ mod tests {
     fn list_all_is_not_rewritten_as_capture() {
         let args = preprocess(vec!["list".into(), "--all".into()]);
         assert_eq!(args, vec!["list", "--all"]);
+    }
+
+    #[test]
+    fn feature_is_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "feature".into(),
+            "create".into(),
+            "Cross-repo rollout".into(),
+            "--body".into(),
+            "Ship it".into(),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                "feature",
+                "create",
+                "Cross-repo rollout",
+                "--body",
+                "Ship it"
+            ]
+        );
     }
 
     #[test]

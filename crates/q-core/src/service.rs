@@ -1,8 +1,9 @@
 use crate::model::{
     BlockRequest, CancelRequest, CaptureRequest, ClaimOutcome, ClaimRequest, CompleteRequest,
-    DeleteOutcome, DeleteRequest, EditRequest, Event, HeartbeatRequest, ListFilter, QueueStatus,
-    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task,
-    TaskDetail, TaskSummary,
+    CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
+    EditRequest, Event, Feature, HeartbeatRequest, ListFilter, QueueStatus, ReadyOutcome,
+    ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail,
+    TaskSummary,
 };
 use crate::QueueError;
 
@@ -16,8 +17,10 @@ pub trait QueueService: Send + Sync {
     ///
     /// `done` and `cancelled` are omitted when `filter.status` is unset and
     /// `filter.include_terminal` is false. An explicit status is returned as
-    /// requested. Rows are ordered by project (blank last), then `updated_at`
-    /// descending.
+    /// requested. Rows are ordered by feature title (blank last), then project
+    /// (blank last), then `updated_at` descending.
+    ///
+    /// `filter.feature`, when set, is a feature id or a unique title.
     fn list(&self, filter: ListFilter) -> Result<Vec<TaskSummary>, QueueError>;
     fn get(&self, id: i64) -> Result<TaskDetail, QueueError>;
     fn edit(&self, id: i64, request: EditRequest) -> Result<Task, QueueError>;
@@ -41,4 +44,12 @@ pub trait QueueService: Send + Sync {
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError>;
     fn status(&self) -> Result<QueueStatus, QueueError>;
     fn reopen(&self, id: i64, actor: crate::model::Actor) -> Result<Task, QueueError>;
+
+    /// Create a feature. A feature is a label that can group tasks across repos.
+    fn create_feature(&self, request: CreateFeatureRequest) -> Result<Feature, QueueError>;
+    fn list_features(&self) -> Result<Vec<Feature>, QueueError>;
+    fn get_feature(&self, id: i64) -> Result<Feature, QueueError>;
+    fn edit_feature(&self, id: i64, request: EditFeatureRequest) -> Result<Feature, QueueError>;
+    /// Delete a feature. Tasks that referenced it keep their rows; `feature_id` is set to null.
+    fn delete_feature(&self, id: i64) -> Result<DeleteFeatureOutcome, QueueError>;
 }

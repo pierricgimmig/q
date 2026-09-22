@@ -21,6 +21,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - No eligible work is success, not an error: `found` is false and `reason` is `no_eligible_ready_tasks`.
 - Prefer `q --json` for machine output. Logs belong on stderr. In MCP mode, stdout is protocol only.
 - The queue does not launch agents, create worktrees, open pull requests, merge, or deploy.
+- A **feature** is an optional group of tasks that may span repos. Each task keeps its own repo and project. Pass a feature id or unique title to `q add --feature`, `q edit --feature`, `q ls --feature`, or MCP `feature`. `q edit --clear-feature` detaches a task. Deleting a feature clears that link and keeps the tasks.
 
 ## CLI
 
@@ -38,9 +39,13 @@ q release 184 --claim-token TOKEN
 q block 184 --claim-token TOKEN
 q cancel 184
 q delete 184
+q feature create "Cross-repo rollout" --body "Ship the queue across services"
+q add --feature "Cross-repo rollout" "Add the migration"
+q ls --feature "Cross-repo rollout"
+q edit 12 --clear-feature
 ```
 
-`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The table has project, priority, and `updated_at`. Tasks with no project are `(none)` and sort last. Within a project, the newest update is first.
+`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The table has feature, project, priority, and `updated_at`. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update.
 
 `q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready.
 
@@ -48,8 +53,9 @@ q delete 184
 
 `q mcp` serves newline-delimited JSON-RPC on stdio and does not open a network port. Tools:
 
-- `queue_capture` — create an inbox task
-- `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true
+- `queue_capture` — create an inbox task. Optional `feature` is an id or unique title
+- `queue_feature_create`, `queue_feature_list`, `queue_feature_get` — named task groups
+- `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true. Optional `feature` filters by id or unique title
 - `queue_get` — fetch one task, its claim, artifacts, and recent events
 - `queue_claim_next` — atomically claim one eligible ready task, or return no work
 - `queue_heartbeat` — extend a lease with the task id and claim token
