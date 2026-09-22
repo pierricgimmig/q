@@ -10,7 +10,7 @@ use std::sync::Arc;
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
     CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, NO_ELIGIBLE_REASON,
+    ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -181,6 +181,7 @@ fn dispatch_tool(
         "queue_capture" => queue_capture(queue, base_dir, args),
         "queue_list" => queue_list(queue, args),
         "queue_get" => queue_get(queue, args),
+        "queue_tree" => queue_tree(queue, args),
         "queue_feature_create" => queue_feature_create(queue, args),
         "queue_feature_list" => queue_feature_list(queue, args),
         "queue_feature_get" => queue_feature_get(queue, args),
@@ -329,6 +330,24 @@ fn queue_feature_get(
     let id =
         optional_i64(args, "id")?.ok_or_else(|| ToolFailure::Invalid("id is required".into()))?;
     Ok(serde_json::to_value(queue.get_feature(id)?).unwrap_or(Value::Null))
+}
+
+fn queue_tree(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id", "feature"])?;
+    let task_id = match (optional_i64(args, "task_id")?, optional_i64(args, "id")?) {
+        (Some(left), Some(right)) if left != right => {
+            return Err(ToolFailure::Invalid(
+                "task_id and id must be the same task".into(),
+            ));
+        }
+        (Some(id), _) | (_, Some(id)) => Some(id),
+        (None, None) => None,
+    };
+    let tree = queue.tree(TreeQuery {
+        task_id,
+        feature: optional_feature(args)?,
+    })?;
+    Ok(serde_json::to_value(tree).unwrap_or(Value::Null))
 }
 
 fn queue_get(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
@@ -748,6 +767,22 @@ fn tool_definitions() -> Vec<Value> {
             }),
         ),
         tool(
+            "queue_tree",
+            "Show a dependency tree. Children are tasks that must be done first. Pass task_id for one task, or feature (id or unique title) for every task in a feature. Dependencies outside that feature are marked external. A repeated node sets already_shown and omits children.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "id": {"type": "integer", "description": "Alias of task_id."},
+                    "feature": {
+                        "description": "Feature id or unique title. Omit task_id to show the whole feature.",
+                        "anyOf": [{"type": "string"}, {"type": "integer"}]
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "queue_get",
             "Fetch one task plus its latest claim, artifacts, and recent events.",
             json!({
@@ -966,6 +1001,7 @@ mod tests {
             "queue_capture",
             "queue_list",
             "queue_get",
+            "queue_tree",
             "queue_feature_create",
             "queue_feature_list",
             "queue_feature_get",
@@ -1305,6 +1341,82 @@ mod tests {
         );
         assert_eq!(missing["result"]["isError"], true);
         assert_eq!(tool_body(&missing)["code"], "not_found");
+    }
+
+    #[test]
+    fn queue_tree_returns_dependencies_for_a_task_or_feature() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+
+        let feature = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_feature_create", "arguments": {"title": "Rollout"}}),
+        ));
+        let feature_id = feature["id"].as_i64().unwrap();
+        let leaf = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "Add the types", "feature": feature_id}}),
+        ));
+        let leaf_id = leaf["id"].as_i64().unwrap();
+        let top = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_capture", "arguments": {
+                "title": "Ship the rollout",
+                "feature": "Rollout",
+                "dependencies": [leaf_id]
+            }}),
+        ));
+        let top_id = top["id"].as_i64().unwrap();
+
+        let missing = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_tree", "arguments": {}}),
+        );
+        assert_eq!(missing["error"]["code"], -32602);
+
+        let tree = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_tree", "arguments": {"task_id": top_id}}),
+        ));
+        assert!(tree.get("feature").is_none());
+        assert_eq!(tree["roots"][0]["id"], top_id);
+        assert_eq!(tree["roots"][0]["depends_on"][0]["id"], leaf_id);
+
+        let forest = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_tree", "arguments": {"feature": "Rollout"}}),
+        ));
+        assert_eq!(forest["feature"]["id"], feature_id);
+        assert_eq!(forest["roots"][0]["id"], top_id);
+        assert_eq!(forest["roots"][0]["depends_on"][0]["id"], leaf_id);
+        assert!(forest["roots"][0]["depends_on"][0]
+            .get("external")
+            .is_none());
     }
 
     fn task_ids(body: &Value) -> Vec<i64> {

@@ -717,6 +717,107 @@ fn features_group_tasks_across_repos_and_resolve_titles() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn tree_prints_dependencies_for_a_task_and_a_feature() {
+    let dir = temp_root("tree");
+    let db = dir.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    run(bin().args(["--db", db_arg, "--json", "feature", "create", "Rollout"]));
+    run(bin().args(["--db", db_arg, "--json", "feature", "create", "Other"]));
+    run(bin().args(["--db", db_arg, "--json", "feature", "create", "Empty"]));
+
+    let external = add_task(db_arg, "Shared schema", "db", Some("Other"), None);
+    let base = add_task(db_arg, "Add the types", "api", Some("Rollout"), None);
+    let left = add_task(
+        db_arg,
+        "Write the schema",
+        "api",
+        Some("Rollout"),
+        Some(&base.to_string()),
+    );
+    let right = add_task(
+        db_arg,
+        "Write the client",
+        "api",
+        Some("Rollout"),
+        Some(&base.to_string()),
+    );
+    let deps = format!("{external},{left},{right}");
+    let top = add_task(
+        db_arg,
+        "Ship the rollout",
+        "api",
+        Some("Rollout"),
+        Some(&deps),
+    );
+    let _notes = add_task(db_arg, "Write the notes", "web", Some("Rollout"), None);
+
+    let human = run(bin().args(["--db", db_arg, "tree", &top.to_string()]));
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("Ship the rollout"), "{text}");
+    assert!(text.contains("├──") && text.contains("└──"), "{text}");
+    assert!(text.contains("already shown"), "{text}");
+    assert!(text.contains("[api]"), "{text}");
+    assert!(!text.contains("(external)"), "{text}");
+
+    let json = run(bin().args(["--db", db_arg, "--json", "tree", &top.to_string()]));
+    let body: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(body.get("feature").is_none());
+    assert_eq!(body["roots"][0]["id"], top);
+    assert_eq!(body["roots"][0]["title"], "Ship the rollout");
+    let children = body["roots"][0]["depends_on"].as_array().unwrap();
+    assert_eq!(children.len(), 3);
+    let left_node = children.iter().find(|node| node["id"] == left).unwrap();
+    let right_node = children.iter().find(|node| node["id"] == right).unwrap();
+    assert_eq!(left_node["depends_on"][0]["id"], base);
+    assert!(left_node["depends_on"][0].get("already_shown").is_none());
+    assert_eq!(right_node["depends_on"][0]["id"], base);
+    assert_eq!(right_node["depends_on"][0]["already_shown"], true);
+
+    let forest = run(bin().args(["--db", db_arg, "tree", "--feature", "Rollout"]));
+    let forest_text = String::from_utf8(forest.stdout).unwrap();
+    assert!(forest_text.contains("Ship the rollout"), "{forest_text}");
+    assert!(forest_text.contains("Write the notes"), "{forest_text}");
+    assert!(forest_text.contains("(external)"), "{forest_text}");
+    assert!(forest_text.contains("{Other}"), "{forest_text}");
+    assert!(forest_text.contains("already shown"), "{forest_text}");
+
+    let forest_json = run(bin().args(["--db", db_arg, "--json", "tree", "--feature", "rollout"]));
+    let forest_body: Value = serde_json::from_slice(&forest_json.stdout).unwrap();
+    assert_eq!(forest_body["feature"]["title"], "Rollout");
+    let roots = forest_body["roots"].as_array().unwrap();
+    assert!(roots.iter().any(|node| node["id"] == top));
+    assert!(roots.iter().any(|node| node["title"] == "Write the notes"));
+    assert!(!roots.iter().any(|node| node["title"] == "Add the types"));
+
+    let empty = run(bin().args(["--db", db_arg, "tree", "--feature", "Empty"]));
+    let empty_text = String::from_utf8(empty.stdout).unwrap();
+    assert_eq!(empty_text.trim(), "no tasks in Empty");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn add_task(
+    db: &str,
+    title: &str,
+    project: &str,
+    feature: Option<&str>,
+    depends_on: Option<&str>,
+) -> i64 {
+    let mut cmd = bin();
+    cmd.args(["--db", db, "--json", "--project", project, "add", title]);
+    if let Some(feature) = feature {
+        cmd.args(["--feature", feature]);
+    }
+    if let Some(depends_on) = depends_on {
+        cmd.args(["--depends-on", depends_on]);
+    }
+    let output = run(&mut cmd);
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    body["id"].as_i64().unwrap()
+}
+
 fn char_index(line: &str, needle: &str) -> usize {
     let byte = line
         .find(needle)

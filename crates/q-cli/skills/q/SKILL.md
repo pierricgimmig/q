@@ -21,7 +21,8 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - No eligible work is success, not an error: `found` is false and `reason` is `no_eligible_ready_tasks`.
 - Prefer `q --json` for machine output. Logs belong on stderr. In MCP mode, stdout is protocol only.
 - The queue does not launch agents, create worktrees, open pull requests, merge, or deploy.
-- A **feature** is an optional group of tasks that may span repos. Each task keeps its own repo and project. Pass a feature id or unique title to `q add --feature`, `q edit --feature`, `q ls --feature`, or MCP `feature`. `q edit --clear-feature` detaches a task. Deleting a feature clears that link and keeps the tasks.
+- A **feature** is an optional group of tasks that may span repos. Each task keeps its own repo and project. Pass a feature id or unique title to `q add --feature`, `q edit --feature`, `q ls --feature`, `q tree --feature`, or MCP `feature`. `q edit --clear-feature` detaches a task. Deleting a feature clears that link and keeps the tasks.
+- `q tree ID` prints the tasks that must be done before that task. Children are dependencies. `q tree --feature` does the same for every task in a feature. A repeated task is marked already shown. A dependency outside the feature is marked external.
 
 ## CLI
 
@@ -31,6 +32,8 @@ q ls
 q ls --all
 q ls --status inbox
 q show 184
+q tree 184
+q tree --feature "Cross-repo rollout"
 q claim --agent codex-local-01 --capability rust --json
 q heartbeat 184 --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
@@ -57,6 +60,7 @@ q edit 12 --clear-feature
 - `queue_feature_create`, `queue_feature_list`, `queue_feature_get` — named task groups
 - `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true. Optional `feature` filters by id or unique title
 - `queue_get` — fetch one task, its claim, artifacts, and recent events
+- `queue_tree` — dependency tree for `task_id`, or a forest for `feature` (id or unique title). Children must be done first
 - `queue_claim_next` — atomically claim one eligible ready task, or return no work
 - `queue_heartbeat` — extend a lease with the task id and claim token
 - `queue_start` — mark a claim in progress and record a branch or worktree
