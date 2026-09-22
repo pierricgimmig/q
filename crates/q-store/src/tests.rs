@@ -765,6 +765,7 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
             repo: None,
             kind: None,
             limit: 100,
+            include_terminal: false,
         })
         .unwrap();
     assert!(listed.iter().all(|task| task.id != inbox));
@@ -818,6 +819,7 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
             repo: None,
             kind: None,
             limit: 100,
+            include_terminal: false,
         })
         .unwrap();
     assert!(listed.is_empty());
@@ -957,6 +959,7 @@ fn empty_claim_is_success_and_list_filters() {
             repo: Some("https://github.com/acme/demo.git".into()),
             kind: Some(TaskKind::Implementation),
             limit: 10,
+            include_terminal: false,
         })
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -964,4 +967,196 @@ fn empty_claim_is_success_and_list_filters() {
     let status = queue.status().unwrap();
     assert_eq!(status.counts.inbox, 1);
     assert_eq!(status.active_claims, 0);
+}
+
+fn capture_named(queue: &Queue, title: &str, project: Option<&str>) -> i64 {
+    queue
+        .capture(CaptureRequest {
+            title: title.into(),
+            body: None,
+            kind: TaskKind::Implementation,
+            priority: 0,
+            risk: RiskLevel::Low,
+            project: project.map(str::to_string),
+            repo: None,
+            capture_path: "/tmp/demo".into(),
+            repo_relative_path: None,
+            git_root: None,
+            git_head: None,
+            agent_pool: None,
+            required_capabilities: vec![],
+            dependencies: vec![],
+            policy: None,
+            actor: actor(),
+            context_source: Some("test".into()),
+        })
+        .unwrap()
+        .id
+}
+
+fn finish(queue: &Queue, id: i64) {
+    make_ready(queue, id);
+    let token = claim(queue, "agent-list").claim.unwrap().token;
+    queue
+        .start(StartRequest {
+            task_id: id,
+            claim_token: token.clone(),
+            branch: None,
+            worktree_path: None,
+            actor: actor(),
+        })
+        .unwrap();
+    queue
+        .complete(CompleteRequest {
+            task_id: id,
+            claim_token: Some(token),
+            summary: "done".into(),
+            target: Some(TaskStatus::Done),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+}
+
+fn set_updated(path: &PathBuf, id: i64, updated_at: &str) {
+    let conn = Connection::open(path).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+            params![updated_at, id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+fn set_project_name(path: &PathBuf, id: i64, project: Option<&str>) {
+    let conn = Connection::open(path).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE tasks SET project_name = ?1 WHERE id = ?2",
+            params![project, id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+fn listed(
+    queue: &Queue,
+    status: Option<TaskStatus>,
+    include_terminal: bool,
+    limit: u32,
+) -> Vec<i64> {
+    queue
+        .list(ListFilter {
+            status,
+            project: None,
+            repo: None,
+            kind: None,
+            limit,
+            include_terminal,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|task| task.id)
+        .collect()
+}
+
+#[test]
+fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
+    let (queue, path) = queue();
+    let alpha_done = capture_named(&queue, "alpha done", Some("Alpha"));
+    finish(&queue, alpha_done);
+    let alpha_new = capture_named(&queue, "alpha new", Some("Alpha"));
+    let alpha_old = capture_named(&queue, "alpha old", Some("Alpha"));
+    let beta_live = capture_named(&queue, "beta live", Some("beta"));
+    let beta_cancelled = capture_named(&queue, "beta cancelled", Some("beta"));
+    queue
+        .cancel(CancelRequest {
+            task_id: beta_cancelled,
+            reason: "superseded".into(),
+            actor: actor(),
+        })
+        .unwrap();
+    let zeta_first = capture_named(&queue, "zeta first", Some("zeta"));
+    let zeta_second = capture_named(&queue, "zeta second", Some("zeta"));
+    let none_new = capture_named(&queue, "none new", None);
+    let none_old = capture_named(&queue, "none old", None);
+    let blank = capture_named(&queue, "blank project", Some("temp"));
+    set_project_name(&path, blank, Some("   "));
+
+    set_updated(&path, alpha_done, "2026-07-01T00:00:00Z");
+    set_updated(&path, alpha_new, "2026-06-01T00:00:00Z");
+    set_updated(&path, alpha_old, "2026-01-01T00:00:00Z");
+    set_updated(&path, beta_cancelled, "2026-12-01T00:00:00Z");
+    set_updated(&path, beta_live, "2026-08-01T00:00:00Z");
+    set_updated(&path, zeta_first, "2026-05-01T00:00:00Z");
+    set_updated(&path, zeta_second, "2026-05-01T00:00:00Z");
+    set_updated(&path, none_new, "2026-09-01T00:00:00Z");
+    set_updated(&path, blank, "2026-04-01T00:00:00Z");
+    set_updated(&path, none_old, "2026-02-01T00:00:00Z");
+
+    let open = listed(&queue, None, false, 100);
+    assert_eq!(
+        open,
+        vec![
+            alpha_new,
+            alpha_old,
+            beta_live,
+            zeta_second,
+            zeta_first,
+            none_new,
+            blank,
+            none_old,
+        ]
+    );
+    assert!(!open.contains(&alpha_done));
+    assert!(!open.contains(&beta_cancelled));
+
+    let all = listed(&queue, None, true, 100);
+    assert_eq!(
+        all,
+        vec![
+            alpha_done,
+            alpha_new,
+            alpha_old,
+            beta_cancelled,
+            beta_live,
+            zeta_second,
+            zeta_first,
+            none_new,
+            blank,
+            none_old,
+        ]
+    );
+
+    assert_eq!(
+        listed(&queue, Some(TaskStatus::Cancelled), false, 100),
+        vec![beta_cancelled]
+    );
+    assert_eq!(
+        listed(&queue, Some(TaskStatus::Done), false, 100),
+        vec![alpha_done]
+    );
+    let inbox = listed(&queue, Some(TaskStatus::Inbox), true, 100);
+    assert!(!inbox.contains(&alpha_done));
+    assert!(!inbox.contains(&beta_cancelled));
+    assert!(inbox.contains(&alpha_new));
+    assert_eq!(listed(&queue, None, false, 1), vec![alpha_new]);
+
+    let beta_only = queue
+        .list(ListFilter {
+            status: None,
+            project: Some("beta".into()),
+            repo: None,
+            kind: None,
+            limit: 100,
+            include_terminal: true,
+        })
+        .unwrap();
+    assert_eq!(
+        beta_only.iter().map(|task| task.id).collect::<Vec<_>>(),
+        vec![beta_cancelled, beta_live]
+    );
+    let blank_row = queue.get(blank).unwrap().task;
+    assert_eq!(blank_row.project.as_deref(), Some("   "));
 }

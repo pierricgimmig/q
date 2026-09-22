@@ -67,13 +67,26 @@ q project show
 
 ```bash
 q ls
+q ls --all
 q ls --status inbox
+q ls --status cancelled
 q show 184
 q edit 184 --body-file task.md
 q ready 184
 q block 184 --reason "Need storage-format decision first"
 q cancel 184 --reason "Superseded by task 212"
 q delete 184 --reason "Captured twice"
+```
+
+`q ls` (alias `q list`) hides `done` and `cancelled`. `--all` includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`.
+
+Human output is an aligned table: `ID`, `STATUS`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no project is shown as `(none)` and sorted after named projects. Projects are ordered by name, case-insensitively. Within a project, the newest `updated_at` is first. Titles longer than 64 characters are truncated with an ellipsis. `--json` prints the same rows as `{"tasks":[...]}`.
+
+```text
+ID  STATUS  PROJECT  PRI  UPDATED               TITLE
+ 4  inbox   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
+ 2  ready   beta       1  2026-09-22T20:02:00Z  Compare encodings
+ 1  inbox   (none)     0  2026-09-22T20:01:00Z  Unassigned capture
 ```
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
@@ -145,7 +158,7 @@ Tools, all backed by the same service methods as the CLI:
 | Tool | Purpose |
 |---|---|
 | `queue_capture` | Create an inbox task. Optional repo, project, path, kind, priority, risk. |
-| `queue_list` | Bounded summaries with status, project, repo, and kind filters. |
+| `queue_list` | Bounded summaries with status, project, repo, and kind filters. Omits `done` and `cancelled` unless `status` is set or `include_terminal` (alias `all`) is true. |
 | `queue_get` | One task plus claim, artifacts, and recent events. |
 | `queue_claim_next` | Atomically claim one eligible ready task, or return no work. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |

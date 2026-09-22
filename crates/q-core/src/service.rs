@@ -12,6 +12,12 @@ use crate::QueueError;
 /// issue their own SQL or implement a parallel state machine.
 pub trait QueueService: Send + Sync {
     fn capture(&self, request: CaptureRequest) -> Result<Task, QueueError>;
+    /// List task summaries.
+    ///
+    /// `done` and `cancelled` are omitted when `filter.status` is unset and
+    /// `filter.include_terminal` is false. An explicit status is returned as
+    /// requested. Rows are ordered by project (blank last), then `updated_at`
+    /// descending.
     fn list(&self, filter: ListFilter) -> Result<Vec<TaskSummary>, QueueError>;
     fn get(&self, id: i64) -> Result<TaskDetail, QueueError>;
     fn edit(&self, id: i64, request: EditRequest) -> Result<Task, QueueError>;

@@ -75,6 +75,7 @@ fn is_bool_flag(arg: &str) -> bool {
         "--json"
             | "--yes"
             | "--force"
+            | "--all"
             | "--help"
             | "-h"
             | "--version"
@@ -178,15 +179,19 @@ pub enum Commands {
         #[arg(long, value_name = "IDS")]
         depends_on: Option<String>,
     },
-    /// List tasks.
+    /// List tasks. Done and cancelled are hidden unless --all or --status is set.
     #[command(alias = "list")]
     Ls {
+        /// Show only this status. Includes done or cancelled when that status is named.
         #[arg(long, value_name = "STATUS")]
         status: Option<String>,
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
+        /// Include done and cancelled tasks. Ignored when --status is set.
+        #[arg(long)]
+        all: bool,
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show { id: i64 },
@@ -415,6 +420,12 @@ mod tests {
             "inbox".into(),
         ]);
         assert_eq!(args, vec!["--db", "/tmp/q.db", "ls", "--status", "inbox"]);
+    }
+
+    #[test]
+    fn list_all_is_not_rewritten_as_capture() {
+        let args = preprocess(vec!["list".into(), "--all".into()]);
+        assert_eq!(args, vec!["list", "--all"]);
     }
 
     #[test]

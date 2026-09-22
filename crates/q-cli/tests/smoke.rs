@@ -321,3 +321,208 @@ fn skill_install_target_agents_writes_skill_md() {
     let stdout = String::from_utf8(updated.stdout).unwrap();
     assert!(stdout.contains("updated"), "{stdout}");
 }
+
+#[test]
+fn ls_hides_terminal_tasks_unless_all_or_status_and_prints_a_table() {
+    let root = temp_root("ls");
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    let capture = |title: &str, project: Option<&str>| -> i64 {
+        let mut cmd = bin();
+        cmd.current_dir(&work)
+            .args(["--db", db_arg, "--json", "add", title]);
+        if let Some(project) = project {
+            cmd.args(["--project", project]);
+        }
+        let output = run(&mut cmd);
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if let Some(project) = project {
+            assert_eq!(body["project"], project);
+        } else {
+            assert!(body["project"].is_null(), "{body}");
+        }
+        body["id"].as_i64().unwrap()
+    };
+
+    let visible = capture("Keep visible work", Some("proj-alpha"));
+    let long_title = format!("Long {}", "x".repeat(80));
+    let _long = capture(&long_title, Some("proj-alpha"));
+    let floating = capture("Floating capture", None);
+    let cancelled = capture("Drop superseded work", Some("proj-alpha"));
+    run(bin().current_dir(&work).args([
+        "--db",
+        db_arg,
+        "cancel",
+        &cancelled.to_string(),
+        "--reason",
+        "superseded",
+    ]));
+    let done = capture("Ship finished report", Some("proj-beta"));
+    run(bin()
+        .current_dir(&work)
+        .args(["--db", db_arg, "ready", &done.to_string()]));
+    let claimed = run(bin().current_dir(&work).args([
+        "--db",
+        db_arg,
+        "--json",
+        "claim",
+        "--agent",
+        "codex-local-01",
+    ]));
+    let claimed: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(claimed["task"]["id"], done);
+    let token = claimed["claim"]["token"].as_str().unwrap();
+    run(bin().current_dir(&work).args([
+        "--db",
+        db_arg,
+        "start",
+        &done.to_string(),
+        "--claim-token",
+        token,
+    ]));
+    run(bin().current_dir(&work).args([
+        "--db",
+        db_arg,
+        "complete",
+        &done.to_string(),
+        "--claim-token",
+        token,
+        "--summary",
+        "shipped",
+    ]));
+
+    let listed = run(bin().current_dir(&work).args(["--db", db_arg, "ls"]));
+    let table = String::from_utf8(listed.stdout).unwrap();
+    assert!(table.contains("Keep visible work"), "{table}");
+    assert!(table.contains("Floating capture"), "{table}");
+    assert!(table.contains("(none)"), "{table}");
+    assert!(table.contains("proj-alpha"), "{table}");
+    assert!(!table.contains("Drop superseded work"), "{table}");
+    assert!(!table.contains("Ship finished report"), "{table}");
+    assert!(!table.contains(&long_title), "{table}");
+    assert!(table.contains('…'), "{table}");
+    assert_aligned_table(&table);
+
+    let aliased = run(bin().current_dir(&work).args(["--db", db_arg, "list"]));
+    let aliased = String::from_utf8(aliased.stdout).unwrap();
+    assert_eq!(aliased, table);
+
+    let all = run(bin()
+        .current_dir(&work)
+        .args(["--db", db_arg, "ls", "--all"]));
+    let all = String::from_utf8(all.stdout).unwrap();
+    assert!(all.contains("Drop superseded work"), "{all}");
+    assert!(all.contains("Ship finished report"), "{all}");
+    assert!(all.contains("Keep visible work"), "{all}");
+    let alpha_at = all.find("proj-alpha").unwrap();
+    let beta_at = all.find("proj-beta").unwrap();
+    let none_at = all.find("(none)").unwrap();
+    assert!(alpha_at < beta_at && beta_at < none_at, "{all}");
+    assert_aligned_table(&all);
+
+    let only_cancelled =
+        run(bin()
+            .current_dir(&work)
+            .args(["--db", db_arg, "ls", "--status", "cancelled"]));
+    let only_cancelled = String::from_utf8(only_cancelled.stdout).unwrap();
+    assert!(
+        only_cancelled.contains("Drop superseded work"),
+        "{only_cancelled}"
+    );
+    assert!(
+        !only_cancelled.contains("Keep visible work"),
+        "{only_cancelled}"
+    );
+    assert!(
+        !only_cancelled.contains("Ship finished report"),
+        "{only_cancelled}"
+    );
+    assert!(only_cancelled.contains("cancelled"), "{only_cancelled}");
+
+    let json = run(bin()
+        .current_dir(&work)
+        .args(["--db", db_arg, "--json", "ls"]));
+    let body: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let tasks = body["tasks"].as_array().unwrap();
+    let ids: Vec<i64> = tasks
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&visible) && ids.contains(&floating), "{body}");
+    assert!(!ids.contains(&cancelled) && !ids.contains(&done), "{body}");
+    assert!(tasks.iter().any(|task| task["title"] == long_title));
+    assert!(tasks
+        .iter()
+        .all(|task| task["status"] != "done" && task["status"] != "cancelled"));
+
+    let json_all = run(bin()
+        .current_dir(&work)
+        .args(["--db", db_arg, "--json", "ls", "--all"]));
+    let body: Value = serde_json::from_slice(&json_all.stdout).unwrap();
+    let ids: Vec<i64> = body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&done) && ids.contains(&cancelled), "{body}");
+
+    let json_cancelled = run(bin().current_dir(&work).args([
+        "--db",
+        db_arg,
+        "--json",
+        "list",
+        "--status",
+        "cancelled",
+    ]));
+    let body: Value = serde_json::from_slice(&json_cancelled.stdout).unwrap();
+    let tasks = body["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], cancelled);
+    assert_eq!(tasks[0]["status"], "cancelled");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn assert_aligned_table(table: &str) {
+    let lines: Vec<&str> = table.lines().filter(|line| !line.is_empty()).collect();
+    assert!(lines.len() >= 2, "{table}");
+    let header = lines[0];
+    for label in ["ID", "STATUS", "PROJECT", "PRI", "UPDATED", "TITLE"] {
+        assert!(header.contains(label), "{header}");
+    }
+    assert!(header.find("ID").unwrap() < header.find("STATUS").unwrap());
+    assert!(header.find("STATUS").unwrap() < header.find("PROJECT").unwrap());
+    assert!(header.find("PROJECT").unwrap() < header.find("PRI").unwrap());
+    assert!(header.find("PRI").unwrap() < header.find("UPDATED").unwrap());
+    assert!(header.find("UPDATED").unwrap() < header.find("TITLE").unwrap());
+    let width = header.chars().count();
+    assert!(
+        lines.iter().all(|line| line.chars().count() == width),
+        "{table}"
+    );
+    let project_at = char_index(header, "PROJECT");
+    let updated_at = char_index(header, "UPDATED");
+    for line in &lines[1..] {
+        assert_eq!(char_index(line, "2026-"), updated_at, "{line}");
+        let project = line
+            .chars()
+            .skip(project_at)
+            .take("PROJECT".chars().count())
+            .collect::<String>();
+        assert!(
+            project.starts_with("proj-") || project.starts_with("(none)"),
+            "{line}"
+        );
+    }
+}
+
+fn char_index(line: &str, needle: &str) -> usize {
+    let byte = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle} in {line}"));
+    line[..byte].chars().count()
+}

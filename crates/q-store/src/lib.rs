@@ -1016,41 +1016,56 @@ impl QueueService for Queue {
         let repo = norm_repo(filter.repo.as_deref());
         let kind = filter.kind.map(|kind| kind.as_str().to_string());
         let limit = i64::from(clamp_limit(filter.limit));
+        // `include_terminal` applies only when status is unset. An explicit
+        // status, including done or cancelled, is honored on its own.
+        let include_terminal = i64::from(filter.include_terminal);
         let mut stmt = conn
             .prepare(
-                "SELECT id, public_id, title, status, kind, priority, risk, project_name, repo, agent_pool, created_at, updated_at
-                 FROM tasks
-                 WHERE (?1 IS NULL OR status = ?1)
-                   AND (?2 IS NULL OR project_name = ?2)
-                   AND (?3 IS NULL OR repo = ?3)
-                   AND (?4 IS NULL OR kind = ?4)
-                 ORDER BY created_at DESC, id DESC
+                "SELECT id, public_id, title, status, kind, priority, risk, project_name, repo, \
+                 agent_pool, created_at, updated_at \
+                 FROM tasks \
+                 WHERE ((?1 IS NOT NULL AND status = ?1) \
+                     OR (?1 IS NULL AND (?6 != 0 OR status NOT IN ('done', 'cancelled')))) \
+                   AND (?2 IS NULL OR project_name = ?2) \
+                   AND (?3 IS NULL OR repo = ?3) \
+                   AND (?4 IS NULL OR kind = ?4) \
+                 ORDER BY \
+                   CASE WHEN project_name IS NULL OR TRIM(project_name) = '' THEN 1 ELSE 0 END, \
+                   CASE \
+                     WHEN project_name IS NULL OR TRIM(project_name) = '' THEN '' \
+                     ELSE project_name \
+                   END COLLATE NOCASE, \
+                   updated_at DESC, \
+                   id DESC \
                  LIMIT ?5",
             )
             .db()?;
         let rows = stmt
-            .query_map(params![status, project, repo, kind, limit], |row| {
-                let public_id: String = row.get(1)?;
-                let status: String = row.get(3)?;
-                let kind: String = row.get(4)?;
-                let risk: String = row.get(6)?;
-                let created_at: String = row.get(10)?;
-                let updated_at: String = row.get(11)?;
-                Ok(TaskSummary {
-                    id: row.get(0)?,
-                    public_id: parse_uuid(1, &public_id)?,
-                    title: row.get(2)?,
-                    status: parse_status(3, &status)?,
-                    kind: parse_kind(4, &kind)?,
-                    priority: row.get(5)?,
-                    risk: parse_risk(6, &risk)?,
-                    project: row.get(7)?,
-                    repo: row.get(8)?,
-                    agent_pool: row.get(9)?,
-                    created_at: parse_time(10, &created_at)?,
-                    updated_at: parse_time(11, &updated_at)?,
-                })
-            })
+            .query_map(
+                params![status, project, repo, kind, limit, include_terminal],
+                |row| {
+                    let public_id: String = row.get(1)?;
+                    let status: String = row.get(3)?;
+                    let kind: String = row.get(4)?;
+                    let risk: String = row.get(6)?;
+                    let created_at: String = row.get(10)?;
+                    let updated_at: String = row.get(11)?;
+                    Ok(TaskSummary {
+                        id: row.get(0)?,
+                        public_id: parse_uuid(1, &public_id)?,
+                        title: row.get(2)?,
+                        status: parse_status(3, &status)?,
+                        kind: parse_kind(4, &kind)?,
+                        priority: row.get(5)?,
+                        risk: parse_risk(6, &risk)?,
+                        project: row.get(7)?,
+                        repo: row.get(8)?,
+                        agent_pool: row.get(9)?,
+                        created_at: parse_time(10, &created_at)?,
+                        updated_at: parse_time(11, &updated_at)?,
+                    })
+                },
+            )
             .db()?;
         let mut tasks = Vec::new();
         for row in rows {
