@@ -259,7 +259,18 @@ fn queue_capture(
 }
 
 fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
-    expect_keys(args, &["status", "project", "repo", "kind", "limit"])?;
+    expect_keys(
+        args,
+        &[
+            "status",
+            "project",
+            "repo",
+            "kind",
+            "limit",
+            "include_terminal",
+            "all",
+        ],
+    )?;
     let status = match optional_string(args, "status")? {
         Some(status) => Some(TaskStatus::parse(&status).map_err(ToolFailure::from)?),
         None => None,
@@ -269,12 +280,16 @@ fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Val
         None => None,
     };
     let limit = optional_u64(args, "limit")?.unwrap_or(50) as u32;
+    // Either flag includes done and cancelled when status is omitted.
+    // An explicit status is honored on its own.
+    let include_terminal = optional_bool(args, "include_terminal")? || optional_bool(args, "all")?;
     let tasks = queue.list(ListFilter {
         status,
         project: optional_string(args, "project")?,
         repo: optional_string(args, "repo")?,
         kind,
         limit,
+        include_terminal,
     })?;
     Ok(json!({ "tasks": tasks }))
 }
@@ -619,7 +634,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "queue_list",
-            "List bounded task summaries.",
+            "List bounded task summaries. Done and cancelled tasks are omitted unless status is set or include_terminal (alias all) is true. Ordered by project, blank projects last, then updated_at descending.",
             json!({
                 "type": "object",
                 "properties": {
@@ -627,7 +642,15 @@ fn tool_definitions() -> Vec<Value> {
                     "project": {"type": "string"},
                     "repo": {"type": "string"},
                     "kind": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "include_terminal": {
+                        "type": "boolean",
+                        "description": "Include done and cancelled tasks when status is omitted. Defaults to false."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Alias of include_terminal. Either flag set to true includes terminal tasks."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -975,5 +998,107 @@ mod tests {
         assert_eq!(body["active_claim_cleared"], true);
         assert!(body["claims_removed"].as_i64().unwrap() >= 1);
         assert!(matches!(queue.get(again.id), Err(QueueError::NotFound(_))));
+    }
+
+    #[test]
+    fn queue_list_omits_terminal_tasks_unless_asked() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+
+        let visible = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "visible work", "project": "alpha"}}),
+        );
+        let visible_id = tool_body(&visible)["id"].as_i64().unwrap();
+        let hidden = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "hidden work", "project": "beta"}}),
+        );
+        let hidden_id = tool_body(&hidden)["id"].as_i64().unwrap();
+        queue
+            .cancel(q_core::CancelRequest {
+                task_id: hidden_id,
+                reason: "superseded".into(),
+                actor: Actor::agent("mcp"),
+            })
+            .unwrap();
+
+        let default_list = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_list", "arguments": {}}),
+        );
+        let default_ids = task_ids(&tool_body(&default_list));
+        assert_eq!(default_ids, vec![visible_id]);
+
+        let included = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_list", "arguments": {"include_terminal": true}}),
+        );
+        let included_ids = task_ids(&tool_body(&included));
+        assert_eq!(included_ids, vec![visible_id, hidden_id]);
+
+        let alias = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_list", "arguments": {"include_terminal": false, "all": true}}),
+        );
+        assert_eq!(task_ids(&tool_body(&alias)), vec![visible_id, hidden_id]);
+
+        let cancelled = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_list", "arguments": {"status": "cancelled"}}),
+        );
+        let cancelled_tasks = tool_body(&cancelled)["tasks"].as_array().unwrap().clone();
+        assert_eq!(cancelled_tasks.len(), 1);
+        assert_eq!(cancelled_tasks[0]["id"], hidden_id);
+        assert_eq!(cancelled_tasks[0]["status"], "cancelled");
+
+        let tools = call(&mut session, &queue, "tools/list", 8, json!({}));
+        let list_tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "queue_list")
+            .unwrap();
+        let properties = &list_tool["inputSchema"]["properties"];
+        assert!(properties.get("include_terminal").is_some());
+        assert!(properties.get("all").is_some());
+        assert!(list_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("include_terminal"));
+    }
+
+    fn task_ids(body: &Value) -> Vec<i64> {
+        body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_i64().unwrap())
+            .collect()
     }
 }

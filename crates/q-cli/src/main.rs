@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use q_core::{
-    lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
-    ClaimRequest, CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest, ListFilter,
-    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, TaskKind, TaskStatus,
+    format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
+    CaptureRequest, ClaimRequest, CompleteRequest, DeleteRequest, EditRequest, HeartbeatRequest,
+    ListFilter, QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus, TaskSummary,
 };
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
@@ -153,6 +153,7 @@ fn dispatch(
             status,
             kind,
             limit,
+            all,
         } => {
             let status = match status {
                 Some(status) => Some(TaskStatus::parse(&status)?),
@@ -168,18 +169,10 @@ fn dispatch(
                 repo: repo.clone(),
                 kind,
                 limit,
+                include_terminal: all,
             })?;
             emit(json, &serde_json::json!({"tasks": tasks}), || {
-                if tasks.is_empty() {
-                    println!("no tasks");
-                    return;
-                }
-                for task in &tasks {
-                    println!(
-                        "#{:<4} {:<12} {:<8} p{: <4} {}",
-                        task.id, task.status, task.risk, task.priority, task.title
-                    );
-                }
+                print_task_list(&tasks);
             });
             Ok(())
         }
@@ -686,6 +679,120 @@ fn print_context(context: &ProjectContext) {
     );
 }
 
+const TITLE_MAX_CHARS: usize = 64;
+const UNASSIGNED_PROJECT: &str = "(none)";
+
+struct TaskListRow {
+    id: String,
+    status: String,
+    project: String,
+    priority: String,
+    updated: String,
+    title: String,
+}
+
+fn print_task_list(tasks: &[TaskSummary]) {
+    if tasks.is_empty() {
+        println!("no tasks");
+        return;
+    }
+    println!("{}", render_task_table(tasks));
+}
+
+fn render_task_table(tasks: &[TaskSummary]) -> String {
+    let rows: Vec<TaskListRow> = tasks.iter().map(task_list_row).collect();
+    render_task_rows(&rows)
+}
+
+fn task_list_row(task: &TaskSummary) -> TaskListRow {
+    TaskListRow {
+        id: task.id.to_string(),
+        status: task.status.to_string(),
+        project: display_project(task.project.as_deref()),
+        priority: task.priority.to_string(),
+        updated: format_timestamp(task.updated_at),
+        title: format_list_title(&task.title),
+    }
+}
+
+fn display_project(project: Option<&str>) -> String {
+    match project.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(name) => name.to_string(),
+        None => UNASSIGNED_PROJECT.to_string(),
+    }
+}
+
+fn format_list_title(title: &str) -> String {
+    let flat = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&flat, TITLE_MAX_CHARS)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+fn render_task_rows(rows: &[TaskListRow]) -> String {
+    let id_w = column_width("ID", rows.iter().map(|row| row.id.as_str()));
+    let status_w = column_width("STATUS", rows.iter().map(|row| row.status.as_str()));
+    let project_w = column_width("PROJECT", rows.iter().map(|row| row.project.as_str()));
+    let priority_w = column_width("PRI", rows.iter().map(|row| row.priority.as_str()));
+    let updated_w = column_width("UPDATED", rows.iter().map(|row| row.updated.as_str()));
+    let title_w = column_width("TITLE", rows.iter().map(|row| row.title.as_str()));
+    let widths = [id_w, status_w, project_w, priority_w, updated_w, title_w];
+    let align_right = [true, false, false, true, false, false];
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(format_task_line(
+        &["ID", "STATUS", "PROJECT", "PRI", "UPDATED", "TITLE"],
+        widths,
+        align_right,
+    ));
+    for row in rows {
+        lines.push(format_task_line(
+            &[
+                row.id.as_str(),
+                row.status.as_str(),
+                row.project.as_str(),
+                row.priority.as_str(),
+                row.updated.as_str(),
+                row.title.as_str(),
+            ],
+            widths,
+            align_right,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
+    values
+        .map(|value| value.chars().count())
+        .chain(std::iter::once(header.chars().count()))
+        .max()
+        .unwrap_or(0)
+}
+
+fn format_task_line(cells: &[&str], widths: [usize; 6], align_right: [bool; 6]) -> String {
+    let mut line = String::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            line.push_str("  ");
+        }
+        let width = widths[index];
+        if align_right[index] {
+            line.push_str(&format!("{cell:>width$}"));
+        } else {
+            line.push_str(&format!("{cell:<width$}"));
+        }
+    }
+    line
+}
+
 fn print_detail(detail: &q_core::TaskDetail) {
     let task = &detail.task;
     println!("#{} {} [{}]", task.id, task.title, task.status);
@@ -759,5 +866,125 @@ impl From<std::io::Error> for CliError {
         Self {
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        display_project, format_list_title, render_task_rows, truncate_chars, TaskListRow,
+        TITLE_MAX_CHARS,
+    };
+
+    #[test]
+    fn unassigned_project_uses_a_stable_label() {
+        assert_eq!(display_project(None), "(none)");
+        assert_eq!(display_project(Some("   ")), "(none)");
+        assert_eq!(display_project(Some(" alpha ")), "alpha");
+    }
+
+    #[test]
+    fn titles_collapse_whitespace_and_truncate_with_ellipsis() {
+        assert_eq!(format_list_title("  a\nb\t c  "), "a b c");
+        let long = "x".repeat(TITLE_MAX_CHARS + 20);
+        let shown = format_list_title(&long);
+        assert_eq!(shown.chars().count(), TITLE_MAX_CHARS);
+        assert!(shown.ends_with('…'));
+        assert!(!shown.contains(&long));
+        assert_eq!(truncate_chars("short", 64), "short");
+    }
+
+    #[test]
+    fn task_table_aligns_columns() {
+        let long = "y".repeat(TITLE_MAX_CHARS + 8);
+        let rows = vec![
+            TaskListRow {
+                id: "12".into(),
+                status: "inbox".into(),
+                project: "alpha".into(),
+                priority: "0".into(),
+                updated: "2026-09-22T20:00:00Z".into(),
+                title: "Short".into(),
+            },
+            TaskListRow {
+                id: "3".into(),
+                status: "in_progress".into(),
+                project: "(none)".into(),
+                priority: "10".into(),
+                updated: "2026-09-22T19:00:00Z".into(),
+                title: format_list_title(&long),
+            },
+        ];
+        let table = render_task_rows(&rows);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let width = lines[0].chars().count();
+        assert!(lines.iter().all(|line| line.chars().count() == width));
+        let project_at = char_index(lines[0], "PROJECT");
+        assert_eq!(char_index(lines[1], "alpha"), project_at);
+        assert_eq!(char_index(lines[2], "(none)"), project_at);
+        let updated_at = char_index(lines[0], "UPDATED");
+        assert_eq!(char_index(lines[1], "2026-09-22T20:00:00Z"), updated_at);
+        assert_eq!(char_index(lines[2], "2026-09-22T19:00:00Z"), updated_at);
+        assert!(lines[2].contains('…'));
+        assert!(!table.contains(&long));
+        assert!(lines[0].find("ID").unwrap() < lines[0].find("STATUS").unwrap());
+        assert!(lines[0].find("STATUS").unwrap() < lines[0].find("PROJECT").unwrap());
+        assert!(lines[0].find("PROJECT").unwrap() < lines[0].find("PRI").unwrap());
+        assert!(lines[0].find("PRI").unwrap() < lines[0].find("UPDATED").unwrap());
+        assert!(lines[0].find("UPDATED").unwrap() < lines[0].find("TITLE").unwrap());
+        assert!(lines[1].contains("  0  "));
+        assert!(lines[2].contains(" 10  "));
+    }
+
+    #[test]
+    fn task_table_matches_the_readme_shape() {
+        let rows = vec![
+            TaskListRow {
+                id: "4".into(),
+                status: "inbox".into(),
+                project: "alpha".into(),
+                priority: "0".into(),
+                updated: "2026-09-22T20:04:00Z".into(),
+                title: "Keep the inbox item".into(),
+            },
+            TaskListRow {
+                id: "2".into(),
+                status: "ready".into(),
+                project: "beta".into(),
+                priority: "1".into(),
+                updated: "2026-09-22T20:02:00Z".into(),
+                title: "Compare encodings".into(),
+            },
+            TaskListRow {
+                id: "1".into(),
+                status: "inbox".into(),
+                project: "(none)".into(),
+                priority: "0".into(),
+                updated: "2026-09-22T20:01:00Z".into(),
+                title: "Unassigned capture".into(),
+            },
+        ];
+        let table = render_task_rows(&rows);
+        let shown = table
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            shown,
+            "\
+ID  STATUS  PROJECT  PRI  UPDATED               TITLE
+ 4  inbox   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
+ 2  ready   beta       1  2026-09-22T20:02:00Z  Compare encodings
+ 1  inbox   (none)     0  2026-09-22T20:01:00Z  Unassigned capture"
+        );
+    }
+
+    fn char_index(line: &str, needle: &str) -> usize {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {line}"));
+        line[..byte].chars().count()
     }
 }

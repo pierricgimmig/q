@@ -513,6 +513,15 @@ pub struct CaptureRequest {
     pub context_source: Option<String>,
 }
 
+/// Filters for [`crate::QueueService::list`].
+///
+/// When `status` is set, only that status is returned. That includes `done`
+/// and `cancelled`, and `include_terminal` is ignored. When `status` is unset
+/// and `include_terminal` is false, those two terminal statuses are omitted.
+///
+/// Rows are ordered by project name (case-insensitive). Null and blank
+/// projects sort last. Within a project, `updated_at` is newest first, then
+/// id descending.
 #[derive(Debug, Clone)]
 pub struct ListFilter {
     pub status: Option<TaskStatus>,
@@ -520,6 +529,8 @@ pub struct ListFilter {
     pub repo: Option<String>,
     pub kind: Option<TaskKind>,
     pub limit: u32,
+    /// Include `done` and `cancelled` when `status` is unset.
+    pub include_terminal: bool,
 }
 
 impl Default for ListFilter {
@@ -530,6 +541,7 @@ impl Default for ListFilter {
             repo: None,
             kind: None,
             limit: 100,
+            include_terminal: false,
         }
     }
 }

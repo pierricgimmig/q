@@ -26,6 +26,8 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 
 ```bash
 q "Benchmark trace encoding variants"
+q ls
+q ls --all
 q ls --status inbox
 q show 184
 q claim --agent codex-local-01 --capability rust --json
@@ -38,6 +40,8 @@ q cancel 184 --reason "Superseded by task 212"
 q delete 184 --reason "Captured twice"
 ```
 
+`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The table has project, priority, and `updated_at`. Tasks with no project are `(none)` and sort last. Within a project, the newest update is first.
+
 `q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready.
 
 ## MCP
@@ -45,7 +49,7 @@ q delete 184 --reason "Captured twice"
 `q mcp` serves newline-delimited JSON-RPC on stdio and does not open a network port. Tools:
 
 - `queue_capture` — create an inbox task
-- `queue_list` — list bounded summaries
+- `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true
 - `queue_get` — fetch one task, its claim, artifacts, and recent events
 - `queue_claim_next` — atomically claim one eligible ready task, or return no work
 - `queue_heartbeat` — extend a lease with the task id and claim token
