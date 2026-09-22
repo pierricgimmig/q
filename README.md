@@ -1,5 +1,5 @@
 # q
 
-Local-first context-aware agent work queue (CLI + MCP over stdio).
+Local-first context-aware agent work queue (CLI + MCP).
 
-See the product spec for v1 scope.
+_Access check probe — safe to overwrite._
