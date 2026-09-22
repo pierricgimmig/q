@@ -391,7 +391,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn delete_is_not_rewritten_as_capture() {
         let args = preprocess(vec![
             "delete".into(),
