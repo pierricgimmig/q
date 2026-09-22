@@ -11,14 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use q_core::{
-    acceptance_criteria, default_lease, ensure_transition, format_timestamp,
-    is_sufficiently_specified, lease_from_minutes, normalize_repo_url, parse_timestamp,
-    readiness_warnings, Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest,
-    CaptureRequest, Claim, ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest,
-    EditRequest, Event, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService,
-    QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest,
-    RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind,
-    TaskStatus, TaskSummary,
+    acceptance_criteria, default_lease, ensure_transition, format_timestamp, lease_from_minutes,
+    normalize_repo_url, parse_timestamp, readiness_warnings, Actor, Artifact, ArtifactInput,
+    BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease, ClaimOutcome, ClaimRequest,
+    ClaimTask, CompleteRequest, EditRequest, Event, HeartbeatRequest, ListFilter, ProjectPolicy,
+    QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
+    RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task,
+    TaskDetail, TaskKind, TaskStatus, TaskSummary,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -1200,10 +1199,6 @@ impl QueueService for Queue {
         let (_, now) = now_parts();
         let task = load_task_in(&tx, request.task_id)?;
         ensure_transition(task.status, TaskStatus::Ready)?;
-        let missing = q_core::missing_recommended_sections(task.body.as_deref());
-        if !is_sufficiently_specified(task.body.as_deref()) && !request.force {
-            return Err(QueueError::insufficient(&missing));
-        }
         let risk_note = if task.risk >= RiskLevel::High {
             Some(format!(
                 "risk is {}; default claims will not select this task",
@@ -1227,7 +1222,6 @@ impl QueueService for Queue {
             json!({
                 "from": task.status.as_str(),
                 "to": "ready",
-                "force": request.force,
                 "warnings": warnings,
             }),
             &now,
