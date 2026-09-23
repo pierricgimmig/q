@@ -14,7 +14,8 @@ use q_core::{
     TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
 
-use super::{open_connection, Queue};
+use super::replica::RemoteBackend;
+use super::{open_connection, LinkState, Queue, RemoteConfig};
 
 const BODY: &str = r#"
 ## Goal
@@ -138,7 +139,7 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let feature_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
@@ -1466,7 +1467,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let rejected = conn.execute(
         "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
         params![task_id],
@@ -1685,4 +1686,231 @@ fn tree_cycle_from_a_raw_edge_does_not_panic() {
     assert_eq!(back.id, left);
     assert!(back.cycle);
     assert!(back.depends_on.is_empty());
+}
+
+fn capture_as(queue: &Queue, title: &str, agent: &str) -> i64 {
+    queue
+        .capture(CaptureRequest {
+            title: title.into(),
+            body: None,
+            kind: TaskKind::Implementation,
+            priority: 0,
+            risk: RiskLevel::Low,
+            project: Some("demo".into()),
+            repo: Some("git@github.com:acme/demo.git".into()),
+            capture_path: "/tmp/demo".into(),
+            repo_relative_path: None,
+            git_root: Some("/tmp/demo".into()),
+            git_head: Some("abc123".into()),
+            agent_pool: None,
+            required_capabilities: vec![],
+            dependencies: vec![],
+            feature: None,
+            policy: None,
+            actor: Actor::agent(agent),
+            context_source: Some("test".into()),
+        })
+        .unwrap()
+        .id
+}
+
+fn pair_paths() -> (PathBuf, PathBuf) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("q-sync-{nanos}-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    (dir.join("local.db"), dir.join("remote.db"))
+}
+
+fn linked(link: LinkState) -> (Queue, PathBuf, PathBuf) {
+    let (local, remote) = pair_paths();
+    let _remote = Queue::open(&remote).unwrap();
+    let queue = Queue::open_linked(
+        &local,
+        Some(RemoteConfig {
+            url: "sqlite-test".into(),
+            auth_token: String::new(),
+        }),
+        Some(RemoteBackend::Sqlite(remote.clone())),
+        Some(link),
+    )
+    .unwrap();
+    (queue, local, remote)
+}
+
+fn set_origin(path: &PathBuf, id: i64, origin: &str, created_offline: i64, creator: Option<&str>) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "UPDATE tasks SET origin = ?1, created_offline = ?2, creator_agent_id = ?3 WHERE id = ?4",
+        params![origin, created_offline, creator, id],
+    )
+    .unwrap();
+}
+
+#[test]
+fn offline_agent_claims_only_a_task_it_just_created() {
+    let (queue, _, _) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Offline local work", "agent-a");
+    make_ready(&queue, id);
+    let own = claim(&queue, "agent-a");
+    assert!(own.found, "{:?}", own.reason);
+    assert_eq!(own.task.as_ref().unwrap().task.id, id);
+
+    let (queue, _, _) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Someone else's outage", "agent-a");
+    make_ready(&queue, id);
+    let other = claim(&queue, "agent-b");
+    assert!(!other.found);
+    assert_eq!(other.reason.as_deref(), Some(NO_ELIGIBLE_REASON));
+
+    let (queue, path, _) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Already on the authority", "agent-a");
+    make_ready(&queue, id);
+    set_origin(&path, id, "synced_from_remote", 1, Some("agent-a"));
+    let synced = claim(&queue, "agent-a");
+    assert!(!synced.found);
+
+    let (queue, path, _) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Created while online", "agent-a");
+    make_ready(&queue, id);
+    set_origin(&path, id, "local_unsynced", 0, Some("agent-a"));
+    let online_origin = claim(&queue, "agent-a");
+    assert!(!online_origin.found);
+
+    let (queue, _, _) = linked(LinkState::Offline);
+    let id = capture(&queue, "Human capture during an outage");
+    make_ready(&queue, id);
+    let human = claim(&queue, "agent-a");
+    assert!(!human.found);
+}
+
+#[test]
+fn local_only_queue_still_claims_any_eligible_ready_task() {
+    let (queue, _) = queue();
+    let id = capture(&queue, "Ordinary ready work");
+    make_ready(&queue, id);
+    let outcome = claim(&queue, "agent-a");
+    assert!(outcome.found);
+    assert_eq!(outcome.task.unwrap().task.id, id);
+    assert_eq!(queue.link_state(), LinkState::LocalOnly);
+}
+
+#[test]
+fn sync_prefers_the_remote_claim_over_an_offline_claim() {
+    let (queue, local, remote) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Claimed on two sides", "agent-a");
+    make_ready(&queue, id);
+    let local_claim = claim(&queue, "agent-a");
+    assert!(local_claim.found);
+    let public_id = queue.get(id).unwrap().task.public_id.to_string();
+    drop(queue);
+
+    let remote_queue = Queue::open(&remote).unwrap();
+    let remote_id = capture(&remote_queue, "Authority copy");
+    drop(remote_queue);
+    let conn = Connection::open(&remote).unwrap();
+    conn.execute(
+        "UPDATE tasks SET public_id = ?1, status = 'claimed', title = 'Claimed on two sides' WHERE id = ?2",
+        params![public_id, remote_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO claims (
+            task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at, dirty
+         ) VALUES (?1, 'agent-b', 'remote-token', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T01:00:00Z', 0)",
+        params![remote_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let queue = Queue::open_linked(
+        &local,
+        Some(RemoteConfig {
+            url: "sqlite-test".into(),
+            auth_token: String::new(),
+        }),
+        Some(RemoteBackend::Sqlite(remote.clone())),
+        Some(LinkState::Online),
+    )
+    .unwrap();
+    let report = queue.sync().unwrap();
+    assert_eq!(report.link, LinkState::Online);
+    assert!(report.conflicts >= 1, "conflicts={}", report.conflicts);
+
+    let detail = queue.get(id).unwrap();
+    assert_eq!(detail.task.status, TaskStatus::Claimed);
+    let claim = detail.claim.expect("remote claim is adopted");
+    assert_eq!(claim.agent_id, "agent-b");
+    assert_eq!(claim.token, "remote-token");
+    let events = queue.events(id).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "claim_conflict"),
+        "expected claim_conflict, got {:?}",
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+    let conn = Connection::open(&local).unwrap();
+    let superseded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE task_id = ?1 AND superseded_reason = 'remote_authority'",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(superseded, 1);
+}
+
+#[test]
+fn offline_claim_replicates_when_the_authority_has_not_seen_the_task() {
+    let (queue, local, remote) = linked(LinkState::Offline);
+    let id = capture_as(&queue, "Brand new offline task", "agent-a");
+    make_ready(&queue, id);
+    let claimed = claim(&queue, "agent-a");
+    assert!(claimed.found);
+    let public_id = queue.get(id).unwrap().task.public_id.to_string();
+    let token = claimed.claim.unwrap().token;
+    drop(queue);
+
+    let queue = Queue::open_linked(
+        &local,
+        Some(RemoteConfig {
+            url: "sqlite-test".into(),
+            auth_token: String::new(),
+        }),
+        Some(RemoteBackend::Sqlite(remote.clone())),
+        Some(LinkState::Online),
+    )
+    .unwrap();
+    let report = queue.sync().unwrap();
+    assert!(report.pushed >= 1, "pushed={}", report.pushed);
+    assert_eq!(report.conflicts, 0);
+
+    let origin: String = Connection::open(&local)
+        .unwrap()
+        .query_row(
+            "SELECT origin FROM tasks WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(origin, "synced_local");
+
+    let remote_status: (String, String) = Connection::open(&remote)
+        .unwrap()
+        .query_row(
+            "SELECT tasks.status, claims.claim_token
+             FROM tasks JOIN claims ON claims.task_id = tasks.id
+             WHERE tasks.public_id = ?1 AND claims.released_at IS NULL",
+            params![public_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(remote_status.0, "claimed");
+    assert_eq!(remote_status.1, token);
 }

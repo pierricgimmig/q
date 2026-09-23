@@ -16,7 +16,7 @@ use q_core::{
     TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
 };
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
-use q_store::{default_db_path, Queue};
+use q_store::{default_db_path, resolve_remote_config, Queue};
 
 use crate::cli::{Commands, FeatureCommand, ProjectCommand};
 
@@ -52,10 +52,12 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
     let repo = cli.repo.clone();
     let project = cli.project.clone();
     let directory = cli.directory.clone();
+    let turso_url = cli.turso_url.clone();
+    let turso_auth_token = cli.turso_auth_token.clone();
     match cli.command {
         Commands::Mcp => {
             tracing::info!(db = %db.display(), "opening queue");
-            let queue = Arc::new(Queue::open(&db)?);
+            let queue = Arc::new(open_queue(&db, turso_url, turso_auth_token)?);
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
         }
@@ -78,7 +80,7 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
         },
         other => {
             tracing::info!(db = %db.display(), "opening queue");
-            let queue = Queue::open(&db)?;
+            let queue = open_queue(&db, turso_url, turso_auth_token)?;
             dispatch(
                 &queue,
                 &db,
@@ -423,14 +425,18 @@ fn dispatch(
         }
         Commands::Status => {
             let status = queue.status()?;
+            let link = queue.link_state();
             let body = serde_json::json!({
                 "db": db,
                 "counts": status.counts,
                 "active_claims": status.active_claims,
                 "expired_claims": status.expired_claims,
+                "link": link.as_str(),
+                "remote_configured": queue.remote_configured(),
             });
             emit(json, &body, || {
                 println!("database: {}", db.display());
+                println!("link: {}", link.as_str());
                 println!("inbox: {}", status.counts.inbox);
                 println!("ready: {}", status.counts.ready);
                 println!("claimed: {}", status.counts.claimed);
@@ -441,6 +447,22 @@ fn dispatch(
                 println!("cancelled: {}", status.counts.cancelled);
                 println!("active claims: {}", status.active_claims);
                 println!("expired claims: {}", status.expired_claims);
+            });
+            Ok(())
+        }
+        Commands::Sync => {
+            let report = queue.sync()?;
+            let body = serde_json::json!({
+                "link": report.link.as_str(),
+                "pulled": report.pulled,
+                "pushed": report.pushed,
+                "conflicts": report.conflicts,
+            });
+            emit(json, &body, || {
+                println!("link: {}", report.link.as_str());
+                println!("pulled: {}", report.pulled);
+                println!("pushed: {}", report.pushed);
+                println!("conflicts: {}", report.conflicts);
             });
             Ok(())
         }
@@ -603,6 +625,17 @@ fn base_dir(directory: Option<&Path>) -> Result<PathBuf, CliError> {
 
 fn db_path(cli: &cli::Cli) -> PathBuf {
     cli.db.clone().unwrap_or_else(default_db_path)
+}
+
+fn open_queue(
+    db: &std::path::Path,
+    turso_url: Option<String>,
+    turso_auth_token: Option<String>,
+) -> Result<Queue, QueueError> {
+    match resolve_remote_config(turso_url, turso_auth_token) {
+        Some(config) => Queue::open_remote(db, config),
+        None => Queue::open(db),
+    }
 }
 
 fn human_actor() -> Actor {

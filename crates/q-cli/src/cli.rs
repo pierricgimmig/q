@@ -67,6 +67,7 @@ fn is_command(word: &str) -> bool {
             | "feature"
             | "mcp"
             | "skill"
+            | "sync"
             | "help"
     )
 }
@@ -123,6 +124,8 @@ fn is_value_flag(arg: &str) -> bool {
             | "--set-project"
             | "--set-repo"
             | "--feature"
+            | "--turso-url"
+            | "--turso-auth-token"
     )
 }
 
@@ -153,6 +156,14 @@ pub struct Cli {
     /// Explicit project name. Overrides discovery. On `claim`/`ls`, filters by project.
     #[arg(long, global = true, value_name = "NAME")]
     pub project: Option<String>,
+
+    /// Turso/libsql database URL. Overrides `Q_TURSO_URL`, `LIBSQL_URL`, and `TURSO_DATABASE_URL`.
+    #[arg(long, global = true, value_name = "URL")]
+    pub turso_url: Option<String>,
+
+    /// Auth token for the Turso/libsql URL. Overrides `Q_TURSO_AUTH_TOKEN`, `LIBSQL_AUTH_TOKEN`, and `TURSO_AUTH_TOKEN`.
+    #[arg(long, global = true, value_name = "TOKEN")]
+    pub turso_auth_token: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -330,6 +341,8 @@ pub enum Commands {
     },
     /// Show queue counts and claim lease health.
     Status,
+    /// Pull from the Turso authority and push local changes.
+    Sync,
     /// Requeue expired claims and record a recovery event.
     RecoverStale {
         /// ready or blocked. Defaults to each project's stale policy.

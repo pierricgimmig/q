@@ -2,7 +2,7 @@
 
 Local-first work queue for coding and research agents. Capture an idea in one command, keep it in an inbox until a person marks it ready, then let an idle agent claim it through the CLI or an MCP server on stdio.
 
-`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate.
+`q` is one binary. The human CLI and `q mcp` call the same service API. The working store is a local SQLite file. When a Turso URL is set, that file syncs with a libsql server that is the central authority for claims.
 
 ## Install
 
@@ -32,6 +32,43 @@ Every connection sets WAL mode, foreign keys, and a 5 second busy timeout. Overr
 ```bash
 q --db /tmp/queue.db status
 ```
+
+### Turso / libsql
+
+With no remote URL, `q` stays local-only. Claims, leases, and `BEGIN IMMEDIATE` behave as they do today. `q status` reports `link: local_only`.
+
+Set a remote to share one queue across machines:
+
+```bash
+export Q_TURSO_URL="libsql://q-queue-your-org.turso.io"
+export Q_TURSO_AUTH_TOKEN="..."
+q sync
+q status
+```
+
+The same values can be passed as `--turso-url` and `--turso-auth-token`. URL lookup order is the flag, then `Q_TURSO_URL`, `LIBSQL_URL`, `TURSO_DATABASE_URL`. Token lookup is the flag, then `Q_TURSO_AUTH_TOKEN`, `LIBSQL_AUTH_TOKEN`, `TURSO_AUTH_TOKEN`. An empty value is skipped. `Queue::open` (used by tests) ignores these variables; the CLI and MCP server opt in.
+
+The local file is still the database the CLI reads and writes. `libsql` is used only as an HTTP client (`Builder::new_remote`) to the authority. Embedded replicas that forward every write to the primary cannot accept offline writes, and stock libsql sync is last-push-wins, which would let two completions overwrite each other. q therefore syncs by `public_id` (tasks, features, events, artifacts) and `claim_token` (claims). Integer ids stay local.
+
+`q sync`, and a sync attempt on open, pull remote rows and push dirty local rows. `q status` adds `link` (`local_only`, `online`, or `offline`) and `remote_configured`. A failed probe is offline, not a hard error: the local file keeps working.
+
+### Offline claim policy
+
+While the link is offline, an agent may claim only a task it created itself during that outage. The row must have `origin = local_unsynced`, `created_offline = 1`, and `creator_agent_id` equal to the claiming agent. Tasks pulled from the authority (`synced_from_remote`), tasks already pushed (`synced_local`), tasks created while online, tasks created by a human, and tasks created by a different agent stay unclaimable until the link returns. That is what stops two machines from taking the same ready task.
+
+`created_offline` is set only at capture, and only when a remote is configured and the probe fails. Later edits do not change it. MCP `queue_capture` takes an optional `agent_id` (default `mcp`) so the creator matches `queue_claim_next`.
+
+When the link is online, claim still runs in one local `BEGIN IMMEDIATE` transaction, and the authority must accept the claim before the token is returned. The remote update is a compare-and-swap on `public_id` and status `ready`. If another machine already claimed it, the local transaction rolls back and the claim result is no eligible work.
+
+### Reconciliation
+
+Prevention is the offline gate. A leftover conflict is possible if a task was claimed locally and the authority also has a different claim (for example a crash after the authority accepted a claim, or a row that was synced and then claimed on two sides before the gate existed). On sync:
+
+- Tasks are matched by `public_id`, claims by `claim_token`.
+- If the latest claim tokens differ and the authority has a claim, or the authority has moved to claimed / in progress / review / done, the remote row wins.
+- The local claim is retired with `release_reason = superseded` and `superseded_reason = remote_authority`. A `claim_conflict` event is appended. If the losing local status was `review` or `done`, the event is `completion_conflict` and that local completion is not pushed. Completions are never applied twice in silence.
+- The same token (this agent's own heartbeat or completion catching up) is not a conflict.
+- A task the authority has never seen is inserted. Deletes travel as rows in `sync_tombstones`.
 
 ## Capture and discovery
 
@@ -149,7 +186,7 @@ q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
 q release 184 --claim-token TOKEN
 ```
 
-`q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. No eligible work is success, not an error:
+`q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. When a Turso URL is configured and the link is online, the authority accepts that claim before the token is returned. When the link is offline, the offline claim policy above applies. No eligible work is success, not an error:
 
 ```json
 {"found": false, "reason": "no_eligible_ready_tasks"}
@@ -165,6 +202,7 @@ If the project sets `require_pr` and the task kind is implementation, `complete`
 
 ```bash
 q status
+q sync
 q recover-stale
 q recover-stale --to blocked
 q events 184
@@ -269,7 +307,7 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 crates/q-core       types, transitions, readiness checks, QueueService
 crates/q-dispatch   eligibility rules used inside the claim transaction
 crates/q-project    git discovery and .agentqueue.toml
-crates/q-store      SQLite schema, migrations, and the service implementation
+crates/q-store      SQLite schema, migrations, Turso sync, and the service implementation
 crates/q-mcp        stdio JSON-RPC adapter
 crates/q-cli        the q binary
 ```

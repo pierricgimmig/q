@@ -1,7 +1,9 @@
-use rusqlite::{params, Connection, TransactionBehavior};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use q_core::{format_timestamp, QueueError};
+
+use crate::session::{query_i64, query_i64s, Db, SqlVal};
 
 pub(crate) const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -13,6 +15,15 @@ CREATE TABLE IF NOT EXISTS projects (
   require_pr INTEGER NOT NULL DEFAULT 0,
   allow_external_actions INTEGER NOT NULL DEFAULT 0,
   stale_disposition TEXT NOT NULL DEFAULT 'ready',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS features (
+  id INTEGER PRIMARY KEY,
+  public_id TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  body TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -37,6 +48,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   agent_pool TEXT,
   required_capabilities_json TEXT NOT NULL DEFAULT '[]',
   blocked_reason TEXT,
+  feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL,
+  origin TEXT NOT NULL DEFAULT 'local_unsynced',
+  created_offline INTEGER NOT NULL DEFAULT 0,
+  creator_agent_id TEXT,
+  dirty INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -52,7 +68,11 @@ CREATE TABLE IF NOT EXISTS claims (
   branch TEXT,
   worktree_path TEXT,
   released_at TEXT,
-  release_reason TEXT
+  release_reason TEXT,
+  claimed_offline INTEGER NOT NULL DEFAULT 0,
+  superseded_at TEXT,
+  superseded_reason TEXT,
+  dirty INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS claims_one_active
@@ -70,6 +90,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
   task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   value TEXT NOT NULL,
+  public_id TEXT,
+  dirty INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 
@@ -80,6 +102,8 @@ CREATE TABLE IF NOT EXISTS events (
   actor_type TEXT NOT NULL,
   actor_id TEXT,
   payload_json TEXT NOT NULL DEFAULT '{}',
+  public_id TEXT,
+  dirty INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
 
@@ -91,6 +115,18 @@ ON claims(lease_expires_at);
 
 CREATE INDEX IF NOT EXISTS events_task_idx
 ON events(task_id, id);
+
+CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);
+CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);
+CREATE UNIQUE INDEX IF NOT EXISTS events_public_id ON events(public_id);
+CREATE UNIQUE INDEX IF NOT EXISTS artifacts_public_id ON artifacts(public_id);
+
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  entity TEXT NOT NULL,
+  public_id TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (entity, public_id)
+);
 "#;
 
 const SCHEMA_V2_TASKS: &str = r#"
@@ -99,44 +135,56 @@ ALTER TABLE tasks ADD COLUMN feature_id INTEGER REFERENCES features(id) ON DELET
 CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);
 "#;
 
-pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
+pub fn migrate(conn: &mut dyn Db) -> Result<(), QueueError> {
+    migrate_in(conn)
+}
+
+pub(crate) fn migrate_in(conn: &mut dyn Db) -> Result<(), QueueError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
          );",
-    )
-    .map_err(|err| QueueError::Database(err.to_string()))?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| QueueError::Database(err.to_string()))?;
-    let current: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|err| QueueError::Database(err.to_string()))?;
+    )?;
+    conn.begin_immediate()?;
+    let result = apply_pending(conn);
+    if result.is_err() {
+        let _ = conn.rollback();
+    } else if let Err(err) = conn.commit() {
+        let _ = conn.rollback();
+        return Err(err);
+    }
+    result
+}
+
+fn apply_pending(conn: &mut dyn Db) -> Result<(), QueueError> {
+    let current = query_i64(
+        conn,
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+    )?;
     let applied_at = format_timestamp(OffsetDateTime::now_utc());
+    // New files get the current schema and are stamped at version 3. Databases
+    // created by older builds walk v1 → v2 → v3. `current` is read once, so a
+    // brand-new file does not also run the upgrade alters.
     if current < 1 {
-        tx.execute_batch(SCHEMA_V1)
-            .map_err(|err| QueueError::Database(err.to_string()))?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
-            params![applied_at],
-        )
-        .map_err(|err| QueueError::Database(err.to_string()))?;
+        conn.execute_batch(SCHEMA_V1)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+            &[SqlVal::text(applied_at.clone())],
+        )?;
+    } else {
+        if current < 2 {
+            apply_v2(conn, &applied_at)?;
+        }
+        if current < 3 {
+            apply_v3(conn, &applied_at)?;
+        }
     }
-    if current < 2 {
-        apply_v2(&tx, &applied_at)?;
-    }
-    tx.commit()
-        .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
 }
 
-fn apply_v2(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
-    tx.execute_batch(
+fn apply_v2(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS features (
             id INTEGER PRIMARY KEY,
             public_id TEXT NOT NULL UNIQUE,
@@ -145,26 +193,175 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), Queu
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
          );",
-    )
-    .map_err(|err| QueueError::Database(err.to_string()))?;
-    let has_feature_id: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|err| QueueError::Database(err.to_string()))?;
+    )?;
+    let has_feature_id = query_i64(
+        conn,
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
+    )?;
     if has_feature_id == 0 {
-        tx.execute_batch(SCHEMA_V2_TASKS)
-            .map_err(|err| QueueError::Database(err.to_string()))?;
+        conn.execute_batch(SCHEMA_V2_TASKS)?;
     } else {
-        tx.execute_batch("CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);")
-            .map_err(|err| QueueError::Database(err.to_string()))?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);")?;
     }
-    tx.execute(
+    conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
-        params![applied_at],
-    )
-    .map_err(|err| QueueError::Database(err.to_string()))?;
+        &[SqlVal::text(applied_at)],
+    )?;
+    Ok(())
+}
+
+const SCHEMA_V3: &str = r#"
+ALTER TABLE tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'local_unsynced';
+ALTER TABLE tasks ADD COLUMN created_offline INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN creator_agent_id TEXT;
+ALTER TABLE tasks ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE claims ADD COLUMN claimed_offline INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE claims ADD COLUMN superseded_at TEXT;
+ALTER TABLE claims ADD COLUMN superseded_reason TEXT;
+ALTER TABLE claims ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE events ADD COLUMN public_id TEXT;
+ALTER TABLE events ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE artifacts ADD COLUMN public_id TEXT;
+ALTER TABLE artifacts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  entity TEXT NOT NULL,
+  public_id TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (entity, public_id)
+);
+
+CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);
+"#;
+
+fn apply_v3(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
+    // Each ALTER is skipped when a previous attempt added the column but did not
+    // record the version (crash mid-migration).
+    if !column_exists(conn, "tasks", "origin")? {
+        conn.execute_batch(SCHEMA_V3)?;
+    } else {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_tombstones (
+                entity TEXT NOT NULL,
+                public_id TEXT NOT NULL,
+                deleted_at TEXT NOT NULL,
+                PRIMARY KEY (entity, public_id)
+             );
+             CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);",
+        )?;
+        ensure_column(
+            conn,
+            "tasks",
+            "created_offline",
+            "ALTER TABLE tasks ADD COLUMN created_offline INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "tasks",
+            "creator_agent_id",
+            "ALTER TABLE tasks ADD COLUMN creator_agent_id TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "tasks",
+            "dirty",
+            "ALTER TABLE tasks ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            conn,
+            "claims",
+            "claimed_offline",
+            "ALTER TABLE claims ADD COLUMN claimed_offline INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "claims",
+            "superseded_at",
+            "ALTER TABLE claims ADD COLUMN superseded_at TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "claims",
+            "superseded_reason",
+            "ALTER TABLE claims ADD COLUMN superseded_reason TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "claims",
+            "dirty",
+            "ALTER TABLE claims ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            conn,
+            "events",
+            "public_id",
+            "ALTER TABLE events ADD COLUMN public_id TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "events",
+            "dirty",
+            "ALTER TABLE events ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            conn,
+            "artifacts",
+            "public_id",
+            "ALTER TABLE artifacts ADD COLUMN public_id TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "artifacts",
+            "dirty",
+            "ALTER TABLE artifacts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+        )?;
+    }
+    backfill_public_ids(conn, "events")?;
+    backfill_public_ids(conn, "artifacts")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS events_public_id ON events(public_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS artifacts_public_id ON artifacts(public_id);",
+    )?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        &[SqlVal::text(applied_at)],
+    )?;
+    Ok(())
+}
+
+fn column_exists(conn: &mut dyn Db, table: &str, column: &str) -> Result<bool, QueueError> {
+    let count = query_i64(
+        conn,
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"),
+    )?;
+    Ok(count > 0)
+}
+
+fn ensure_column(
+    conn: &mut dyn Db,
+    table: &str,
+    column: &str,
+    alter: &str,
+) -> Result<(), QueueError> {
+    if !column_exists(conn, table, column)? {
+        conn.execute_batch(alter)?;
+    }
+    Ok(())
+}
+
+fn backfill_public_ids(conn: &mut dyn Db, table: &str) -> Result<(), QueueError> {
+    let ids = query_i64s(
+        conn,
+        &format!("SELECT id FROM {table} WHERE public_id IS NULL"),
+    )?;
+    for id in ids {
+        conn.execute(
+            &format!("UPDATE {table} SET public_id = ? WHERE id = ?"),
+            &[SqlVal::text(Uuid::now_v7().to_string()), SqlVal::Int(id)],
+        )?;
+    }
     Ok(())
 }

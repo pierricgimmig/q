@@ -216,6 +216,7 @@ fn queue_capture(
             "dependencies",
             "agent_pool",
             "feature",
+            "agent_id",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -256,7 +257,10 @@ fn queue_capture(
         dependencies: optional_i64_array(args, "dependencies")?,
         feature: optional_feature(args)?,
         policy: context.policy,
-        actor: Actor::agent("mcp"),
+        actor: match optional_string(args, "agent_id")? {
+            Some(agent_id) if !agent_id.trim().is_empty() => Actor::agent(agent_id.trim()),
+            _ => Actor::agent("mcp"),
+        },
         context_source: serde_json::to_value(context.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
@@ -700,6 +704,10 @@ fn tool_definitions() -> Vec<Value> {
                     "feature": {
                         "description": "Feature id or unique title. The task keeps its own repo and project.",
                         "anyOf": [{"type": "string"}, {"type": "integer"}]
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Agent that created the task. Required to claim it while offline from the Turso authority. Defaults to mcp."
                     }
                 },
                 "additionalProperties": false

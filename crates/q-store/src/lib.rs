@@ -2,19 +2,27 @@
 //!
 //! Claim, recovery, and every other state change go through this crate. The
 //! CLI and MCP adapters do not keep a second copy of the SQL.
+//!
+//! When a Turso URL is configured, this file stays the working database.
+//! [`replica`] pushes and pulls against the remote authority. Offline claims
+//! are limited to tasks this agent created during the outage; see that module.
 
 mod dbpath;
+mod libsql_remote;
+mod replica;
 mod schema;
+mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
     format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
-    Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
-    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
+    Actor, ActorKind, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim,
+    ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
     DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
     Feature, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus,
     ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
@@ -28,6 +36,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub use dbpath::{default_db_path, resolve_db_path};
+pub use replica::{resolve_remote_config, LinkState, RemoteConfig, SyncReport};
+
+const LINK_CACHE_TTL: Duration = Duration::from_secs(3);
 
 const TASK_SELECT: &str = "\
 SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_capture, tasks.status, \
@@ -52,20 +63,159 @@ FROM claims";
 const EVENT_SELECT: &str = "\
 SELECT id, task_id, event_type, actor_type, actor_id, payload_json, created_at FROM events";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Queue {
     path: PathBuf,
+    remote: Option<RemoteConfig>,
+    backend: Option<replica::RemoteBackend>,
+    /// Tests pin the link so claim policy can run without a network.
+    forced_link: Option<LinkState>,
+    link_cache: Mutex<Option<(LinkState, Instant)>>,
 }
 
 impl Queue {
+    /// Open a local-only queue. Ambient Turso environment variables are ignored.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, QueueError> {
+        Self::open_linked(path, None, None, None)
+    }
+
+    /// Open a queue that syncs with a Turso/libsql authority.
+    ///
+    /// A failed probe leaves the queue usable offline. The first open also
+    /// tries to sync so a reconnect picks up the central queue.
+    pub fn open_remote(path: impl Into<PathBuf>, config: RemoteConfig) -> Result<Self, QueueError> {
+        let queue = Self::open_linked(path, Some(config), None, None)?;
+        if let Err(err) = queue.sync() {
+            tracing::warn!(error = %err, "sync on open failed; continuing offline");
+        }
+        Ok(queue)
+    }
+
+    pub(crate) fn open_linked(
+        path: impl Into<PathBuf>,
+        remote: Option<RemoteConfig>,
+        backend: Option<replica::RemoteBackend>,
+        forced_link: Option<LinkState>,
+    ) -> Result<Self, QueueError> {
         let path = path.into();
         let _conn = open_connection(&path)?;
-        Ok(Self { path })
+        let backend = match (&remote, backend) {
+            (None, _) => None,
+            (Some(_), Some(backend)) => Some(backend),
+            (Some(_), None) => Some(replica::RemoteBackend::Libsql),
+        };
+        Ok(Self {
+            path,
+            remote,
+            backend,
+            forced_link,
+            link_cache: Mutex::new(None),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn remote_configured(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    pub fn link_state(&self) -> LinkState {
+        self.link_state_cached(false)
+    }
+
+    /// Pull remote tasks and push local dirty rows.
+    ///
+    /// Local-only queues and an offline link return a zero report. A probe
+    /// failure is offline, not an error. A sync that starts online and then
+    /// fails returns [`QueueError`].
+    pub fn sync(&self) -> Result<SyncReport, QueueError> {
+        let Some(config) = &self.remote else {
+            return Ok(SyncReport {
+                link: LinkState::LocalOnly,
+                pulled: 0,
+                pushed: 0,
+                conflicts: 0,
+            });
+        };
+        let Some(backend) = &self.backend else {
+            return Ok(SyncReport {
+                link: LinkState::LocalOnly,
+                pulled: 0,
+                pushed: 0,
+                conflicts: 0,
+            });
+        };
+        let link = self.link_state_cached(true);
+        if link != LinkState::Online {
+            return Ok(SyncReport {
+                link,
+                pulled: 0,
+                pushed: 0,
+                conflicts: 0,
+            });
+        }
+        match replica::synchronize(&self.path, backend, config) {
+            Ok(report) => {
+                self.remember_link(LinkState::Online);
+                Ok(report)
+            }
+            Err(err) => {
+                if self.forced_link.is_none() {
+                    self.remember_link(LinkState::Offline);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn link_state_cached(&self, force: bool) -> LinkState {
+        if self.remote.is_none() {
+            return LinkState::LocalOnly;
+        }
+        if let Some(forced) = self.forced_link {
+            return forced;
+        }
+        if !force {
+            let guard = self
+                .link_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if let Some((state, at)) = *guard {
+                if at.elapsed() < LINK_CACHE_TTL {
+                    return state;
+                }
+            }
+        }
+        let online = match (&self.backend, &self.remote) {
+            (Some(backend), Some(config)) => replica::probe(backend, config),
+            _ => false,
+        };
+        let state = if online {
+            LinkState::Online
+        } else {
+            LinkState::Offline
+        };
+        self.remember_link(state);
+        state
+    }
+
+    fn remember_link(&self, state: LinkState) {
+        let mut guard = self
+            .link_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *guard = Some((state, Instant::now()));
+    }
+
+    fn best_effort_sync(&self) {
+        if self.remote.is_none() {
+            return;
+        }
+        if let Err(err) = self.sync() {
+            tracing::warn!(error = %err, "sync after local write failed");
+        }
     }
 
     fn with_conn<T>(
@@ -74,6 +224,18 @@ impl Queue {
     ) -> Result<T, QueueError> {
         let conn = open_connection(&self.path)?;
         f(&conn)
+    }
+}
+
+impl Clone for Queue {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            remote: self.remote.clone(),
+            backend: self.backend.clone(),
+            forced_link: self.forced_link,
+            link_cache: Mutex::new(None),
+        }
     }
 }
 
@@ -181,15 +343,18 @@ fn insert_event(
     now: &str,
 ) -> Result<(), QueueError> {
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let public_id = Uuid::now_v7().to_string();
     conn.execute(
-        "INSERT INTO events (task_id, event_type, actor_type, actor_id, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events (
+            task_id, event_type, actor_type, actor_id, payload_json, public_id, dirty, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
         params![
             task_id,
             event_type,
             actor.kind.as_str(),
             actor.id,
             payload,
+            public_id,
             now
         ],
     )
@@ -382,7 +547,7 @@ fn set_status(
 ) -> Result<(), QueueError> {
     let updated = conn
         .execute(
-            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+            "UPDATE tasks SET status = ?, updated_at = ?, dirty = 1 WHERE id = ? AND status = ?",
             params![to.as_str(), now, id, from.as_str()],
         )
         .db()?;
@@ -396,7 +561,7 @@ fn set_status(
 
 fn retire_claim(conn: &Connection, claim_id: i64, now: &str) -> Result<(), QueueError> {
     conn.execute(
-        "UPDATE claims SET released_at = ?, release_reason = NULL WHERE id = ? AND released_at IS NULL",
+        "UPDATE claims SET released_at = ?, release_reason = NULL, dirty = 1 WHERE id = ? AND released_at IS NULL",
         params![now, claim_id],
     )
     .db()?;
@@ -674,7 +839,7 @@ fn recover_expired(
         if to == TaskStatus::Blocked {
             let updated = conn
                 .execute(
-                    "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status = ?",
+                    "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ?, dirty = 1 WHERE id = ? AND status = ?",
                     params![now, task_id, from.as_str()],
                 )
                 .db()?;
@@ -709,7 +874,11 @@ fn recover_expired(
     Ok(recovered)
 }
 
-fn select_eligible(conn: &Connection, request: &ClaimRequest) -> Result<Option<i64>, QueueError> {
+fn select_eligible(
+    conn: &Connection,
+    request: &ClaimRequest,
+    offline: bool,
+) -> Result<Option<i64>, QueueError> {
     let mut stmt = conn
         .prepare(
             "SELECT id FROM tasks WHERE status = 'ready' ORDER BY priority DESC, created_at ASC, id ASC",
@@ -737,15 +906,36 @@ fn select_eligible(conn: &Connection, request: &ClaimRequest) -> Result<Option<i
             required_capabilities: task.required_capabilities.clone(),
             dependency_statuses,
         };
-        if is_eligible(
+        if !is_eligible(
             &candidate,
             request,
             active,
             meta.max_parallel_jobs,
             meta.allow_external_actions,
         ) {
-            return Ok(Some(id));
+            continue;
         }
+        // Offline workers may take only tasks they created during this outage.
+        // Synced ready work stays on the authority so another machine cannot
+        // claim the same task from a stale replica.
+        if offline {
+            let (origin, created_offline, creator): (String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT origin, created_offline, creator_agent_id FROM tasks WHERE id = ?",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .db()?;
+            if !replica::offline_claim_allowed(
+                &origin,
+                created_offline,
+                creator.as_deref(),
+                &request.agent_id,
+            ) {
+                continue;
+            }
+        }
+        return Ok(Some(id));
     }
     Ok(None)
 }
@@ -868,9 +1058,11 @@ fn insert_artifact(
                 .into(),
         ));
     }
+    let public_id = Uuid::now_v7().to_string();
     conn.execute(
-        "INSERT INTO artifacts (task_id, kind, value, created_at) VALUES (?, ?, ?, ?)",
-        params![task_id, kind, value, now],
+        "INSERT INTO artifacts (task_id, kind, value, public_id, dirty, created_at)
+         VALUES (?, ?, ?, ?, 1, ?)",
+        params![task_id, kind, value, public_id, now],
     )
     .db()?;
     insert_event(
@@ -1038,13 +1230,24 @@ impl QueueService for Queue {
         };
         let feature_id = optional_feature_id(&tx, request.feature.as_deref())?;
         let public_id = Uuid::now_v7().to_string();
+        // `created_offline` is captured once. Later edits must not flip it, or a
+        // task created while online could become claimable after a disconnect.
+        let link = self.link_state();
+        let created_offline = i64::from(link == LinkState::Offline);
+        let creator_agent_id = match (&request.actor.kind, request.actor.id.as_deref()) {
+            (ActorKind::Agent, Some(id)) if !id.trim().is_empty() => Some(id.to_string()),
+            _ => None,
+        };
         tx.execute(
             "INSERT INTO tasks (
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
-                created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                origin, created_offline, creator_agent_id, dirty, created_at, updated_at
+             ) VALUES (
+                ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
+                'local_unsynced', ?, ?, 1, ?, ?
+             )",
             params![
                 public_id,
                 title,
@@ -1063,6 +1266,8 @@ impl QueueService for Queue {
                 &request.agent_pool,
                 caps,
                 feature_id,
+                created_offline,
+                creator_agent_id,
                 &now,
                 &now
             ],
@@ -1091,6 +1296,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, id))
     }
 
@@ -1304,7 +1510,7 @@ impl QueueService for Queue {
             "UPDATE tasks SET
                 title = ?, body = ?, kind = ?, priority = ?, risk = ?, project_id = ?,
                 project_name = ?, repo = ?, agent_pool = ?, required_capabilities_json = ?,
-                feature_id = ?, updated_at = ?
+                feature_id = ?, updated_at = ?, dirty = 1
              WHERE id = ?",
             params![
                 task.title,
@@ -1336,6 +1542,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, id))
     }
 
@@ -1358,7 +1565,7 @@ impl QueueService for Queue {
         let warnings = readiness_warnings(task.body.as_deref(), risk_note);
         set_status(&tx, task.id, task.status, TaskStatus::Ready, &now)?;
         tx.execute(
-            "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
+            "UPDATE tasks SET blocked_reason = NULL, dirty = 1 WHERE id = ?",
             params![task.id],
         )
         .db()?;
@@ -1375,6 +1582,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         let task = self.with_conn(|conn| load_task(conn, request.task_id))?;
         Ok(ReadyOutcome { task, warnings })
     }
@@ -1398,7 +1606,7 @@ impl QueueService for Queue {
         }
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ? WHERE id = ? AND status = ?",
+                "UPDATE tasks SET status = 'blocked', blocked_reason = NULL, updated_at = ?, dirty = 1 WHERE id = ? AND status = ?",
                 params![now, task.id, task.status.as_str()],
             )
             .db()?;
@@ -1417,6 +1625,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, request.task_id))
     }
 
@@ -1438,6 +1647,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, request.task_id))
     }
 
@@ -1502,6 +1712,9 @@ impl QueueService for Queue {
             params![task.id],
         )
         .db()?;
+        if self.remote.is_some() {
+            replica::record_tombstone(&tx, "task", &task.public_id.to_string(), &now)?;
+        }
         let deleted = tx
             .execute("DELETE FROM tasks WHERE id = ?", params![task.id])
             .db()?;
@@ -1509,6 +1722,7 @@ impl QueueService for Queue {
             return Err(QueueError::NotFound(task.id));
         }
         tx.commit().db()?;
+        self.best_effort_sync();
         Ok(DeleteOutcome {
             task_id: task.id,
             public_id: task.public_id,
@@ -1553,35 +1767,94 @@ impl QueueService for Queue {
             maximum_risk: request.maximum_risk,
             lease,
         };
+        // Refresh the link before taking the local write lock. A failed sync
+        // means this worker is offline for the rest of the claim.
+        let mut link = self.link_state_cached(true);
+        if link == LinkState::Online {
+            if let Err(err) = self.sync() {
+                tracing::warn!(error = %err, "sync before claim failed; treating the link as offline");
+                link = LinkState::Offline;
+            }
+        }
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .db()?;
         let (now_dt, now) = now_parts();
         recover_expired(&tx, &now, None, &Actor::system())?;
-        let Some(task_id) = select_eligible(&tx, &request)? else {
+        let offline = link == LinkState::Offline;
+        let Some(task_id) = select_eligible(&tx, &request, offline)? else {
             tx.commit().db()?;
+            self.best_effort_sync();
             tracing::info!(agent_id = %request.agent_id, found = false, "claim_next");
             return Ok(ClaimOutcome::none());
         };
         let expires = format_timestamp(add_lease(now_dt, lease)?);
+        let token = Uuid::new_v4().to_string();
+        let claimed_offline = offline;
+        // Online claims are acknowledged by the authority before the local
+        // row is claimed. The token is not returned until that CAS succeeds.
+        if link == LinkState::Online {
+            let (Some(config), Some(backend)) = (&self.remote, &self.backend) else {
+                tx.rollback().db()?;
+                return Err(QueueError::Database(
+                    "online claim is missing its remote backend".into(),
+                ));
+            };
+            match replica::publish_local_claim(
+                &tx,
+                backend,
+                config,
+                task_id,
+                &request.agent_id,
+                &token,
+                &now,
+                &expires,
+                false,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tx.rollback().db()?;
+                    self.best_effort_sync();
+                    tracing::info!(
+                        agent_id = %request.agent_id,
+                        task_id,
+                        "claim rejected by central authority"
+                    );
+                    return Ok(ClaimOutcome::none());
+                }
+                Err(err) => {
+                    tx.rollback().db()?;
+                    return Err(err);
+                }
+            }
+        }
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = 'claimed', updated_at = ? WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'claimed', updated_at = ?, dirty = 1 WHERE id = ? AND status = 'ready'",
                 params![now, task_id],
             )
             .db()?;
         if updated != 1 {
-            tx.commit().db()?;
+            tx.rollback().db()?;
+            self.best_effort_sync();
             tracing::info!(agent_id = %request.agent_id, found = false, "claim_next");
             return Ok(ClaimOutcome::none());
         }
-        let token = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO claims (
-                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-            params![task_id, &request.agent_id, &token, &now, &now, &expires],
+                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at,
+                claimed_offline, dirty
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+            params![
+                task_id,
+                &request.agent_id,
+                &token,
+                &now,
+                &now,
+                &expires,
+                i64::from(claimed_offline)
+            ],
         )
         .db()?;
         insert_event(
@@ -1598,6 +1871,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         tracing::info!(agent_id = %request.agent_id, found = true, task_id, "claim_next");
         let detail = self.get(task_id)?;
         Ok(ClaimOutcome {
@@ -1629,7 +1903,7 @@ impl QueueService for Queue {
         let claim = require_active_claim(&tx, request.task_id, &request.claim_token, &now)?;
         let expires = format_timestamp(add_lease(now_dt, lease)?);
         tx.execute(
-            "UPDATE claims SET heartbeat_at = ?, lease_expires_at = ? WHERE id = ?",
+            "UPDATE claims SET heartbeat_at = ?, lease_expires_at = ?, dirty = 1 WHERE id = ?",
             params![now, expires, claim.id],
         )
         .db()?;
@@ -1642,6 +1916,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_latest_claim(conn, request.task_id, &now))?
             .ok_or(QueueError::NotFound(request.task_id))
     }
@@ -1657,7 +1932,7 @@ impl QueueService for Queue {
         let claim = require_active_claim(&tx, task.id, &request.claim_token, &now)?;
         set_status(&tx, task.id, task.status, TaskStatus::InProgress, &now)?;
         tx.execute(
-            "UPDATE claims SET branch = COALESCE(?, branch), worktree_path = COALESCE(?, worktree_path), heartbeat_at = ? WHERE id = ?",
+            "UPDATE claims SET branch = COALESCE(?, branch), worktree_path = COALESCE(?, worktree_path), heartbeat_at = ?, dirty = 1 WHERE id = ?",
             params![&request.branch, &request.worktree_path, &now, claim.id],
         )
         .db()?;
@@ -1675,6 +1950,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.get(request.task_id)
     }
 
@@ -1772,6 +2048,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.get(request.task_id)
     }
 
@@ -1795,6 +2072,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, request.task_id))
     }
 
@@ -1806,6 +2084,7 @@ impl QueueService for Queue {
         let (_, now) = now_parts();
         let recovered = recover_expired(&tx, &now, request.to, &request.actor)?;
         tx.commit().db()?;
+        self.best_effort_sync();
         Ok(recovered)
     }
 
@@ -1886,7 +2165,7 @@ impl QueueService for Queue {
         set_status(&tx, task.id, task.status, to, &now)?;
         if to == TaskStatus::Inbox {
             tx.execute(
-                "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
+                "UPDATE tasks SET blocked_reason = NULL, dirty = 1 WHERE id = ?",
                 params![id],
             )
             .db()?;
@@ -1900,6 +2179,7 @@ impl QueueService for Queue {
             &now,
         )?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_task(conn, id))
     }
 
@@ -1920,6 +2200,7 @@ impl QueueService for Queue {
         .db()?;
         let id = tx.last_insert_rowid();
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_feature(conn, id))
     }
 
@@ -1964,6 +2245,7 @@ impl QueueService for Queue {
         )
         .db()?;
         tx.commit().db()?;
+        self.best_effort_sync();
         self.with_conn(|conn| load_feature(conn, id))
     }
 
@@ -1981,10 +2263,14 @@ impl QueueService for Queue {
             )
             .db()?;
         tx.execute(
-            "UPDATE tasks SET feature_id = NULL WHERE feature_id = ?",
+            "UPDATE tasks SET feature_id = NULL, dirty = 1 WHERE feature_id = ?",
             params![id],
         )
         .db()?;
+        if self.remote.is_some() {
+            let (_, now) = now_parts();
+            replica::record_tombstone(&tx, "feature", &feature.public_id.to_string(), &now)?;
+        }
         let deleted = tx
             .execute("DELETE FROM features WHERE id = ?", params![id])
             .db()?;
@@ -1992,6 +2278,7 @@ impl QueueService for Queue {
             return Err(QueueError::FeatureNotFound(id.to_string()));
         }
         tx.commit().db()?;
+        self.best_effort_sync();
         Ok(DeleteFeatureOutcome {
             id: feature.id,
             public_id: feature.public_id,
