@@ -5,7 +5,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 
 # q agent work queue
 
-`q` is a local SQLite queue for coding and research agents. Use the `q` binary or the `q mcp` tools. Do not invent a second queue, task file, or status tracker for work that belongs here. If `Q_TURSO_URL` is set, the local file syncs with that Turso/libsql database. Creating a task offline is allowed and syncs on reconnect. While `q status` reports `link: offline`, claim only a task you created yourself during the outage (`queue_capture` `agent_id` must match `queue_claim_next`). Synced ready tasks stay unclaimable until the link is online. Pass `idempotency_key` (or omit it to use a content hash of title, body, kind, repo, and project) so the same intent is not queued twice. A remote claim wins if both sides claimed the same task; do not complete a task after a `claim_conflict` or `completion_conflict` event. A `task_deduped` event means the authority already had that intent.
+`q` is a local SQLite queue for coding and research agents. Use the `q` binary or the `q mcp` tools. Do not invent a second queue, task file, or status tracker for work that belongs here. If `Q_TURSO_URL` is set, the local file syncs with that Turso/libsql database. Creating a task offline is allowed and syncs on reconnect. While `q status` reports `link: offline`, do not claim: dequeue requires the Turso/libsql authority, and `queue_claim_next` returns no eligible work. Pass `idempotency_key` (or omit it to use a content hash of title, body, kind, repo, and project) so the same intent is not queued twice. A `task_deduped` event means the authority already had that intent.
 
 ## Rules
 

@@ -3,7 +3,6 @@
 //! An explicit key names one intent across retries and machines. When the
 //! caller omits it, q derives `content:<sha256>` from the title, body, kind,
 //! repo, and project. The same derived or explicit key is one queue item.
-//! This is content dedup, separate from the offline claim gate.
 
 use sha2::{Digest, Sha256};
 

@@ -49,9 +49,6 @@ CREATE TABLE IF NOT EXISTS tasks (
   required_capabilities_json TEXT NOT NULL DEFAULT '[]',
   blocked_reason TEXT,
   feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL,
-  origin TEXT NOT NULL DEFAULT 'local_unsynced',
-  created_offline INTEGER NOT NULL DEFAULT 0,
-  creator_agent_id TEXT,
   idempotency_key TEXT,
   dirty INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
@@ -70,9 +67,6 @@ CREATE TABLE IF NOT EXISTS claims (
   worktree_path TEXT,
   released_at TEXT,
   release_reason TEXT,
-  claimed_offline INTEGER NOT NULL DEFAULT 0,
-  superseded_at TEXT,
-  superseded_reason TEXT,
   dirty INTEGER NOT NULL DEFAULT 1
 );
 
@@ -118,7 +112,6 @@ CREATE INDEX IF NOT EXISTS events_task_idx
 ON events(task_id, id);
 
 CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);
-CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);
 CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_key
 ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS events_public_id ON events(public_id);
@@ -166,13 +159,13 @@ fn apply_pending(conn: &mut dyn Db) -> Result<(), QueueError> {
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
     )?;
     let applied_at = format_timestamp(OffsetDateTime::now_utc());
-    // New files get the current schema and are stamped at version 4. Databases
-    // created by older builds walk v1 → v2 → v3 → v4. `current` is read once, so a
-    // brand-new file does not also run the upgrade alters.
+    // New files get the current schema and are stamped at version 5. Databases
+    // created by older builds walk each pending version. `current` is read once,
+    // so a brand-new file does not also run the upgrade alters.
     if current < 1 {
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
             &[SqlVal::text(applied_at.clone())],
         )?;
     } else {
@@ -184,6 +177,9 @@ fn apply_pending(conn: &mut dyn Db) -> Result<(), QueueError> {
         }
         if current < 4 {
             apply_v4(conn, &applied_at)?;
+        }
+        if current < 5 {
+            apply_v5(conn, &applied_at)?;
         }
     }
     Ok(())
@@ -351,6 +347,29 @@ fn apply_v4(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
     )?;
     conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+        &[SqlVal::text(applied_at)],
+    )?;
+    Ok(())
+}
+
+fn apply_v5(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
+    // These columns only existed to let an offline agent claim its own
+    // unsynced tasks. Dequeue now requires the authority, so they are gone.
+    conn.execute_batch("DROP INDEX IF EXISTS tasks_origin_idx;")?;
+    for (table, column) in [
+        ("tasks", "origin"),
+        ("tasks", "created_offline"),
+        ("tasks", "creator_agent_id"),
+        ("claims", "claimed_offline"),
+        ("claims", "superseded_at"),
+        ("claims", "superseded_reason"),
+    ] {
+        if column_exists(conn, table, column)? {
+            conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))?;
+        }
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
         &[SqlVal::text(applied_at)],
     )?;
     Ok(())

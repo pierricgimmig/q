@@ -50,39 +50,35 @@ The same values can be passed as `--turso-url` and `--turso-auth-token`. URL loo
 
 The local file is still the database the CLI reads and writes. `libsql` is used only as an HTTP client (`Builder::new_remote`) to the authority. Embedded replicas that forward every write to the primary cannot accept offline writes, and stock libsql sync is last-push-wins, which would let two completions overwrite each other. q therefore syncs by `public_id` (tasks, features, events, artifacts) and `claim_token` (claims). Integer ids stay local.
 
-`q sync`, and a sync attempt on open, pull remote rows and push dirty local rows. `q status` adds `link` (`local_only`, `online`, or `offline`) and `remote_configured`. A failed probe is offline, not a hard error: the local file keeps working.
+`q sync`, and a sync attempt on open, pull remote rows and push dirty local rows. `q status` adds `link` (`local_only`, `online`, or `offline`) and `remote_configured`. A failed probe is offline, not a hard error: capture still writes the local file. Dequeue does not.
 
-### Offline claim policy
+### Claims and the central authority
 
-Creating a task does not consult that gate. An agent may capture inbox work while offline; the row is stored locally and pushed on the next successful sync. Claiming is separate: while the link is offline, an agent may claim only a task it created itself during that outage. The row must have `origin = local_unsynced`, `created_offline = 1`, and `creator_agent_id` equal to the claiming agent. Tasks pulled from the authority (`synced_from_remote`), tasks already pushed (`synced_local`), tasks created while online, tasks created by a human, and tasks created by a different agent stay unclaimable until the link returns. That is what stops two machines from taking the same ready task.
+With no remote URL, claims run against the local database, including while the machine has no network.
 
-`created_offline` is set only at capture, and only when a remote is configured and the probe fails. Later edits do not change it. MCP `queue_capture` takes an optional `agent_id` (default `mcp`) so the creator matches `queue_claim_next`.
+When a remote URL is configured, `q claim` and MCP `queue_claim_next` dequeue only while the Turso/libsql authority is reachable. The claim is a compare-and-swap on that server before a token is returned, so two machines cannot take the same ready task. If the link is offline, or the authority cannot be reached, the claim returns no eligible work (`found: false`, reason `no_eligible_ready_tasks`). That includes tasks this agent just created locally. Multi-machine dequeue assumes network access to the endpoint: cloud agents online, or a local-hosted libsql server that this process can reach.
 
-When the link is online, claim still runs in one local `BEGIN IMMEDIATE` transaction, and the authority must accept the claim before the token is returned. The remote update is a compare-and-swap on `public_id` and status `ready`. If another machine already claimed it, the local transaction rolls back and the claim result is no eligible work.
+Capture is separate from dequeue. An agent or a person may capture inbox work while disconnected. The row stays local (`dirty = 1`) and is pushed on the next successful sync.
+
+MCP `queue_capture` takes an optional `agent_id` (default `mcp`). That value is the actor on the `task_created` event.
 
 ### Offline create and idempotency
 
-Offline create and the offline claim gate are different rules. Capture always writes the local database, online or offline. Claim, while offline, still accepts only a task this agent just created locally.
-
-Each new task stores an idempotency key so the same intent is not queued twice when machines reconnect:
+Capture always writes the local database, online or offline. Each new task stores an idempotency key so the same intent is not queued twice when machines reconnect:
 
 - Pass `--idempotency-key` (CLI) or `idempotency_key` (MCP `queue_capture`) to name the intent. A repeat capture with that key returns the existing task.
 - When the key is omitted, q derives `content:<sha256>` from the title, body, kind, repo, and project (whitespace collapsed). The same content on two machines is one task.
-- The key is unique when it is set. On sync, if the authority already has that key under a different `public_id`, the authority's row is kept. The local duplicate is deleted, its `public_id` is tombstoned, and a `task_deduped` event records the discarded id. This is content dedup, not a second claim rule.
+- The key is unique when it is set. On sync, if the authority already has that key under a different `public_id`, the authority's row is kept. The local duplicate is deleted, its `public_id` is tombstoned, and a `task_deduped` event records the discarded id.
 
 ```bash
 q add --idempotency-key rollout-7 "Add the migration"
 ```
 
-### Reconciliation
+### Sync
 
-Prevention is the offline gate. A leftover conflict is possible if a task was claimed locally and the authority also has a different claim (for example a crash after the authority accepted a claim, or a row that was synced and then claimed on two sides before the gate existed). On sync:
+Tasks are matched by `public_id`, claims by `claim_token`. Dirty local rows are pushed. Remote rows that are new here, or newer and not dirty locally, are pulled. Deletes travel as rows in `sync_tombstones`.
 
-- Tasks are matched by `public_id`, claims by `claim_token`.
-- If the latest claim tokens differ and the authority has a claim, or the authority has moved to claimed / in progress / review / done, the remote row wins.
-- The local claim is retired with `release_reason = superseded` and `superseded_reason = remote_authority`. A `claim_conflict` event is appended. If the losing local status was `review` or `done`, the event is `completion_conflict` and that local completion is not pushed. Completions are never applied twice in silence.
-- The same token (this agent's own heartbeat or completion catching up) is not a conflict.
-- A task the authority has never seen is inserted. Deletes travel as rows in `sync_tombstones`.
+If the authority already holds a claim token the local row does not — the crash window after the compare-and-swap succeeded and the local commit did not — sync adopts that remote row. A local active claim with a different token is released with `release_reason = superseded`. The same token is this worker's own heartbeat or completion catching up, and that dirty local row is pushed. A status compare-and-swap that loses during push adopts the fresh remote row and increments `conflicts` on `q sync`. Ordinary pulls do not.
 
 ## Capture and discovery
 
@@ -200,7 +196,7 @@ q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
 q release 184 --claim-token TOKEN
 ```
 
-`q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. When a Turso URL is configured and the link is online, the authority accepts that claim before the token is returned. When the link is offline, the offline claim policy above applies. No eligible work is success, not an error:
+`q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. When a Turso URL is configured, that transaction runs only while the authority is reachable, and the authority must accept the claim before the token is returned. An offline link returns no eligible work and does not claim the local row. No eligible work is success, not an error:
 
 ```json
 {"found": false, "reason": "no_eligible_ready_tasks"}

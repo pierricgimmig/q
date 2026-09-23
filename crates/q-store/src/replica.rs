@@ -10,34 +10,33 @@
 //! (unchanged rusqlite transactions, including `BEGIN IMMEDIATE` claims) and
 //! uses `libsql::Builder::new_remote` only as the central authority.
 //!
-//! # Offline claim policy
+//! # Claims
 //!
-//! When a remote URL is configured and the authority cannot be reached, a
-//! worker may claim only a task that this same agent created locally during
-//! the outage (`origin = local_unsynced`, `created_offline = 1`,
-//! `creator_agent_id` matches). Tasks pulled from the authority, or created
-//! while online, stay unclaimable until the link is back. That is what stops
-//! two machines from taking the same ready task. Creating a task offline is
-//! allowed and is not part of that gate. The new row syncs on reconnect.
+//! Creating a task offline is allowed. The row stays local (`dirty = 1`) and
+//! is pushed on the next successful sync. Dequeue is not. When a remote URL is
+//! configured, `claim` requires a live link to this authority and a successful
+//! compare-and-swap before a token is returned. An offline or unreachable
+//! authority yields no eligible work. Local-only queues (no remote URL) claim
+//! against the local file.
 //!
 //! # Idempotency
 //!
-//! Tasks also carry `idempotency_key`. Capture stores an explicit key or a
-//! derived `content:` hash. On sync, two public ids with the same key collapse
-//! to the authority's row. The losing local row is tombstoned and a
-//! `task_deduped` event is recorded. That merge does not change the claim gate.
+//! Tasks carry `idempotency_key`. Capture stores an explicit key or a derived
+//! `content:` hash. On sync, two public ids with the same key collapse to the
+//! authority's row. The losing local row is tombstoned and a `task_deduped`
+//! event is recorded.
 //!
-//! # Reconciliation
+//! # Sync
 //!
-//! Tasks are keyed by `public_id`, claims by `claim_token`. On sync, if the
-//! local latest claim token and the remote latest claim token disagree — or
-//! the remote has moved into claimed/in-progress/review/done without our
-//! token — the **remote claim wins**. The local claim is retired with
-//! `superseded_reason = remote_authority` and a `claim_conflict` event is
-//! appended. If the losing local status was `review` or `done`, the event is
-//! `completion_conflict` instead, and the local completion is not pushed.
-//! Matching tokens (our own heartbeat or completion catching up) are not
-//! conflicts. A fresh offline task the authority has never seen is inserted.
+//! Tasks are keyed by `public_id`, claims by `claim_token`. Dirty local rows
+//! are pushed. Remote rows the local file does not have, or that are newer and
+//! not dirty locally, are pulled. If the authority already has a claim token
+//! the local row lacks — the crash window after a compare-and-swap, before
+//! the local commit — that remote row is adopted quietly and the local active
+//! claim, if any, is released with `release_reason = superseded`. The same
+//! token is this worker's own heartbeat or completion catching up. A status
+//! compare-and-swap that loses on push adopts the fresh remote row and counts
+//! a conflict. A fresh offline task the authority has never seen is inserted.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -51,10 +50,6 @@ use q_core::{format_timestamp, QueueError};
 
 use crate::libsql_remote;
 use crate::session::{Db, SqlVal};
-
-pub(crate) const ORIGIN_LOCAL_UNSYNCED: &str = "local_unsynced";
-pub(crate) const ORIGIN_SYNCED_FROM_REMOTE: &str = "synced_from_remote";
-pub(crate) const ORIGIN_SYNCED_LOCAL: &str = "synced_local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
@@ -101,73 +96,35 @@ pub(crate) struct ClaimSide {
     pub status: String,
     pub updated_at: String,
     pub latest_claim_token: Option<String>,
-    pub origin: String,
     pub dirty: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConflictKind {
-    None,
-    Claim,
-    Completion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeChoice {
     KeepLocal,
-    AdoptRemote { conflict: ConflictKind },
+    AdoptRemote,
 }
 
-/// Pure claim-authority decision. See the module docs.
-///
-/// A remote claim token the local row does not have is enough to adopt the
-/// remote task, even when the local row is dirty. That covers the crash
-/// window where the authority accepted a claim and the local commit did not.
+/// A remote claim token the local row does not share means the authority
+/// already accepted a claim. Adopt that row even when the local copy is dirty.
+/// That is the crash window after compare-and-swap, before the local commit.
+fn remote_claim_wins(local: &ClaimSide, remote: &ClaimSide) -> bool {
+    remote.latest_claim_token.is_some()
+        && local.latest_claim_token.as_deref() != remote.latest_claim_token.as_deref()
+}
+
+/// Pure merge decision. See the module docs.
 pub(crate) fn choose_merge(local: &ClaimSide, remote: &ClaimSide) -> MergeChoice {
-    if let Some(conflict) = authority_conflict(local, remote) {
-        return MergeChoice::AdoptRemote { conflict };
+    if remote_claim_wins(local, remote) {
+        return MergeChoice::AdoptRemote;
     }
-    if local.origin == ORIGIN_LOCAL_UNSYNCED || local.dirty {
+    if local.dirty {
         return MergeChoice::KeepLocal;
     }
     if remote.updated_at >= local.updated_at {
-        return MergeChoice::AdoptRemote {
-            conflict: ConflictKind::None,
-        };
+        return MergeChoice::AdoptRemote;
     }
     MergeChoice::KeepLocal
-}
-
-fn authority_conflict(local: &ClaimSide, remote: &ClaimSide) -> Option<ConflictKind> {
-    if local.latest_claim_token == remote.latest_claim_token {
-        return None;
-    }
-    let remote_has_claim = remote.latest_claim_token.is_some();
-    let remote_moved = matches!(
-        remote.status.as_str(),
-        "claimed" | "in_progress" | "review" | "done"
-    );
-    let diverged = remote_has_claim || (local.latest_claim_token.is_some() && remote_moved);
-    if !diverged {
-        return None;
-    }
-    if local.latest_claim_token.is_none() {
-        return Some(ConflictKind::None);
-    }
-    if matches!(local.status.as_str(), "done" | "review") {
-        Some(ConflictKind::Completion)
-    } else {
-        Some(ConflictKind::Claim)
-    }
-}
-
-pub(crate) fn offline_claim_allowed(
-    origin: &str,
-    created_offline: i64,
-    creator_agent_id: Option<&str>,
-    agent_id: &str,
-) -> bool {
-    origin == ORIGIN_LOCAL_UNSYNCED && created_offline != 0 && creator_agent_id == Some(agent_id)
 }
 
 pub fn resolve_remote_config(url: Option<String>, token: Option<String>) -> Option<RemoteConfig> {
@@ -233,17 +190,8 @@ pub(crate) fn publish_local_claim(
     token: &str,
     claimed_at: &str,
     lease_expires_at: &str,
-    claimed_offline: bool,
 ) -> Result<bool, QueueError> {
-    let bundle = load_publish_bundle(
-        conn,
-        task_id,
-        agent_id,
-        token,
-        claimed_at,
-        lease_expires_at,
-        claimed_offline,
-    )?;
+    let bundle = load_publish_bundle(conn, task_id, agent_id, token, claimed_at, lease_expires_at)?;
     with_backend(backend, config, |remote| {
         crate::schema::migrate_in(remote)?;
         publish_bundle(remote, &bundle)
@@ -303,9 +251,6 @@ struct TaskRec {
     feature_public_id: Option<String>,
     created_at: String,
     updated_at: String,
-    origin: String,
-    created_offline: i64,
-    creator_agent_id: Option<String>,
     idempotency_key: Option<String>,
 }
 
@@ -322,9 +267,6 @@ struct ClaimRec {
     worktree_path: Option<String>,
     released_at: Option<String>,
     release_reason: Option<String>,
-    claimed_offline: i64,
-    superseded_at: Option<String>,
-    superseded_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,7 +373,7 @@ fn apply_and_push(
         }
         let local_id = lookup_local_task(local, &task.public_id)?;
         if local_id.is_none() {
-            insert_local_task(local, task, ORIGIN_SYNCED_FROM_REMOTE, 0)?;
+            insert_local_task(local, task)?;
             adopted.insert(task.public_id.clone());
             pulled += 1;
             continue;
@@ -440,11 +382,8 @@ fn apply_and_push(
         let remote_side = side_for(task, remote_snap);
         match choose_merge(&local_side, &remote_side) {
             MergeChoice::KeepLocal => {}
-            MergeChoice::AdoptRemote { conflict } => {
-                adopt_existing(local, task, remote_snap, conflict)?;
-                if conflict != ConflictKind::None {
-                    conflicts += 1;
-                }
+            MergeChoice::AdoptRemote => {
+                adopt_existing(local, task)?;
                 adopted.insert(task.public_id.clone());
                 pulled += 1;
             }
@@ -590,7 +529,6 @@ fn side_for(task: &TaskRec, snap: &Snapshot) -> ClaimSide {
         status: task.status.clone(),
         updated_at: task.updated_at.clone(),
         latest_claim_token: latest_token(&snap.claims, &task.public_id),
-        origin: task.origin.clone(),
         dirty: false,
     }
 }
@@ -606,7 +544,7 @@ fn latest_token(claims: &[ClaimRec], public_id: &str) -> Option<String> {
 fn local_side(local: &mut dyn Db, public_id: &str) -> Result<ClaimSide, QueueError> {
     let row = one(
         local,
-        "SELECT status, updated_at, origin, dirty,
+        "SELECT status, updated_at, dirty,
             (SELECT claim_token FROM claims WHERE task_id = tasks.id ORDER BY id DESC LIMIT 1)
          FROM tasks WHERE public_id = ?",
         &[SqlVal::text(public_id)],
@@ -615,9 +553,8 @@ fn local_side(local: &mut dyn Db, public_id: &str) -> Result<ClaimSide, QueueErr
     Ok(ClaimSide {
         status: req_text(&row, 0)?,
         updated_at: req_text(&row, 1)?,
-        origin: req_text(&row, 2)?,
-        dirty: req_int(&row, 3)? != 0,
-        latest_claim_token: opt_text(&row, 4)?,
+        dirty: req_int(&row, 2)? != 0,
+        latest_claim_token: opt_text(&row, 3)?,
     })
 }
 
@@ -656,60 +593,10 @@ fn apply_tombstone(
     Ok(removed > 0)
 }
 
-fn adopt_existing(
-    local: &mut dyn Db,
-    task: &TaskRec,
-    snap: &Snapshot,
-    conflict: ConflictKind,
-) -> Result<(), QueueError> {
+fn adopt_existing(local: &mut dyn Db, task: &TaskRec) -> Result<(), QueueError> {
     let id = lookup_local_task(local, &task.public_id)?.ok_or_else(|| {
         QueueError::Database(format!("task {} disappeared during adopt", task.public_id))
     })?;
-    let local_token = local_side(local, &task.public_id)?.latest_claim_token;
-    let remote_token = latest_token(&snap.claims, &task.public_id);
-    let local_status = local_side(local, &task.public_id)?.status;
-    if conflict != ConflictKind::None {
-        // Losing local history stays for the operator but must not be pushed
-        // over the authority, or a rejected completion would land twice.
-        local.execute(
-            "UPDATE events SET dirty = 0 WHERE task_id = ?",
-            &[SqlVal::Int(id)],
-        )?;
-        local.execute(
-            "UPDATE artifacts SET dirty = 0 WHERE task_id = ?",
-            &[SqlVal::Int(id)],
-        )?;
-        // `column != NULL` is never true in SQL, so a remote row with no claim
-        // token still has to retire every local claim on this task.
-        if let Some(token) = &remote_token {
-            local.execute(
-                "UPDATE claims SET dirty = 0, released_at = COALESCE(released_at, ?),
-                    release_reason = CASE WHEN released_at IS NULL THEN 'superseded' ELSE release_reason END,
-                    superseded_at = COALESCE(superseded_at, ?),
-                    superseded_reason = COALESCE(superseded_reason, 'remote_authority')
-                 WHERE task_id = ? AND claim_token != ?",
-                &[
-                    SqlVal::text(&task.updated_at),
-                    SqlVal::text(&task.updated_at),
-                    SqlVal::Int(id),
-                    SqlVal::text(token),
-                ],
-            )?;
-        } else {
-            local.execute(
-                "UPDATE claims SET dirty = 0, released_at = COALESCE(released_at, ?),
-                    release_reason = CASE WHEN released_at IS NULL THEN 'superseded' ELSE release_reason END,
-                    superseded_at = COALESCE(superseded_at, ?),
-                    superseded_reason = COALESCE(superseded_reason, 'remote_authority')
-                 WHERE task_id = ?",
-                &[
-                    SqlVal::text(&task.updated_at),
-                    SqlVal::text(&task.updated_at),
-                    SqlVal::Int(id),
-                ],
-            )?;
-        }
-    }
     let feature_id = match &task.feature_public_id {
         Some(public_id) => lookup_local_feature(local, public_id)?,
         None => None,
@@ -724,8 +611,7 @@ fn adopt_existing(
             risk = ?, project_id = ?, project_name = ?, repo = ?, capture_path = ?,
             repo_relative_path = ?, git_root = ?, git_head = ?, agent_pool = ?,
             required_capabilities_json = ?, blocked_reason = ?, feature_id = ?,
-            created_at = ?, updated_at = ?, origin = ?, created_offline = ?,
-            creator_agent_id = ?, idempotency_key = ?, dirty = 0
+            created_at = ?, updated_at = ?, idempotency_key = ?, dirty = 0
          WHERE id = ?",
         &[
             SqlVal::text(&task.title),
@@ -748,38 +634,10 @@ fn adopt_existing(
             opt_int(feature_id),
             SqlVal::text(&task.created_at),
             SqlVal::text(&task.updated_at),
-            SqlVal::text(ORIGIN_SYNCED_FROM_REMOTE),
-            SqlVal::Int(task.created_offline),
-            SqlVal::opt_text(task.creator_agent_id.clone()),
             SqlVal::opt_text(task.idempotency_key.clone()),
             SqlVal::Int(id),
         ],
     )?;
-    if conflict != ConflictKind::None {
-        let event_type = match conflict {
-            ConflictKind::Completion => "completion_conflict",
-            ConflictKind::Claim | ConflictKind::None => "claim_conflict",
-        };
-        let now = format_timestamp(OffsetDateTime::now_utc());
-        let payload = json!({
-            "resolution": "remote_authority",
-            "local_status": local_status,
-            "remote_status": task.status,
-            "local_claim_token": local_token,
-            "remote_claim_token": remote_token,
-        });
-        local.execute(
-            "INSERT INTO events (task_id, event_type, actor_type, actor_id, payload_json, public_id, dirty, created_at)
-             VALUES (?, ?, 'system', 'q', ?, ?, 1, ?)",
-            &[
-                SqlVal::Int(id),
-                SqlVal::text(event_type),
-                SqlVal::text(payload.to_string()),
-                SqlVal::text(Uuid::now_v7().to_string()),
-                SqlVal::text(now),
-            ],
-        )?;
-    }
     Ok(())
 }
 
@@ -787,6 +645,26 @@ fn copy_claims(local: &mut dyn Db, public_id: &str, snap: &Snapshot) -> Result<(
     let Some(task_id) = lookup_local_task(local, public_id)? else {
         return Ok(());
     };
+    // One unreleased claim per task. Release any local active claim the
+    // authority does not still hold before inserting the remote token.
+    if let Some(active) = snap
+        .claims
+        .iter()
+        .filter(|claim| claim.task_public_id == public_id && claim.released_at.is_none())
+        .max_by_key(|claim| claim.id)
+    {
+        local.execute(
+            "UPDATE claims SET dirty = 0,
+                released_at = COALESCE(released_at, ?),
+                release_reason = CASE WHEN released_at IS NULL THEN 'superseded' ELSE release_reason END
+             WHERE task_id = ? AND released_at IS NULL AND claim_token != ?",
+            &[
+                SqlVal::text(&active.claimed_at),
+                SqlVal::Int(task_id),
+                SqlVal::text(&active.claim_token),
+            ],
+        )?;
+    }
     for claim in snap
         .claims
         .iter()
@@ -801,8 +679,7 @@ fn copy_claims(local: &mut dyn Db, public_id: &str, snap: &Snapshot) -> Result<(
             local.execute(
                 "UPDATE claims SET
                     agent_id = ?, claimed_at = ?, heartbeat_at = ?, lease_expires_at = ?,
-                    branch = ?, worktree_path = ?, released_at = ?, release_reason = ?,
-                    claimed_offline = ?, superseded_at = ?, superseded_reason = ?, dirty = 0
+                    branch = ?, worktree_path = ?, released_at = ?, release_reason = ?, dirty = 0
                  WHERE claim_token = ?",
                 &[
                     SqlVal::text(&claim.agent_id),
@@ -813,9 +690,6 @@ fn copy_claims(local: &mut dyn Db, public_id: &str, snap: &Snapshot) -> Result<(
                     SqlVal::opt_text(claim.worktree_path.clone()),
                     SqlVal::opt_text(claim.released_at.clone()),
                     SqlVal::opt_text(claim.release_reason.clone()),
-                    SqlVal::Int(claim.claimed_offline),
-                    SqlVal::opt_text(claim.superseded_at.clone()),
-                    SqlVal::opt_text(claim.superseded_reason.clone()),
                     SqlVal::text(&claim.claim_token),
                 ],
             )?;
@@ -823,9 +697,8 @@ fn copy_claims(local: &mut dyn Db, public_id: &str, snap: &Snapshot) -> Result<(
             local.execute(
                 "INSERT INTO claims (
                     task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at,
-                    branch, worktree_path, released_at, release_reason, claimed_offline,
-                    superseded_at, superseded_reason, dirty
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    branch, worktree_path, released_at, release_reason, dirty
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 &claim_insert_params(claim, task_id),
             )?;
         }
@@ -845,9 +718,6 @@ fn claim_insert_params(claim: &ClaimRec, task_id: i64) -> Vec<SqlVal> {
         SqlVal::opt_text(claim.worktree_path.clone()),
         SqlVal::opt_text(claim.released_at.clone()),
         SqlVal::opt_text(claim.release_reason.clone()),
-        SqlVal::Int(claim.claimed_offline),
-        SqlVal::opt_text(claim.superseded_at.clone()),
-        SqlVal::opt_text(claim.superseded_reason.clone()),
     ]
 }
 
@@ -929,7 +799,7 @@ fn push_dirty(
 ) -> Result<(u64, u64), QueueError> {
     let rows = local.query(
         "SELECT public_id FROM tasks
-         WHERE (dirty = 1 OR origin = 'local_unsynced')
+         WHERE dirty = 1
            AND public_id NOT IN (SELECT public_id FROM sync_tombstones WHERE entity = 'task')
          ORDER BY id ASC",
         &[],
@@ -1004,14 +874,9 @@ fn push_one(
     };
     match outcome {
         RemoteWrite::Accepted => {
-            let origin = if task.origin == ORIGIN_LOCAL_UNSYNCED {
-                ORIGIN_SYNCED_LOCAL
-            } else {
-                task.origin.as_str()
-            };
             local.execute(
-                "UPDATE tasks SET dirty = 0, origin = ? WHERE public_id = ?",
-                &[SqlVal::text(origin), SqlVal::text(public_id)],
+                "UPDATE tasks SET dirty = 0 WHERE public_id = ?",
+                &[SqlVal::text(public_id)],
             )?;
             if let Some(id) = lookup_local_task(local, public_id)? {
                 local.execute(
@@ -1030,7 +895,7 @@ fn push_one(
             Ok(PushResult::Pushed)
         }
         RemoteWrite::Rejected(fresh) => {
-            adopt_existing(local, &fresh.task, &fresh.snap, fresh.conflict)?;
+            adopt_existing(local, &fresh.task)?;
             copy_claims(local, &fresh.task.public_id, &fresh.snap)?;
             replace_local_deps(local, &fresh.task.public_id, &fresh.snap)?;
             Ok(PushResult::Conflict)
@@ -1047,7 +912,7 @@ fn push_one(
             let now = format_timestamp(OffsetDateTime::now_utc());
             discard_local_task(local, public_id, &now)?;
             if lookup_local_task(local, &pull.task.public_id)?.is_none() {
-                insert_local_task(local, &pull.task, ORIGIN_SYNCED_FROM_REMOTE, 0)?;
+                insert_local_task(local, &pull.task)?;
             }
             let snap = Snapshot {
                 tasks: vec![pull.task.clone()],
@@ -1069,7 +934,6 @@ fn push_one(
 struct RejectedPull {
     task: TaskRec,
     snap: Snapshot,
-    conflict: ConflictKind,
 }
 
 enum RemoteWrite {
@@ -1106,29 +970,19 @@ fn push_one_remote(
     }
     let existing = load_remote_task(remote, &task.public_id)?;
     if let Some(existing) = existing {
-        let local_side = ClaimSide {
-            status: task.status.clone(),
-            updated_at: task.updated_at.clone(),
-            latest_claim_token: claims
-                .iter()
-                .max_by_key(|claim| claim.id)
-                .map(|c| c.claim_token.clone()),
-            origin: task.origin.clone(),
-            dirty: true,
-        };
         let remote_claims = load_remote_claims(remote, &task.public_id)?;
-        let remote_side = ClaimSide {
-            status: existing.status.clone(),
-            updated_at: existing.updated_at.clone(),
-            latest_claim_token: remote_claims
-                .iter()
-                .max_by_key(|c| c.id)
-                .map(|c| c.claim_token.clone()),
-            origin: existing.origin.clone(),
-            dirty: false,
-        };
-        if let Some(conflict) = authority_conflict(&local_side, &remote_side) {
-            let mut snap = Snapshot {
+        let remote_token = remote_claims
+            .iter()
+            .max_by_key(|claim| claim.id)
+            .map(|claim| claim.claim_token.clone());
+        let local_token = claims
+            .iter()
+            .max_by_key(|claim| claim.id)
+            .map(|claim| claim.claim_token.clone());
+        // The authority already recorded a different claim (crash after CAS,
+        // or a claim this replica never wrote). Do not push over it.
+        if remote_token.is_some() && local_token.as_deref() != remote_token.as_deref() {
+            let snap = Snapshot {
                 tasks: vec![existing.clone()],
                 claims: remote_claims,
                 events: load_remote_events(remote, &task.public_id)?,
@@ -1138,14 +992,10 @@ fn push_one_remote(
                 projects: vec![],
                 tombstones: vec![],
             };
-            // Keep the previously observed snapshot out of the adopt path; the
-            // fresh read above is the authority.
             let _ = previous;
-            snap.tasks[0].origin = ORIGIN_SYNCED_FROM_REMOTE.to_string();
             return Ok(RemoteWrite::Rejected(Box::new(RejectedPull {
                 task: existing,
                 snap,
-                conflict,
             })));
         }
         if existing.status != task.status {
@@ -1159,11 +1009,6 @@ fn push_one_remote(
             )?;
             if updated == 0 {
                 let fresh = load_remote_task(remote, &task.public_id)?.unwrap_or(existing);
-                let conflict = if matches!(task.status.as_str(), "done" | "review") {
-                    ConflictKind::Completion
-                } else {
-                    ConflictKind::Claim
-                };
                 let snap = Snapshot {
                     tasks: vec![fresh.clone()],
                     claims: load_remote_claims(remote, &task.public_id)?,
@@ -1177,11 +1022,10 @@ fn push_one_remote(
                 return Ok(RemoteWrite::Rejected(Box::new(RejectedPull {
                     task: fresh,
                     snap,
-                    conflict,
                 })));
             }
         }
-        write_task_fields(remote, task, ORIGIN_SYNCED_LOCAL)?;
+        write_task_fields(remote, task)?;
     } else {
         insert_remote_task(remote, task)?;
     }
@@ -1281,7 +1125,7 @@ fn publish_in_tx(remote: &mut dyn Db, bundle: &PublishBundle) -> Result<bool, Qu
     let mut task = bundle.task.clone();
     task.status = "claimed".into();
     task.updated_at = bundle.claim.claimed_at.clone();
-    write_task_fields(remote, &task, ORIGIN_SYNCED_LOCAL)?;
+    write_task_fields(remote, &task)?;
     upsert_remote_claim(remote, &bundle.claim, &task.public_id)?;
     Ok(true)
 }
@@ -1359,8 +1203,7 @@ fn load_tasks(db: &mut dyn Db) -> Result<Vec<TaskRec>, QueueError> {
             tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo,
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
-            features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
+            features.public_id, tasks.created_at, tasks.updated_at, tasks.idempotency_key
          FROM tasks
          LEFT JOIN features ON features.id = tasks.feature_id
          ORDER BY tasks.id",
@@ -1391,10 +1234,7 @@ fn parse_task(row: &[SqlVal]) -> Result<TaskRec, QueueError> {
         feature_public_id: opt_text(row, 17)?,
         created_at: req_text(row, 18)?,
         updated_at: req_text(row, 19)?,
-        origin: req_text(row, 20)?,
-        created_offline: req_int(row, 21)?,
-        creator_agent_id: opt_text(row, 22)?,
-        idempotency_key: opt_text(row, 23)?,
+        idempotency_key: opt_text(row, 20)?,
     })
 }
 
@@ -1404,8 +1244,7 @@ fn load_local_task(local: &mut dyn Db, public_id: &str) -> Result<Option<TaskRec
             tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo,
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
-            features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
+            features.public_id, tasks.created_at, tasks.updated_at, tasks.idempotency_key
          FROM tasks
          LEFT JOIN features ON features.id = tasks.feature_id
          WHERE tasks.public_id = ?",
@@ -1424,8 +1263,7 @@ fn load_task_by_idempotency(db: &mut dyn Db, key: &str) -> Result<Option<TaskRec
             tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo,
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
-            features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
+            features.public_id, tasks.created_at, tasks.updated_at, tasks.idempotency_key
          FROM tasks
          LEFT JOIN features ON features.id = tasks.feature_id
          WHERE tasks.idempotency_key = ?",
@@ -1438,8 +1276,7 @@ fn load_claims(db: &mut dyn Db) -> Result<Vec<ClaimRec>, QueueError> {
     let rows = db.query(
         "SELECT claims.id, tasks.public_id, claims.agent_id, claims.claim_token, claims.claimed_at,
             claims.heartbeat_at, claims.lease_expires_at, claims.branch, claims.worktree_path,
-            claims.released_at, claims.release_reason, claims.claimed_offline, claims.superseded_at,
-            claims.superseded_reason
+            claims.released_at, claims.release_reason
          FROM claims JOIN tasks ON tasks.id = claims.task_id
          ORDER BY claims.id",
         &[],
@@ -1460,9 +1297,6 @@ fn parse_claim(row: &[SqlVal]) -> Result<ClaimRec, QueueError> {
         worktree_path: opt_text(row, 8)?,
         released_at: opt_text(row, 9)?,
         release_reason: opt_text(row, 10)?,
-        claimed_offline: req_int(row, 11)?,
-        superseded_at: opt_text(row, 12)?,
-        superseded_reason: opt_text(row, 13)?,
     })
 }
 
@@ -1470,8 +1304,7 @@ fn load_local_claims(local: &mut dyn Db, public_id: &str) -> Result<Vec<ClaimRec
     let rows = local.query(
         "SELECT claims.id, tasks.public_id, claims.agent_id, claims.claim_token, claims.claimed_at,
             claims.heartbeat_at, claims.lease_expires_at, claims.branch, claims.worktree_path,
-            claims.released_at, claims.release_reason, claims.claimed_offline, claims.superseded_at,
-            claims.superseded_reason
+            claims.released_at, claims.release_reason
          FROM claims JOIN tasks ON tasks.id = claims.task_id
          WHERE tasks.public_id = ?
          ORDER BY claims.id",
@@ -1702,12 +1535,7 @@ fn load_tombstones(db: &mut dyn Db) -> Result<Vec<(String, String, String)>, Que
     Ok(out)
 }
 
-fn insert_local_task(
-    local: &mut dyn Db,
-    task: &TaskRec,
-    origin: &str,
-    dirty: i64,
-) -> Result<i64, QueueError> {
+fn insert_local_task(local: &mut dyn Db, task: &TaskRec) -> Result<i64, QueueError> {
     let feature_id = match &task.feature_public_id {
         Some(public_id) => lookup_local_feature(local, public_id)?,
         None => None,
@@ -1720,10 +1548,10 @@ fn insert_local_task(
         "INSERT INTO tasks (
             public_id, title, body, original_capture, status, kind, priority, risk,
             project_id, project_name, repo, capture_path, repo_relative_path, git_root, git_head,
-            agent_pool, required_capabilities_json, blocked_reason, feature_id, origin,
-            created_offline, creator_agent_id, idempotency_key, dirty, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &task_insert_params(task, project_id, feature_id, origin, dirty),
+            agent_pool, required_capabilities_json, blocked_reason, feature_id,
+            idempotency_key, dirty, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        &task_insert_params(task, project_id, feature_id),
     )?;
     Ok(local.last_insert_rowid())
 }
@@ -1741,10 +1569,10 @@ fn insert_remote_task(remote: &mut dyn Db, task: &TaskRec) -> Result<(), QueueEr
         "INSERT INTO tasks (
             public_id, title, body, original_capture, status, kind, priority, risk,
             project_id, project_name, repo, capture_path, repo_relative_path, git_root, git_head,
-            agent_pool, required_capabilities_json, blocked_reason, feature_id, origin,
-            created_offline, creator_agent_id, idempotency_key, dirty, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &task_insert_params(task, project_id, feature_id, ORIGIN_SYNCED_LOCAL, 0),
+            agent_pool, required_capabilities_json, blocked_reason, feature_id,
+            idempotency_key, dirty, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        &task_insert_params(task, project_id, feature_id),
     )?;
     Ok(())
 }
@@ -1753,8 +1581,6 @@ fn task_insert_params(
     task: &TaskRec,
     project_id: Option<i64>,
     feature_id: Option<i64>,
-    origin: &str,
-    dirty: i64,
 ) -> Vec<SqlVal> {
     vec![
         SqlVal::text(&task.public_id),
@@ -1776,17 +1602,13 @@ fn task_insert_params(
         SqlVal::text(&task.required_capabilities_json),
         SqlVal::opt_text(task.blocked_reason.clone()),
         opt_int(feature_id),
-        SqlVal::text(origin),
-        SqlVal::Int(task.created_offline),
-        SqlVal::opt_text(task.creator_agent_id.clone()),
         SqlVal::opt_text(task.idempotency_key.clone()),
-        SqlVal::Int(dirty),
         SqlVal::text(&task.created_at),
         SqlVal::text(&task.updated_at),
     ]
 }
 
-fn write_task_fields(remote: &mut dyn Db, task: &TaskRec, origin: &str) -> Result<(), QueueError> {
+fn write_task_fields(remote: &mut dyn Db, task: &TaskRec) -> Result<(), QueueError> {
     let feature_id = match &task.feature_public_id {
         Some(public_id) => lookup_local_feature(remote, public_id)?,
         None => None,
@@ -1801,8 +1623,7 @@ fn write_task_fields(remote: &mut dyn Db, task: &TaskRec, origin: &str) -> Resul
             risk = ?, project_id = ?, project_name = ?, repo = ?, capture_path = ?,
             repo_relative_path = ?, git_root = ?, git_head = ?, agent_pool = ?,
             required_capabilities_json = ?, blocked_reason = ?, feature_id = ?,
-            updated_at = ?, origin = ?, created_offline = ?, creator_agent_id = ?,
-            idempotency_key = ?, dirty = 0
+            updated_at = ?, idempotency_key = ?, dirty = 0
          WHERE public_id = ?",
         &[
             SqlVal::text(&task.title),
@@ -1824,9 +1645,6 @@ fn write_task_fields(remote: &mut dyn Db, task: &TaskRec, origin: &str) -> Resul
             SqlVal::opt_text(task.blocked_reason.clone()),
             opt_int(feature_id),
             SqlVal::text(&task.updated_at),
-            SqlVal::text(origin),
-            SqlVal::Int(task.created_offline),
-            SqlVal::opt_text(task.creator_agent_id.clone()),
             SqlVal::opt_text(task.idempotency_key.clone()),
             SqlVal::text(&task.public_id),
         ],
@@ -1853,8 +1671,7 @@ fn upsert_remote_claim(
         remote.execute(
             "UPDATE claims SET
                 heartbeat_at = ?, lease_expires_at = ?, branch = ?, worktree_path = ?,
-                released_at = ?, release_reason = ?, claimed_offline = ?, superseded_at = ?,
-                superseded_reason = ?, dirty = 0
+                released_at = ?, release_reason = ?, dirty = 0
              WHERE claim_token = ?",
             &[
                 SqlVal::text(&claim.heartbeat_at),
@@ -1863,9 +1680,6 @@ fn upsert_remote_claim(
                 SqlVal::opt_text(claim.worktree_path.clone()),
                 SqlVal::opt_text(claim.released_at.clone()),
                 SqlVal::opt_text(claim.release_reason.clone()),
-                SqlVal::Int(claim.claimed_offline),
-                SqlVal::opt_text(claim.superseded_at.clone()),
-                SqlVal::opt_text(claim.superseded_reason.clone()),
                 SqlVal::text(&claim.claim_token),
             ],
         )?;
@@ -1873,9 +1687,8 @@ fn upsert_remote_claim(
         remote.execute(
             "INSERT INTO claims (
                 task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at,
-                branch, worktree_path, released_at, release_reason, claimed_offline,
-                superseded_at, superseded_reason, dirty
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                branch, worktree_path, released_at, release_reason, dirty
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             &claim_insert_params(claim, task_id),
         )?;
     }
@@ -2004,7 +1817,6 @@ fn load_publish_bundle(
     token: &str,
     claimed_at: &str,
     lease_expires_at: &str,
-    claimed_offline: bool,
 ) -> Result<PublishBundle, QueueError> {
     let public_id: String = conn
         .query_row(
@@ -2034,9 +1846,6 @@ fn load_publish_bundle(
         worktree_path: None,
         released_at: None,
         release_reason: None,
-        claimed_offline: i64::from(claimed_offline),
-        superseded_at: None,
-        superseded_reason: None,
     };
     Ok(PublishBundle {
         task,
@@ -2052,8 +1861,7 @@ fn load_task_through(conn: &Connection, public_id: &str) -> Result<TaskRec, Queu
             tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo,
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
-            features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
+            features.public_id, tasks.created_at, tasks.updated_at, tasks.idempotency_key
          FROM tasks LEFT JOIN features ON features.id = tasks.feature_id
          WHERE tasks.public_id = ?",
         params![public_id],
@@ -2079,10 +1887,7 @@ fn load_task_through(conn: &Connection, public_id: &str) -> Result<TaskRec, Queu
                 feature_public_id: row.get(17)?,
                 created_at: row.get(18)?,
                 updated_at: row.get(19)?,
-                origin: row.get(20)?,
-                created_offline: row.get(21)?,
-                creator_agent_id: row.get(22)?,
-                idempotency_key: row.get(23)?,
+                idempotency_key: row.get(20)?,
             })
         },
     )
@@ -2186,163 +1991,45 @@ fn opt_int(value: Option<i64>) -> SqlVal {
 mod tests {
     use super::*;
 
-    fn side(
-        status: &str,
-        token: Option<&str>,
-        origin: &str,
-        dirty: bool,
-        updated: &str,
-    ) -> ClaimSide {
+    fn side(status: &str, token: Option<&str>, dirty: bool, updated: &str) -> ClaimSide {
         ClaimSide {
             status: status.into(),
             updated_at: updated.into(),
             latest_claim_token: token.map(str::to_string),
-            origin: origin.into(),
             dirty,
         }
     }
 
     #[test]
-    fn remote_claim_beats_offline_local_claim() {
-        let local = side(
-            "claimed",
-            Some("local-token"),
-            ORIGIN_LOCAL_UNSYNCED,
-            true,
-            "2026-01-01T00:00:02Z",
-        );
+    fn authority_claim_is_adopted_when_the_local_row_has_no_token() {
+        let local = side("ready", None, true, "2026-01-01T00:00:04Z");
         let remote = side(
             "claimed",
             Some("remote-token"),
-            ORIGIN_SYNCED_LOCAL,
             false,
             "2026-01-01T00:00:03Z",
         );
-        assert_eq!(
-            choose_merge(&local, &remote),
-            MergeChoice::AdoptRemote {
-                conflict: ConflictKind::Claim
-            }
-        );
+        assert_eq!(choose_merge(&local, &remote), MergeChoice::AdoptRemote);
     }
 
     #[test]
-    fn remote_claim_beats_local_completion() {
-        let local = side(
-            "done",
-            Some("local-token"),
-            ORIGIN_LOCAL_UNSYNCED,
-            true,
-            "2026-01-01T00:00:04Z",
-        );
-        let remote = side(
-            "claimed",
-            Some("remote-token"),
-            ORIGIN_SYNCED_LOCAL,
-            false,
-            "2026-01-01T00:00:03Z",
-        );
-        assert_eq!(
-            choose_merge(&local, &remote),
-            MergeChoice::AdoptRemote {
-                conflict: ConflictKind::Completion
-            }
-        );
-    }
-
-    #[test]
-    fn own_completion_is_not_a_conflict() {
-        let local = side(
-            "done",
-            Some("same"),
-            ORIGIN_SYNCED_LOCAL,
-            true,
-            "2026-01-01T00:00:04Z",
-        );
-        let remote = side(
-            "claimed",
-            Some("same"),
-            ORIGIN_SYNCED_LOCAL,
-            false,
-            "2026-01-01T00:00:03Z",
-        );
+    fn same_token_keeps_a_dirty_local_completion() {
+        let local = side("done", Some("same"), true, "2026-01-01T00:00:04Z");
+        let remote = side("claimed", Some("same"), false, "2026-01-01T00:00:03Z");
         assert_eq!(choose_merge(&local, &remote), MergeChoice::KeepLocal);
     }
 
     #[test]
-    fn unseen_local_task_is_kept_when_remote_has_no_competing_claim() {
-        let local = side(
-            "claimed",
-            Some("local-token"),
-            ORIGIN_LOCAL_UNSYNCED,
-            true,
-            "2026-01-01T00:00:02Z",
-        );
-        let remote = side(
-            "ready",
-            None,
-            ORIGIN_SYNCED_LOCAL,
-            false,
-            "2026-01-01T00:00:01Z",
-        );
+    fn dirty_local_row_is_kept_when_the_authority_has_no_claim() {
+        let local = side("ready", None, true, "2026-01-01T00:00:02Z");
+        let remote = side("inbox", None, false, "2026-01-01T00:00:03Z");
         assert_eq!(choose_merge(&local, &remote), MergeChoice::KeepLocal);
     }
 
     #[test]
-    fn remote_claim_is_adopted_when_local_has_no_token() {
-        let local = side(
-            "ready",
-            None,
-            ORIGIN_SYNCED_FROM_REMOTE,
-            true,
-            "2026-01-01T00:00:02Z",
-        );
-        let remote = side(
-            "claimed",
-            Some("remote-token"),
-            ORIGIN_SYNCED_LOCAL,
-            false,
-            "2026-01-01T00:00:03Z",
-        );
-        assert_eq!(
-            choose_merge(&local, &remote),
-            MergeChoice::AdoptRemote {
-                conflict: ConflictKind::None
-            }
-        );
-    }
-
-    #[test]
-    fn offline_gate_matches_only_the_creating_agent() {
-        assert!(offline_claim_allowed(
-            ORIGIN_LOCAL_UNSYNCED,
-            1,
-            Some("agent-a"),
-            "agent-a"
-        ));
-        assert!(!offline_claim_allowed(
-            ORIGIN_LOCAL_UNSYNCED,
-            1,
-            Some("agent-a"),
-            "agent-b"
-        ));
-        assert!(!offline_claim_allowed(
-            ORIGIN_SYNCED_FROM_REMOTE,
-            1,
-            Some("agent-a"),
-            "agent-a"
-        ));
-        assert!(!offline_claim_allowed(
-            ORIGIN_LOCAL_UNSYNCED,
-            0,
-            Some("agent-a"),
-            "agent-a"
-        ));
-        assert!(!offline_claim_allowed(
-            ORIGIN_LOCAL_UNSYNCED,
-            1,
-            None,
-            "agent-a"
-        ));
+    fn clean_local_row_adopts_a_newer_remote_task() {
+        let local = side("ready", None, false, "2026-01-01T00:00:01Z");
+        let remote = side("ready", None, false, "2026-01-01T00:00:02Z");
+        assert_eq!(choose_merge(&local, &remote), MergeChoice::AdoptRemote);
     }
 }

@@ -4,8 +4,8 @@
 //! CLI and MCP adapters do not keep a second copy of the SQL.
 //!
 //! When a Turso URL is configured, this file stays the working database.
-//! [`replica`] pushes and pulls against the remote authority. Offline claims
-//! are limited to tasks this agent created during the outage; see that module.
+//! [`replica`] pushes and pulls against the remote authority. Dequeue requires
+//! that authority to be reachable; offline create still writes the local file.
 
 mod dbpath;
 mod libsql_remote;
@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
     format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
-    Actor, ActorKind, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim,
-    ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
+    Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
+    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
     DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
     Feature, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus,
     ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
@@ -877,11 +877,7 @@ fn recover_expired(
     Ok(recovered)
 }
 
-fn select_eligible(
-    conn: &Connection,
-    request: &ClaimRequest,
-    offline: bool,
-) -> Result<Option<i64>, QueueError> {
+fn select_eligible(conn: &Connection, request: &ClaimRequest) -> Result<Option<i64>, QueueError> {
     let mut stmt = conn
         .prepare(
             "SELECT id FROM tasks WHERE status = 'ready' ORDER BY priority DESC, created_at ASC, id ASC",
@@ -917,26 +913,6 @@ fn select_eligible(
             meta.allow_external_actions,
         ) {
             continue;
-        }
-        // Offline workers may take only tasks they created during this outage.
-        // Synced ready work stays on the authority so another machine cannot
-        // claim the same task from a stale replica.
-        if offline {
-            let (origin, created_offline, creator): (String, i64, Option<String>) = conn
-                .query_row(
-                    "SELECT origin, created_offline, creator_agent_id FROM tasks WHERE id = ?",
-                    params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .db()?;
-            if !replica::offline_claim_allowed(
-                &origin,
-                created_offline,
-                creator.as_deref(),
-                &request.agent_id,
-            ) {
-                continue;
-            }
         }
         return Ok(Some(id));
     }
@@ -1270,24 +1246,15 @@ impl QueueService for Queue {
             return self.with_conn(|conn| load_task(conn, id));
         }
         let public_id = Uuid::now_v7().to_string();
-        // `created_offline` is captured once. Later edits must not flip it, or a
-        // task created while online could become claimable after a disconnect.
-        let link = self.link_state();
-        let created_offline = i64::from(link == LinkState::Offline);
-        let creator_agent_id = match (&request.actor.kind, request.actor.id.as_deref()) {
-            (ActorKind::Agent, Some(id)) if !id.trim().is_empty() => Some(id.to_string()),
-            _ => None,
-        };
         tx.execute(
             "INSERT INTO tasks (
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
-                origin, created_offline, creator_agent_id, idempotency_key, dirty,
-                created_at, updated_at
+                idempotency_key, dirty, created_at, updated_at
              ) VALUES (
-                ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
-                'local_unsynced', ?, ?, ?, 1, ?, ?
+                ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
+                ?, 1, ?, ?
              )",
             params![
                 public_id,
@@ -1307,8 +1274,6 @@ impl QueueService for Queue {
                 &request.agent_pool,
                 caps,
                 feature_id,
-                created_offline,
-                creator_agent_id,
                 idempotency_key,
                 &now,
                 &now
@@ -1810,13 +1775,27 @@ impl QueueService for Queue {
             maximum_risk: request.maximum_risk,
             lease,
         };
-        // Refresh the link before taking the local write lock. A failed sync
-        // means this worker is offline for the rest of the claim.
-        let mut link = self.link_state_cached(true);
-        if link == LinkState::Online {
+        // A configured remote is the only place a claim may be taken. Offline
+        // or unreachable means no eligible work, including tasks just created
+        // on this machine. Local-only queues (no remote) claim as before.
+        if self.remote.is_some() {
+            let link = self.link_state_cached(true);
+            if link != LinkState::Online {
+                tracing::info!(
+                    agent_id = %request.agent_id,
+                    link = link.as_str(),
+                    found = false,
+                    "claim requires the central authority"
+                );
+                return Ok(ClaimOutcome::none());
+            }
             if let Err(err) = self.sync() {
-                tracing::warn!(error = %err, "sync before claim failed; treating the link as offline");
-                link = LinkState::Offline;
+                tracing::warn!(
+                    error = %err,
+                    agent_id = %request.agent_id,
+                    "claim skipped; central authority is unreachable"
+                );
+                return Ok(ClaimOutcome::none());
             }
         }
         let mut conn = open_connection(&self.path)?;
@@ -1825,8 +1804,7 @@ impl QueueService for Queue {
             .db()?;
         let (now_dt, now) = now_parts();
         recover_expired(&tx, &now, None, &Actor::system())?;
-        let offline = link == LinkState::Offline;
-        let Some(task_id) = select_eligible(&tx, &request, offline)? else {
+        let Some(task_id) = select_eligible(&tx, &request)? else {
             tx.commit().db()?;
             self.best_effort_sync();
             tracing::info!(agent_id = %request.agent_id, found = false, "claim_next");
@@ -1834,10 +1812,8 @@ impl QueueService for Queue {
         };
         let expires = format_timestamp(add_lease(now_dt, lease)?);
         let token = Uuid::new_v4().to_string();
-        let claimed_offline = offline;
-        // Online claims are acknowledged by the authority before the local
-        // row is claimed. The token is not returned until that CAS succeeds.
-        if link == LinkState::Online {
+        // The token is not returned until the authority accepts the claim.
+        if self.remote.is_some() {
             let (Some(config), Some(backend)) = (&self.remote, &self.backend) else {
                 tx.rollback().db()?;
                 return Err(QueueError::Database(
@@ -1853,7 +1829,6 @@ impl QueueService for Queue {
                 &token,
                 &now,
                 &expires,
-                false,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1868,7 +1843,13 @@ impl QueueService for Queue {
                 }
                 Err(err) => {
                     tx.rollback().db()?;
-                    return Err(err);
+                    tracing::warn!(
+                        error = %err,
+                        agent_id = %request.agent_id,
+                        task_id,
+                        "claim skipped; central authority is unreachable"
+                    );
+                    return Ok(ClaimOutcome::none());
                 }
             }
         }
@@ -1886,18 +1867,9 @@ impl QueueService for Queue {
         }
         tx.execute(
             "INSERT INTO claims (
-                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at,
-                claimed_offline, dirty
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-            params![
-                task_id,
-                &request.agent_id,
-                &token,
-                &now,
-                &now,
-                &expires,
-                i64::from(claimed_offline)
-            ],
+                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at, dirty
+             ) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            params![task_id, &request.agent_id, &token, &now, &now, &expires],
         )
         .db()?;
         insert_event(

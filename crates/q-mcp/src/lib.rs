@@ -709,7 +709,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "agent_id": {
                         "type": "string",
-                        "description": "Agent that created the task. Required to claim it while offline from the Turso authority. Defaults to mcp."
+                        "description": "Actor recorded on the task_created event. Defaults to mcp."
                     },
                     "idempotency_key": {
                         "type": "string",
@@ -810,7 +810,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "queue_claim_next",
-            "Atomically claim one eligible ready task, or return found=false when none are eligible.",
+            "Atomically claim one eligible ready task, or return found=false when none are eligible. When a Turso URL is configured, dequeue requires the authority to be reachable; an offline link returns found=false.",
             json!({
                 "type": "object",
                 "required": ["agent_id"],
