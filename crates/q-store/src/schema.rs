@@ -212,115 +212,91 @@ fn apply_v2(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
     Ok(())
 }
 
-const SCHEMA_V3: &str = r#"
-ALTER TABLE tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'local_unsynced';
-ALTER TABLE tasks ADD COLUMN created_offline INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE tasks ADD COLUMN creator_agent_id TEXT;
-ALTER TABLE tasks ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
-
-ALTER TABLE claims ADD COLUMN claimed_offline INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE claims ADD COLUMN superseded_at TEXT;
-ALTER TABLE claims ADD COLUMN superseded_reason TEXT;
-ALTER TABLE claims ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
-
-ALTER TABLE events ADD COLUMN public_id TEXT;
-ALTER TABLE events ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
-
-ALTER TABLE artifacts ADD COLUMN public_id TEXT;
-ALTER TABLE artifacts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1;
-
-CREATE TABLE IF NOT EXISTS sync_tombstones (
-  entity TEXT NOT NULL,
-  public_id TEXT NOT NULL,
-  deleted_at TEXT NOT NULL,
-  PRIMARY KEY (entity, public_id)
-);
-
-CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);
-"#;
-
 fn apply_v3(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
-    // Each ALTER is skipped when a previous attempt added the column but did not
-    // record the version (crash mid-migration).
-    if !column_exists(conn, "tasks", "origin")? {
-        conn.execute_batch(SCHEMA_V3)?;
-    } else {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sync_tombstones (
-                entity TEXT NOT NULL,
-                public_id TEXT NOT NULL,
-                deleted_at TEXT NOT NULL,
-                PRIMARY KEY (entity, public_id)
-             );
-             CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);",
-        )?;
-        ensure_column(
-            conn,
-            "tasks",
-            "created_offline",
-            "ALTER TABLE tasks ADD COLUMN created_offline INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            conn,
-            "tasks",
-            "creator_agent_id",
-            "ALTER TABLE tasks ADD COLUMN creator_agent_id TEXT",
-        )?;
-        ensure_column(
-            conn,
-            "tasks",
-            "dirty",
-            "ALTER TABLE tasks ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
-        )?;
-        ensure_column(
-            conn,
-            "claims",
-            "claimed_offline",
-            "ALTER TABLE claims ADD COLUMN claimed_offline INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            conn,
-            "claims",
-            "superseded_at",
-            "ALTER TABLE claims ADD COLUMN superseded_at TEXT",
-        )?;
-        ensure_column(
-            conn,
-            "claims",
-            "superseded_reason",
-            "ALTER TABLE claims ADD COLUMN superseded_reason TEXT",
-        )?;
-        ensure_column(
-            conn,
-            "claims",
-            "dirty",
-            "ALTER TABLE claims ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
-        )?;
-        ensure_column(
-            conn,
-            "events",
-            "public_id",
-            "ALTER TABLE events ADD COLUMN public_id TEXT",
-        )?;
-        ensure_column(
-            conn,
-            "events",
-            "dirty",
-            "ALTER TABLE events ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
-        )?;
-        ensure_column(
-            conn,
-            "artifacts",
-            "public_id",
-            "ALTER TABLE artifacts ADD COLUMN public_id TEXT",
-        )?;
-        ensure_column(
-            conn,
-            "artifacts",
-            "dirty",
-            "ALTER TABLE artifacts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
-        )?;
-    }
+    // Each ALTER is skipped when the column is already present. Fresh files
+    // are stamped at the current version and never reach this path. A database
+    // stamped at version 1 but created from a later schema still walks it.
+    ensure_column(
+        conn,
+        "tasks",
+        "origin",
+        "ALTER TABLE tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'local_unsynced'",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "created_offline",
+        "ALTER TABLE tasks ADD COLUMN created_offline INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "creator_agent_id",
+        "ALTER TABLE tasks ADD COLUMN creator_agent_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "dirty",
+        "ALTER TABLE tasks ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "claims",
+        "claimed_offline",
+        "ALTER TABLE claims ADD COLUMN claimed_offline INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "claims",
+        "superseded_at",
+        "ALTER TABLE claims ADD COLUMN superseded_at TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "claims",
+        "superseded_reason",
+        "ALTER TABLE claims ADD COLUMN superseded_reason TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "claims",
+        "dirty",
+        "ALTER TABLE claims ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "events",
+        "public_id",
+        "ALTER TABLE events ADD COLUMN public_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "events",
+        "dirty",
+        "ALTER TABLE events ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "artifacts",
+        "public_id",
+        "ALTER TABLE artifacts ADD COLUMN public_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "artifacts",
+        "dirty",
+        "ALTER TABLE artifacts ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_tombstones (
+            entity TEXT NOT NULL,
+            public_id TEXT NOT NULL,
+            deleted_at TEXT NOT NULL,
+            PRIMARY KEY (entity, public_id)
+         );
+         CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);",
+    )?;
     backfill_public_ids(conn, "events")?;
     backfill_public_ids(conn, "artifacts")?;
     conn.execute_batch(

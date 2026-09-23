@@ -1253,7 +1253,7 @@ impl QueueService for Queue {
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
                 idempotency_key, dirty, created_at, updated_at
              ) VALUES (
-                ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
+                ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
                 ?, 1, ?, ?
              )",
             params![
