@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   origin TEXT NOT NULL DEFAULT 'local_unsynced',
   created_offline INTEGER NOT NULL DEFAULT 0,
   creator_agent_id TEXT,
+  idempotency_key TEXT,
   dirty INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -118,6 +119,8 @@ ON events(task_id, id);
 
 CREATE INDEX IF NOT EXISTS tasks_feature_idx ON tasks(feature_id);
 CREATE INDEX IF NOT EXISTS tasks_origin_idx ON tasks(origin, created_offline);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_key
+ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS events_public_id ON events(public_id);
 CREATE UNIQUE INDEX IF NOT EXISTS artifacts_public_id ON artifacts(public_id);
 
@@ -163,13 +166,13 @@ fn apply_pending(conn: &mut dyn Db) -> Result<(), QueueError> {
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
     )?;
     let applied_at = format_timestamp(OffsetDateTime::now_utc());
-    // New files get the current schema and are stamped at version 3. Databases
-    // created by older builds walk v1 → v2 → v3. `current` is read once, so a
+    // New files get the current schema and are stamped at version 4. Databases
+    // created by older builds walk v1 → v2 → v3 → v4. `current` is read once, so a
     // brand-new file does not also run the upgrade alters.
     if current < 1 {
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
             &[SqlVal::text(applied_at.clone())],
         )?;
     } else {
@@ -178,6 +181,9 @@ fn apply_pending(conn: &mut dyn Db) -> Result<(), QueueError> {
         }
         if current < 3 {
             apply_v3(conn, &applied_at)?;
+        }
+        if current < 4 {
+            apply_v4(conn, &applied_at)?;
         }
     }
     Ok(())
@@ -327,6 +333,24 @@ fn apply_v3(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
     )?;
     conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        &[SqlVal::text(applied_at)],
+    )?;
+    Ok(())
+}
+
+fn apply_v4(conn: &mut dyn Db, applied_at: &str) -> Result<(), QueueError> {
+    ensure_column(
+        conn,
+        "tasks",
+        "idempotency_key",
+        "ALTER TABLE tasks ADD COLUMN idempotency_key TEXT",
+    )?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS tasks_idempotency_key
+         ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;",
+    )?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
         &[SqlVal::text(applied_at)],
     )?;
     Ok(())

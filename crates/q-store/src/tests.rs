@@ -82,6 +82,7 @@ fn capture_with(queue: &Queue, title: &str, risk: RiskLevel, policy: Option<Proj
             policy,
             actor: actor(),
             context_source: Some("test".into()),
+            idempotency_key: None,
         })
         .unwrap()
         .id
@@ -139,7 +140,7 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let feature_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
@@ -615,6 +616,7 @@ fn project_cap_limits_active_claims() {
             policy: Some(policy),
             actor: actor(),
             context_source: None,
+            idempotency_key: None,
         })
         .unwrap();
     let second = queue
@@ -637,6 +639,7 @@ fn project_cap_limits_active_claims() {
             policy: None,
             actor: actor(),
             context_source: None,
+            idempotency_key: None,
         })
         .unwrap();
     for id in [first.id, second.id] {
@@ -982,6 +985,7 @@ fn capture_named(queue: &Queue, title: &str, project: Option<&str>) -> i64 {
             policy: None,
             actor: actor(),
             context_source: Some("test".into()),
+            idempotency_key: None,
         })
         .unwrap()
         .id
@@ -1182,6 +1186,7 @@ fn capture_in(
             policy: None,
             actor: actor(),
             context_source: Some("test".into()),
+            idempotency_key: None,
         })
         .unwrap()
         .id
@@ -1308,6 +1313,7 @@ fn features_group_tasks_across_repos_and_resolve_by_id_or_title() {
         policy: None,
         actor: actor(),
         context_source: None,
+        idempotency_key: None,
     });
     assert!(matches!(ambiguous, Err(QueueError::Conflict(_))));
 
@@ -1467,7 +1473,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let rejected = conn.execute(
         "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
         params![task_id],
@@ -1709,6 +1715,7 @@ fn capture_as(queue: &Queue, title: &str, agent: &str) -> i64 {
             policy: None,
             actor: Actor::agent(agent),
             context_source: Some("test".into()),
+            idempotency_key: None,
         })
         .unwrap()
         .id
@@ -1913,4 +1920,173 @@ fn offline_claim_replicates_when_the_authority_has_not_seen_the_task() {
         .unwrap();
     assert_eq!(remote_status.0, "claimed");
     assert_eq!(remote_status.1, token);
+}
+
+fn capture_keyed(queue: &Queue, title: &str, key: Option<&str>, agent: &str) -> i64 {
+    queue
+        .capture(CaptureRequest {
+            title: title.into(),
+            body: None,
+            kind: TaskKind::Implementation,
+            priority: 0,
+            risk: RiskLevel::Low,
+            project: Some("demo".into()),
+            repo: Some("git@github.com:acme/demo.git".into()),
+            capture_path: "/tmp/demo".into(),
+            repo_relative_path: None,
+            git_root: Some("/tmp/demo".into()),
+            git_head: Some("abc123".into()),
+            agent_pool: None,
+            required_capabilities: vec![],
+            dependencies: vec![],
+            feature: None,
+            policy: None,
+            actor: Actor::agent(agent),
+            context_source: Some("test".into()),
+            idempotency_key: key.map(str::to_string),
+        })
+        .unwrap()
+        .id
+}
+
+fn open_at(local: &std::path::Path, remote: &std::path::Path, link: LinkState) -> Queue {
+    Queue::open_linked(
+        local,
+        Some(RemoteConfig {
+            url: "sqlite-test".into(),
+            auth_token: String::new(),
+        }),
+        Some(RemoteBackend::Sqlite(remote.to_path_buf())),
+        Some(link),
+    )
+    .unwrap()
+}
+
+#[test]
+fn offline_create_syncs_and_same_intent_is_one_task() {
+    let (queue, local, remote) = linked(LinkState::Offline);
+    let id = capture_keyed(&queue, "Created on the plane", None, "agent-a");
+    let public_id = queue.get(id).unwrap().task.public_id.to_string();
+    let (origin, created_offline, key): (String, i64, String) = Connection::open(&local)
+        .unwrap()
+        .query_row(
+            "SELECT origin, created_offline, idempotency_key FROM tasks WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(origin, "local_unsynced");
+    assert_eq!(created_offline, 1);
+    assert!(key.starts_with("content:"), "{key}");
+    let again = capture_keyed(&queue, "Created   on the plane", None, "agent-b");
+    assert_eq!(again, id);
+    drop(queue);
+
+    let queue = open_at(&local, &remote, LinkState::Online);
+    let report = queue.sync().unwrap();
+    assert!(report.pushed >= 1, "pushed={}", report.pushed);
+    let synced: String = Connection::open(&local)
+        .unwrap()
+        .query_row(
+            "SELECT origin FROM tasks WHERE public_id = ?1",
+            params![public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(synced, "synced_local");
+    let remote_count: i64 = Connection::open(&remote)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE public_id = ?1",
+            params![public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remote_count, 1);
+}
+
+#[test]
+fn explicit_idempotency_key_returns_the_original_task() {
+    let (queue, path) = queue();
+    let first = capture_keyed(&queue, "First wording", Some("ticket-9"), "agent-a");
+    let second = capture_keyed(&queue, "Different wording", Some("ticket-9"), "agent-b");
+    assert_eq!(first, second);
+    let other = capture_keyed(&queue, "First wording", Some("ticket-10"), "agent-a");
+    assert_ne!(first, other);
+    let stored: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT idempotency_key FROM tasks WHERE id = ?1",
+            params![first],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "ticket-9");
+    let events = queue.events(first).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "task_deduped"));
+}
+
+#[test]
+fn sync_collapses_two_public_ids_with_the_same_idempotency_key() {
+    let (local_a, remote) = pair_paths();
+    Queue::open(&remote).unwrap();
+    let queue_a = open_at(&local_a, &remote, LinkState::Offline);
+    let local_id = capture_keyed(&queue_a, "Shared intent", Some("intent-1"), "agent-a");
+    let local_public = queue_a.get(local_id).unwrap().task.public_id.to_string();
+    drop(queue_a);
+
+    let remote_queue = Queue::open(&remote).unwrap();
+    let remote_id = capture_keyed(&remote_queue, "Authority copy", Some("intent-1"), "agent-b");
+    let remote_public = remote_queue
+        .get(remote_id)
+        .unwrap()
+        .task
+        .public_id
+        .to_string();
+    assert_ne!(local_public, remote_public);
+    drop(remote_queue);
+
+    let queue_a = open_at(&local_a, &remote, LinkState::Online);
+    let report = queue_a.sync().unwrap();
+    assert!(report.deduped >= 1, "deduped={}", report.deduped);
+    let kept = queue_a.list(ListFilter::default()).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].public_id.to_string(), remote_public);
+    assert_ne!(kept[0].public_id.to_string(), local_public);
+    let events = queue_a.events(kept[0].id).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "task_deduped"),
+        "{:?}",
+        events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let (local_b, _) = pair_paths();
+    let queue_b = open_at(&local_b, &remote, LinkState::Offline);
+    let second = capture_keyed(&queue_b, "Shared intent again", Some("intent-1"), "agent-c");
+    let second_public = queue_b.get(second).unwrap().task.public_id.to_string();
+    assert_ne!(second_public, remote_public);
+    drop(queue_b);
+    let queue_b = open_at(&local_b, &remote, LinkState::Online);
+    let report = queue_b.sync().unwrap();
+    assert!(report.deduped >= 1, "deduped={}", report.deduped);
+    let kept_b = queue_b.list(ListFilter::default()).unwrap();
+    assert_eq!(kept_b.len(), 1);
+    assert_eq!(kept_b[0].public_id.to_string(), remote_public);
+
+    let remote_count: i64 = Connection::open(&remote)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = 'intent-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remote_count, 1);
 }

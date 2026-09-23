@@ -115,6 +115,7 @@ fn dispatch(
             agent_pool,
             depends_on,
             feature,
+            idempotency_key,
         } => {
             let context = resolve_context(directory, repo, project)?;
             let body = read_body(body, body_file.as_deref())?;
@@ -147,6 +148,7 @@ fn dispatch(
                 context_source: serde_json::to_value(context.source)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string)),
+                idempotency_key,
             })?;
             let id = task.id;
             emit(json, &task, || {
@@ -457,12 +459,14 @@ fn dispatch(
                 "pulled": report.pulled,
                 "pushed": report.pushed,
                 "conflicts": report.conflicts,
+                "deduped": report.deduped,
             });
             emit(json, &body, || {
                 println!("link: {}", report.link.as_str());
                 println!("pulled: {}", report.pulled);
                 println!("pushed: {}", report.pushed);
                 println!("conflicts: {}", report.conflicts);
+                println!("deduped: {}", report.deduped);
             });
             Ok(())
         }

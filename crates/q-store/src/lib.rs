@@ -137,6 +137,7 @@ impl Queue {
                 pulled: 0,
                 pushed: 0,
                 conflicts: 0,
+                deduped: 0,
             });
         };
         let Some(backend) = &self.backend else {
@@ -145,6 +146,7 @@ impl Queue {
                 pulled: 0,
                 pushed: 0,
                 conflicts: 0,
+                deduped: 0,
             });
         };
         let link = self.link_state_cached(true);
@@ -154,6 +156,7 @@ impl Queue {
                 pulled: 0,
                 pushed: 0,
                 conflicts: 0,
+                deduped: 0,
             });
         }
         match replica::synchronize(&self.path, backend, config) {
@@ -1229,6 +1232,43 @@ impl QueueService for Queue {
             None
         };
         let feature_id = optional_feature_id(&tx, request.feature.as_deref())?;
+        // Offline create is always allowed. The claim gate is a separate check
+        // and does not run on this path.
+        let idempotency_key = q_core::resolve_idempotency_key(
+            request.idempotency_key.as_deref(),
+            title,
+            body.as_deref(),
+            request.kind.as_str(),
+            repo.as_deref(),
+            project.as_deref(),
+        )?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM tasks WHERE idempotency_key = ?",
+                params![idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .db()?;
+        if let Some(id) = existing {
+            insert_event(
+                &tx,
+                Some(id),
+                "task_deduped",
+                &request.actor,
+                json!({
+                    "scope": "local",
+                    "idempotency_key": idempotency_key,
+                    "kept_task_id": id,
+                }),
+                &now,
+            )?;
+            tx.execute("UPDATE tasks SET dirty = 1 WHERE id = ?", params![id])
+                .db()?;
+            tx.commit().db()?;
+            self.best_effort_sync();
+            return self.with_conn(|conn| load_task(conn, id));
+        }
         let public_id = Uuid::now_v7().to_string();
         // `created_offline` is captured once. Later edits must not flip it, or a
         // task created while online could become claimable after a disconnect.
@@ -1243,10 +1283,11 @@ impl QueueService for Queue {
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
-                origin, created_offline, creator_agent_id, dirty, created_at, updated_at
+                origin, created_offline, creator_agent_id, idempotency_key, dirty,
+                created_at, updated_at
              ) VALUES (
                 ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?,
-                'local_unsynced', ?, ?, 1, ?, ?
+                'local_unsynced', ?, ?, ?, 1, ?, ?
              )",
             params![
                 public_id,
@@ -1268,6 +1309,7 @@ impl QueueService for Queue {
                 feature_id,
                 created_offline,
                 creator_agent_id,
+                idempotency_key,
                 &now,
                 &now
             ],
@@ -1292,6 +1334,7 @@ impl QueueService for Queue {
                 "feature_id": feature_id,
                 "capture_path": request.capture_path,
                 "source": request.context_source,
+                "idempotency_key": idempotency_key,
             }),
             &now,
         )?;

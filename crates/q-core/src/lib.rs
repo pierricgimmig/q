@@ -4,6 +4,7 @@
 //! transitions or SQL themselves.
 
 mod error;
+mod idempotency;
 mod model;
 mod repo;
 mod service;
@@ -13,6 +14,7 @@ mod tree;
 mod validate;
 
 pub use error::QueueError;
+pub use idempotency::resolve_idempotency_key;
 pub use model::*;
 pub use repo::normalize_repo_url;
 pub use service::QueueService;

@@ -522,6 +522,8 @@ pub struct CaptureRequest {
     pub policy: Option<ProjectPolicy>,
     pub actor: Actor,
     pub context_source: Option<String>,
+    /// Caller-supplied intent id. When omitted, the service derives a content key.
+    pub idempotency_key: Option<String>,
 }
 
 /// Filters for [`crate::QueueService::list`].

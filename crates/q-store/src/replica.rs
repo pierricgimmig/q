@@ -17,7 +17,15 @@
 //! the outage (`origin = local_unsynced`, `created_offline = 1`,
 //! `creator_agent_id` matches). Tasks pulled from the authority, or created
 //! while online, stay unclaimable until the link is back. That is what stops
-//! two machines from taking the same ready task.
+//! two machines from taking the same ready task. Creating a task offline is
+//! allowed and is not part of that gate. The new row syncs on reconnect.
+//!
+//! # Idempotency
+//!
+//! Tasks also carry `idempotency_key`. Capture stores an explicit key or a
+//! derived `content:` hash. On sync, two public ids with the same key collapse
+//! to the authority's row. The losing local row is tombstoned and a
+//! `task_deduped` event is recorded. That merge does not change the claim gate.
 //!
 //! # Reconciliation
 //!
@@ -77,6 +85,7 @@ pub struct SyncReport {
     pub pulled: u64,
     pub pushed: u64,
     pub conflicts: u64,
+    pub deduped: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +306,7 @@ struct TaskRec {
     origin: String,
     created_offline: i64,
     creator_agent_id: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +423,7 @@ fn apply_and_push(
     for project in &remote_snap.projects {
         upsert_local_project(local, project)?;
     }
+    let dedup_notes = fold_idempotency_duplicates(local, remote_snap)?;
     let mut adopted = HashSet::new();
     for task in &remote_snap.tasks {
         if tombstones.contains(&("task".to_string(), task.public_id.clone())) {
@@ -445,14 +456,133 @@ fn apply_and_push(
     }
     import_events(local, remote_snap)?;
     import_artifacts(local, remote_snap)?;
-    let pushed = push_dirty(local, remote, remote_snap, &mut conflicts)?;
+    let mut deduped = 0u64;
+    for note in &dedup_notes {
+        if record_dedup_event(local, note)? {
+            deduped += 1;
+        }
+    }
+    let (pushed, push_deduped) = push_dirty(local, remote, remote_snap, &mut conflicts)?;
+    deduped += push_deduped;
     push_tombstones(local, remote)?;
     Ok(SyncReport {
         link: LinkState::Online,
         pulled,
         pushed,
         conflicts,
+        deduped,
     })
+}
+
+struct DedupNote {
+    kept_public_id: String,
+    discarded_public_id: String,
+    idempotency_key: String,
+    local_status: String,
+    local_claim_token: Option<String>,
+}
+
+fn fold_idempotency_duplicates(
+    local: &mut dyn Db,
+    remote_snap: &Snapshot,
+) -> Result<Vec<DedupNote>, QueueError> {
+    let mut notes = Vec::new();
+    let now = format_timestamp(OffsetDateTime::now_utc());
+    for remote_task in &remote_snap.tasks {
+        let Some(key) = remote_task
+            .idempotency_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        else {
+            continue;
+        };
+        let rows = local.query(
+            "SELECT public_id FROM tasks WHERE idempotency_key = ? AND public_id != ?",
+            &[SqlVal::text(key), SqlVal::text(&remote_task.public_id)],
+        )?;
+        for row in rows {
+            let discarded = req_text(&row, 0)?;
+            let side = local_side(local, &discarded)?;
+            discard_local_task(local, &discarded, &now)?;
+            notes.push(DedupNote {
+                kept_public_id: remote_task.public_id.clone(),
+                discarded_public_id: discarded,
+                idempotency_key: key.to_string(),
+                local_status: side.status,
+                local_claim_token: side.latest_claim_token,
+            });
+        }
+    }
+    Ok(notes)
+}
+
+fn discard_local_task(local: &mut dyn Db, public_id: &str, now: &str) -> Result<(), QueueError> {
+    local.execute(
+        "INSERT INTO sync_tombstones (entity, public_id, deleted_at) VALUES ('task', ?, ?)
+         ON CONFLICT(entity, public_id) DO UPDATE SET deleted_at = excluded.deleted_at",
+        &[SqlVal::text(public_id), SqlVal::text(now)],
+    )?;
+    local.execute(
+        "DELETE FROM tasks WHERE public_id = ?",
+        &[SqlVal::text(public_id)],
+    )?;
+    Ok(())
+}
+
+fn record_dedup_event(local: &mut dyn Db, note: &DedupNote) -> Result<bool, QueueError> {
+    let Some(id) = lookup_local_task(local, &note.kept_public_id)? else {
+        return Ok(false);
+    };
+    let now = format_timestamp(OffsetDateTime::now_utc());
+    let payload = json!({
+        "scope": "sync",
+        "resolution": "remote_authority",
+        "idempotency_key": note.idempotency_key,
+        "kept_public_id": note.kept_public_id,
+        "discarded_public_id": note.discarded_public_id,
+        "local_status": note.local_status,
+        "local_claim_token": note.local_claim_token,
+    });
+    local.execute(
+        "INSERT INTO events (
+            task_id, event_type, actor_type, actor_id, payload_json, public_id, dirty, created_at
+         ) VALUES (?, 'task_deduped', 'system', 'q', ?, ?, 1, ?)",
+        &[
+            SqlVal::Int(id),
+            SqlVal::text(payload.to_string()),
+            SqlVal::text(Uuid::now_v7().to_string()),
+            SqlVal::text(now),
+        ],
+    )?;
+    local.execute(
+        "UPDATE tasks SET dirty = 1 WHERE id = ?",
+        &[SqlVal::Int(id)],
+    )?;
+    Ok(true)
+}
+
+fn conflicting_idempotency_owner(
+    remote: &mut dyn Db,
+    task: &TaskRec,
+) -> Result<Option<Box<DedupPull>>, QueueError> {
+    let Some(key) = task
+        .idempotency_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(other) = load_task_by_idempotency(remote, key)? else {
+        return Ok(None);
+    };
+    if other.public_id == task.public_id {
+        return Ok(None);
+    }
+    let claims = load_remote_claims(remote, &other.public_id)?;
+    Ok(Some(Box::new(DedupPull {
+        task: other,
+        claims,
+    })))
 }
 
 fn side_for(task: &TaskRec, snap: &Snapshot) -> ClaimSide {
@@ -595,7 +725,7 @@ fn adopt_existing(
             repo_relative_path = ?, git_root = ?, git_head = ?, agent_pool = ?,
             required_capabilities_json = ?, blocked_reason = ?, feature_id = ?,
             created_at = ?, updated_at = ?, origin = ?, created_offline = ?,
-            creator_agent_id = ?, dirty = 0
+            creator_agent_id = ?, idempotency_key = ?, dirty = 0
          WHERE id = ?",
         &[
             SqlVal::text(&task.title),
@@ -621,6 +751,7 @@ fn adopt_existing(
             SqlVal::text(ORIGIN_SYNCED_FROM_REMOTE),
             SqlVal::Int(task.created_offline),
             SqlVal::opt_text(task.creator_agent_id.clone()),
+            SqlVal::opt_text(task.idempotency_key.clone()),
             SqlVal::Int(id),
         ],
     )?;
@@ -795,7 +926,7 @@ fn push_dirty(
     remote: &mut dyn Db,
     snap: &Snapshot,
     conflicts: &mut u64,
-) -> Result<u64, QueueError> {
+) -> Result<(u64, u64), QueueError> {
     let rows = local.query(
         "SELECT public_id FROM tasks
          WHERE (dirty = 1 OR origin = 'local_unsynced')
@@ -804,6 +935,7 @@ fn push_dirty(
         &[],
     )?;
     let mut pushed = 0u64;
+    let mut deduped = 0u64;
     for row in rows {
         let public_id = req_text(&row, 0)?;
         match push_one(local, remote, &public_id, snap)? {
@@ -811,14 +943,16 @@ fn push_dirty(
             PushResult::Conflict => {
                 *conflicts += 1;
             }
+            PushResult::Deduped => deduped += 1,
         }
     }
-    Ok(pushed)
+    Ok((pushed, deduped))
 }
 
 enum PushResult {
     Pushed,
     Conflict,
+    Deduped,
 }
 
 fn push_one(
@@ -901,6 +1035,34 @@ fn push_one(
             replace_local_deps(local, &fresh.task.public_id, &fresh.snap)?;
             Ok(PushResult::Conflict)
         }
+        RemoteWrite::Deduped(pull) => {
+            let side = local_side(local, public_id)?;
+            let note = DedupNote {
+                kept_public_id: pull.task.public_id.clone(),
+                discarded_public_id: public_id.to_string(),
+                idempotency_key: pull.task.idempotency_key.clone().unwrap_or_default(),
+                local_status: side.status,
+                local_claim_token: side.latest_claim_token,
+            };
+            let now = format_timestamp(OffsetDateTime::now_utc());
+            discard_local_task(local, public_id, &now)?;
+            if lookup_local_task(local, &pull.task.public_id)?.is_none() {
+                insert_local_task(local, &pull.task, ORIGIN_SYNCED_FROM_REMOTE, 0)?;
+            }
+            let snap = Snapshot {
+                tasks: vec![pull.task.clone()],
+                claims: pull.claims.clone(),
+                events: Vec::new(),
+                artifacts: Vec::new(),
+                deps: Vec::new(),
+                features: Vec::new(),
+                projects: Vec::new(),
+                tombstones: Vec::new(),
+            };
+            copy_claims(local, &pull.task.public_id, &snap)?;
+            record_dedup_event(local, &note)?;
+            Ok(PushResult::Deduped)
+        }
     }
 }
 
@@ -913,6 +1075,12 @@ struct RejectedPull {
 enum RemoteWrite {
     Accepted,
     Rejected(Box<RejectedPull>),
+    Deduped(Box<DedupPull>),
+}
+
+struct DedupPull {
+    task: TaskRec,
+    claims: Vec<ClaimRec>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -932,6 +1100,9 @@ fn push_one_remote(
     }
     if let Some(feature) = feature {
         upsert_remote_feature(remote, feature)?;
+    }
+    if let Some(pull) = conflicting_idempotency_owner(remote, task)? {
+        return Ok(RemoteWrite::Deduped(pull));
     }
     let existing = load_remote_task(remote, &task.public_id)?;
     if let Some(existing) = existing {
@@ -1189,7 +1360,7 @@ fn load_tasks(db: &mut dyn Db) -> Result<Vec<TaskRec>, QueueError> {
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
             features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id
+            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
          FROM tasks
          LEFT JOIN features ON features.id = tasks.feature_id
          ORDER BY tasks.id",
@@ -1223,6 +1394,7 @@ fn parse_task(row: &[SqlVal]) -> Result<TaskRec, QueueError> {
         origin: req_text(row, 20)?,
         created_offline: req_int(row, 21)?,
         creator_agent_id: opt_text(row, 22)?,
+        idempotency_key: opt_text(row, 23)?,
     })
 }
 
@@ -1233,7 +1405,7 @@ fn load_local_task(local: &mut dyn Db, public_id: &str) -> Result<Option<TaskRec
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
             features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id
+            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
          FROM tasks
          LEFT JOIN features ON features.id = tasks.feature_id
          WHERE tasks.public_id = ?",
@@ -1244,6 +1416,22 @@ fn load_local_task(local: &mut dyn Db, public_id: &str) -> Result<Option<TaskRec
 
 fn load_remote_task(remote: &mut dyn Db, public_id: &str) -> Result<Option<TaskRec>, QueueError> {
     load_local_task(remote, public_id)
+}
+
+fn load_task_by_idempotency(db: &mut dyn Db, key: &str) -> Result<Option<TaskRec>, QueueError> {
+    let rows = db.query(
+        "SELECT tasks.public_id, tasks.title, tasks.body, tasks.original_capture, tasks.status,
+            tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo,
+            tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
+            tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
+            features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
+            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
+         FROM tasks
+         LEFT JOIN features ON features.id = tasks.feature_id
+         WHERE tasks.idempotency_key = ?",
+        &[SqlVal::text(key)],
+    )?;
+    rows.first().map(|row| parse_task(row)).transpose()
 }
 
 fn load_claims(db: &mut dyn Db) -> Result<Vec<ClaimRec>, QueueError> {
@@ -1533,8 +1721,8 @@ fn insert_local_task(
             public_id, title, body, original_capture, status, kind, priority, risk,
             project_id, project_name, repo, capture_path, repo_relative_path, git_root, git_head,
             agent_pool, required_capabilities_json, blocked_reason, feature_id, origin,
-            created_offline, creator_agent_id, dirty, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            created_offline, creator_agent_id, idempotency_key, dirty, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &task_insert_params(task, project_id, feature_id, origin, dirty),
     )?;
     Ok(local.last_insert_rowid())
@@ -1554,8 +1742,8 @@ fn insert_remote_task(remote: &mut dyn Db, task: &TaskRec) -> Result<(), QueueEr
             public_id, title, body, original_capture, status, kind, priority, risk,
             project_id, project_name, repo, capture_path, repo_relative_path, git_root, git_head,
             agent_pool, required_capabilities_json, blocked_reason, feature_id, origin,
-            created_offline, creator_agent_id, dirty, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            created_offline, creator_agent_id, idempotency_key, dirty, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &task_insert_params(task, project_id, feature_id, ORIGIN_SYNCED_LOCAL, 0),
     )?;
     Ok(())
@@ -1591,6 +1779,7 @@ fn task_insert_params(
         SqlVal::text(origin),
         SqlVal::Int(task.created_offline),
         SqlVal::opt_text(task.creator_agent_id.clone()),
+        SqlVal::opt_text(task.idempotency_key.clone()),
         SqlVal::Int(dirty),
         SqlVal::text(&task.created_at),
         SqlVal::text(&task.updated_at),
@@ -1612,7 +1801,8 @@ fn write_task_fields(remote: &mut dyn Db, task: &TaskRec, origin: &str) -> Resul
             risk = ?, project_id = ?, project_name = ?, repo = ?, capture_path = ?,
             repo_relative_path = ?, git_root = ?, git_head = ?, agent_pool = ?,
             required_capabilities_json = ?, blocked_reason = ?, feature_id = ?,
-            updated_at = ?, origin = ?, created_offline = ?, creator_agent_id = ?, dirty = 0
+            updated_at = ?, origin = ?, created_offline = ?, creator_agent_id = ?,
+            idempotency_key = ?, dirty = 0
          WHERE public_id = ?",
         &[
             SqlVal::text(&task.title),
@@ -1637,6 +1827,7 @@ fn write_task_fields(remote: &mut dyn Db, task: &TaskRec, origin: &str) -> Resul
             SqlVal::text(origin),
             SqlVal::Int(task.created_offline),
             SqlVal::opt_text(task.creator_agent_id.clone()),
+            SqlVal::opt_text(task.idempotency_key.clone()),
             SqlVal::text(&task.public_id),
         ],
     )?;
@@ -1862,7 +2053,7 @@ fn load_task_through(conn: &Connection, public_id: &str) -> Result<TaskRec, Queu
             tasks.capture_path, tasks.repo_relative_path, tasks.git_root, tasks.git_head,
             tasks.agent_pool, tasks.required_capabilities_json, tasks.blocked_reason,
             features.public_id, tasks.created_at, tasks.updated_at, tasks.origin,
-            tasks.created_offline, tasks.creator_agent_id
+            tasks.created_offline, tasks.creator_agent_id, tasks.idempotency_key
          FROM tasks LEFT JOIN features ON features.id = tasks.feature_id
          WHERE tasks.public_id = ?",
         params![public_id],
@@ -1891,6 +2082,7 @@ fn load_task_through(conn: &Connection, public_id: &str) -> Result<TaskRec, Queu
                 origin: row.get(20)?,
                 created_offline: row.get(21)?,
                 creator_agent_id: row.get(22)?,
+                idempotency_key: row.get(23)?,
             })
         },
     )

@@ -54,11 +54,25 @@ The local file is still the database the CLI reads and writes. `libsql` is used 
 
 ### Offline claim policy
 
-While the link is offline, an agent may claim only a task it created itself during that outage. The row must have `origin = local_unsynced`, `created_offline = 1`, and `creator_agent_id` equal to the claiming agent. Tasks pulled from the authority (`synced_from_remote`), tasks already pushed (`synced_local`), tasks created while online, tasks created by a human, and tasks created by a different agent stay unclaimable until the link returns. That is what stops two machines from taking the same ready task.
+Creating a task does not consult that gate. An agent may capture inbox work while offline; the row is stored locally and pushed on the next successful sync. Claiming is separate: while the link is offline, an agent may claim only a task it created itself during that outage. The row must have `origin = local_unsynced`, `created_offline = 1`, and `creator_agent_id` equal to the claiming agent. Tasks pulled from the authority (`synced_from_remote`), tasks already pushed (`synced_local`), tasks created while online, tasks created by a human, and tasks created by a different agent stay unclaimable until the link returns. That is what stops two machines from taking the same ready task.
 
 `created_offline` is set only at capture, and only when a remote is configured and the probe fails. Later edits do not change it. MCP `queue_capture` takes an optional `agent_id` (default `mcp`) so the creator matches `queue_claim_next`.
 
 When the link is online, claim still runs in one local `BEGIN IMMEDIATE` transaction, and the authority must accept the claim before the token is returned. The remote update is a compare-and-swap on `public_id` and status `ready`. If another machine already claimed it, the local transaction rolls back and the claim result is no eligible work.
+
+### Offline create and idempotency
+
+Offline create and the offline claim gate are different rules. Capture always writes the local database, online or offline. Claim, while offline, still accepts only a task this agent just created locally.
+
+Each new task stores an idempotency key so the same intent is not queued twice when machines reconnect:
+
+- Pass `--idempotency-key` (CLI) or `idempotency_key` (MCP `queue_capture`) to name the intent. A repeat capture with that key returns the existing task.
+- When the key is omitted, q derives `content:<sha256>` from the title, body, kind, repo, and project (whitespace collapsed). The same content on two machines is one task.
+- The key is unique when it is set. On sync, if the authority already has that key under a different `public_id`, the authority's row is kept. The local duplicate is deleted, its `public_id` is tombstoned, and a `task_deduped` event records the discarded id. This is content dedup, not a second claim rule.
+
+```bash
+q add --idempotency-key rollout-7 "Add the migration"
+```
 
 ### Reconciliation
 

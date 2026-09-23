@@ -126,6 +126,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--feature"
             | "--turso-url"
             | "--turso-auth-token"
+            | "--idempotency-key"
     )
 }
 
@@ -195,6 +196,10 @@ pub enum Commands {
         /// Feature id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Intent id. The same key returns the existing task instead of enqueueing another.
+        /// Omit it to derive a key from title, body, kind, repo, and project.
+        #[arg(long, value_name = "KEY")]
+        idempotency_key: Option<String>,
     },
     /// List tasks. Done and cancelled are hidden unless --all or --status is set.
     #[command(alias = "list")]

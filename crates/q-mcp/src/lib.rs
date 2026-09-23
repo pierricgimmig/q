@@ -217,6 +217,7 @@ fn queue_capture(
             "agent_pool",
             "feature",
             "agent_id",
+            "idempotency_key",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -264,6 +265,7 @@ fn queue_capture(
         context_source: serde_json::to_value(context.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
+        idempotency_key: optional_string(args, "idempotency_key")?,
     })?;
     serde_json::to_value(task).map_err(|err| ToolFailure::Invalid(err.to_string()))
 }
@@ -708,6 +710,10 @@ fn tool_definitions() -> Vec<Value> {
                     "agent_id": {
                         "type": "string",
                         "description": "Agent that created the task. Required to claim it while offline from the Turso authority. Defaults to mcp."
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Intent id. The same key on any machine returns or syncs as one task. Omit it to derive a content key from title, body, kind, repo, and project."
                     }
                 },
                 "additionalProperties": false
@@ -1107,6 +1113,7 @@ mod tests {
                 policy: None,
                 actor: Actor::agent("mcp"),
                 context_source: None,
+                idempotency_key: None,
             })
             .unwrap();
         queue
