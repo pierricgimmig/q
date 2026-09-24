@@ -67,6 +67,7 @@ fn is_command(word: &str) -> bool {
             | "feature"
             | "mcp"
             | "serve"
+            | "token"
             | "skill"
             | "help"
     )
@@ -98,6 +99,8 @@ fn is_value_flag(arg: &str) -> bool {
             | "--token"
             | "--bind"
             | "--auth"
+            | "--public-url"
+            | "--role"
             | "-C"
             | "--directory"
             | "--repo"
@@ -365,14 +368,23 @@ pub enum Commands {
     },
     /// Serve the queue as an MCP server on stdio.
     Mcp,
-    /// Serve the local database over HTTP as the single authority for remote agents.
+    /// Serve the local database over HTTP for remote agents and chat connectors.
     Serve {
-        /// Address to listen on. Non-loopback addresses require --auth.
+        /// Address to listen on. Non-loopback addresses require a token file.
         #[arg(long, default_value = "127.0.0.1:7777", value_name = "ADDR")]
         bind: String,
-        /// TOML token file with [[tokens]] entries (name, role = human|agent, secret).
+        /// Token file. Defaults to tokens.toml next to the database when that file exists.
         #[arg(long, value_name = "FILE")]
         auth: Option<PathBuf>,
+        /// Public origin, for example https://q.example.com. Used in OAuth metadata and redirects.
+        /// Defaults to the reverse proxy's X-Forwarded-Proto and Host headers.
+        #[arg(long, value_name = "URL")]
+        public_url: Option<String>,
+    },
+    /// Manage the token file that q serve authenticates with.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
     },
     /// Print or install the agent skill for q.
     Skill {
@@ -391,6 +403,32 @@ pub enum SkillCommand {
         /// Accepted for scripts. Existing SKILL.md files are overwritten either way.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Add a token with a fresh secret and print the secret once.
+    Create {
+        /// Who this token is for, for example pierric or codex-vps.
+        name: String,
+        /// human or agent. Agents cannot mark work ready.
+        #[arg(long, default_value = "agent", value_name = "ROLE")]
+        role: String,
+        /// Token file. Defaults to tokens.toml next to the database.
+        #[arg(long, value_name = "FILE")]
+        auth: Option<PathBuf>,
+    },
+    /// List token names and roles. Secrets are never printed.
+    Ls {
+        #[arg(long, value_name = "FILE")]
+        auth: Option<PathBuf>,
+    },
+    /// Remove a token. Connectors signed in with it stop working.
+    Revoke {
+        name: String,
+        #[arg(long, value_name = "FILE")]
+        auth: Option<PathBuf>,
     },
 }
 

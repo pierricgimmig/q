@@ -9,13 +9,15 @@ description = "HTTP server and client over the shared queue service"
 [dependencies]
 axum.workspace = true
 q-core.workspace = true
+q-mcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 ureq.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 q-store.workspace = true
-uuid.workspace = true

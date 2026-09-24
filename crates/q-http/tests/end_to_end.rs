@@ -7,7 +7,7 @@ use q_core::{
     Actor, ActorKind, CaptureRequest, ClaimRequest, CompleteRequest, HeartbeatRequest, ListFilter,
     QueueError, QueueService, ReadyRequest, RiskLevel, StartRequest, TaskKind, TaskStatus,
 };
-use q_http::{serve_on, AuthConfig, RemoteQueue};
+use q_http::{serve_on, AuthConfig, RemoteQueue, ServerOptions, TokenStore};
 use q_store::Queue;
 use tokio::sync::oneshot;
 
@@ -40,7 +40,8 @@ impl Server {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 ready.send(format!("http://{addr}")).unwrap();
-                serve_on(queue, listener, auth, async move {
+                let options = ServerOptions::local(auth.map(TokenStore::fixed));
+                serve_on(queue, listener, options, async move {
                     let _ = stopped.await;
                 })
                 .await

@@ -19,7 +19,7 @@ use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
 
-use crate::cli::{Commands, FeatureCommand, ProjectCommand};
+use crate::cli::{Commands, FeatureCommand, ProjectCommand, TokenCommand};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -111,7 +111,12 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
         }
-        Commands::Serve { bind, auth } => serve(&cli, bind, auth.as_deref()).await,
+        Commands::Serve {
+            bind,
+            auth,
+            public_url,
+        } => serve(&cli, bind, auth.as_deref(), public_url.as_deref()).await,
+        Commands::Token { command } => token_command(&cli, command, json),
         Commands::Skill { command } => match command {
             None => skill::print_skill(json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
@@ -144,8 +149,24 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
     }
 }
 
-/// `q serve`: own the local file and answer remote CLI and MCP clients.
-async fn serve(cli: &cli::Cli, bind: &str, auth: Option<&Path>) -> Result<(), CliError> {
+/// Token file next to the database unless overridden.
+fn tokens_path(cli: &cli::Cli, explicit: Option<&Path>) -> PathBuf {
+    match explicit {
+        Some(path) => path.to_path_buf(),
+        None => db_path(cli)
+            .parent()
+            .map(|dir| dir.join("tokens.toml"))
+            .unwrap_or_else(|| PathBuf::from("tokens.toml")),
+    }
+}
+
+/// `q serve`: own the local file and answer remote CLI, MCP, and chat clients.
+async fn serve(
+    cli: &cli::Cli,
+    bind: &str,
+    auth: Option<&Path>,
+    public_url: Option<&str>,
+) -> Result<(), CliError> {
     if cli.server.is_some() {
         return Err(CliError::message(
             "q serve owns a local database; it cannot be pointed at another --server",
@@ -154,29 +175,123 @@ async fn serve(cli: &cli::Cli, bind: &str, auth: Option<&Path>) -> Result<(), Cl
     let addr: std::net::SocketAddr = bind
         .parse()
         .map_err(|err| CliError::message(format!("invalid --bind {bind}: {err}")))?;
-    let auth = match auth {
-        Some(path) => Some(q_http::AuthConfig::load(path).map_err(CliError::message)?),
-        None => None,
-    };
-    q_http::check_bind(&addr, auth.as_ref()).map_err(CliError::message)?;
     let db = db_path(cli);
+    let tokens = tokens_path(cli, auth);
+    let store = if auth.is_some() || tokens.exists() {
+        Some(q_http::TokenStore::from_file(&tokens).map_err(CliError::message)?)
+    } else {
+        None
+    };
+    q_http::check_bind(&addr, store.as_ref()).map_err(CliError::message)?;
+    let key_path = db
+        .parent()
+        .map(|dir| dir.join("oauth.key"))
+        .unwrap_or_else(|| PathBuf::from("oauth.key"));
+    let signing_key = q_http::SigningKey::load_or_create(&key_path).map_err(CliError::message)?;
     let queue: Arc<dyn QueueService> = Arc::new(Queue::open(&db)?);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    let mode = match &auth {
-        Some(auth) => format!("{} token(s)", auth.tokens.len()),
+    let mode = match &store {
+        Some(store) => format!("{} token(s) from {}", store.len(), tokens.display()),
         None => "no auth, loopback only".to_string(),
     };
     eprintln!(
         "q serve listening on http://{local} (database: {}, {mode})",
         db.display()
     );
-    q_http::serve_on(queue, listener, auth, async {
+    let public = public_url
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("http://{local}"));
+    eprintln!("connector URL for Grok, Claude, or ChatGPT: {public}/mcp");
+    if store.is_none() {
+        eprintln!("chat connectors need a token file; run: q token create NAME --role human");
+    }
+    let options = q_http::ServerOptions {
+        auth: store,
+        public_url: public_url.map(|url| url.trim_end_matches('/').to_string()),
+        signing_key,
+        base_dir: base_dir(cli.directory.as_deref())?,
+    };
+    q_http::serve_on(queue, listener, options, async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down");
     })
     .await?;
     Ok(())
+}
+
+fn token_command(cli: &cli::Cli, command: &TokenCommand, json: bool) -> Result<(), CliError> {
+    match command {
+        TokenCommand::Create { name, role, auth } => {
+            let role = q_http::Role::parse(role).map_err(CliError::message)?;
+            let path = tokens_path(cli, auth.as_deref());
+            let secret =
+                q_http::AuthConfig::create_token(&path, name, role).map_err(CliError::message)?;
+            let body = serde_json::json!({
+                "name": name,
+                "role": role.as_str(),
+                "secret": secret,
+                "path": path,
+            });
+            emit(json, &body, || {
+                println!(
+                    "created token {name} ({}) in {}",
+                    role.as_str(),
+                    path.display()
+                );
+                println!("secret: {secret}");
+                match role {
+                    q_http::Role::Human => println!(
+                        "Paste it on the connector sign-in page, or export it as Q_SERVER_TOKEN."
+                    ),
+                    q_http::Role::Agent => println!(
+                        "Give it to that agent as Q_SERVER_TOKEN, or as a Bearer header for /mcp."
+                    ),
+                }
+                println!("A running q serve picks it up without a restart.");
+            });
+            Ok(())
+        }
+        TokenCommand::Ls { auth } => {
+            let path = tokens_path(cli, auth.as_deref());
+            let config = if path.exists() {
+                q_http::AuthConfig::load(&path).map_err(CliError::message)?
+            } else {
+                q_http::AuthConfig::default()
+            };
+            let tokens: Vec<serde_json::Value> = config
+                .tokens
+                .iter()
+                .map(|token| serde_json::json!({"name": token.name, "role": token.role.as_str()}))
+                .collect();
+            emit(
+                json,
+                &serde_json::json!({"path": path, "tokens": tokens}),
+                || {
+                    println!("token file: {}", path.display());
+                    if config.tokens.is_empty() {
+                        println!("(no tokens)");
+                    }
+                    for token in &config.tokens {
+                        println!("{}\t{}", token.name, token.role.as_str());
+                    }
+                },
+            );
+            Ok(())
+        }
+        TokenCommand::Revoke { name, auth } => {
+            let path = tokens_path(cli, auth.as_deref());
+            q_http::AuthConfig::revoke_token(&path, name).map_err(CliError::message)?;
+            emit(
+                json,
+                &serde_json::json!({"revoked": name, "path": path}),
+                || {
+                    println!("revoked token {name}");
+                },
+            );
+            Ok(())
+        }
+    }
 }
 
 fn dispatch(
@@ -578,6 +693,7 @@ fn dispatch(
         Commands::Project { .. }
         | Commands::Mcp
         | Commands::Serve { .. }
+        | Commands::Token { .. }
         | Commands::Skill { .. } => {
             unreachable!("handled before queue open")
         }
