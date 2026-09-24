@@ -1,0 +1,42 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# Checked in CI by the `deny` job in .github/workflows/ci.yml.
+# Run locally with `cargo install --locked cargo-deny && cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Ignore specific advisories here with a comment explaining why, e.g.:
+# ignore = [{ id = "RUSTSEC-0000-0000", reason = "..." }]
+ignore = []
+
+[licenses]
+version = 2
+# Licenses every dependency must be under. Add to this list deliberately.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path without a version; that's fine.
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
