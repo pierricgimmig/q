@@ -66,6 +66,7 @@ fn is_command(word: &str) -> bool {
             | "project"
             | "feature"
             | "mcp"
+            | "serve"
             | "skill"
             | "help"
     )
@@ -93,6 +94,10 @@ fn is_value_flag(arg: &str) -> bool {
     matches!(
         arg,
         "--db"
+            | "--server"
+            | "--token"
+            | "--bind"
+            | "--auth"
             | "-C"
             | "--directory"
             | "--repo"
@@ -134,9 +139,17 @@ fn is_value_flag(arg: &str) -> bool {
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// SQLite database path. Defaults to $XDG_DATA_HOME/q/queue.db.
+    /// SQLite database path. Defaults to $XDG_DATA_HOME/q/queue.db. Ignored with --server.
     #[arg(long, global = true, value_name = "PATH")]
     pub db: Option<PathBuf>,
+
+    /// URL of a `q serve` authority, for example http://127.0.0.1:7777. Falls back to $Q_SERVER_URL.
+    #[arg(long, global = true, value_name = "URL")]
+    pub server: Option<String>,
+
+    /// Bearer token for --server. Falls back to $Q_SERVER_TOKEN.
+    #[arg(long, global = true, value_name = "TOKEN")]
+    pub token: Option<String>,
 
     /// Print machine-readable JSON on stdout. Logs stay on stderr.
     #[arg(long, global = true)]
@@ -352,6 +365,15 @@ pub enum Commands {
     },
     /// Serve the queue as an MCP server on stdio.
     Mcp,
+    /// Serve the local database over HTTP as the single authority for remote agents.
+    Serve {
+        /// Address to listen on. Non-loopback addresses require --auth.
+        #[arg(long, default_value = "127.0.0.1:7777", value_name = "ADDR")]
+        bind: String,
+        /// TOML token file with [[tokens]] entries (name, role = human|agent, secret).
+        #[arg(long, value_name = "FILE")]
+        auth: Option<PathBuf>,
+    },
     /// Print or install the agent skill for q.
     Skill {
         #[command(subcommand)]

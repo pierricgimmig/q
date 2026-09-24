@@ -221,7 +221,7 @@ impl ActorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     pub kind: ActorKind,
     pub id: Option<String>,
@@ -501,7 +501,7 @@ pub struct ReadyOutcome {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureRequest {
     pub title: String,
     pub body: Option<String>,
@@ -535,7 +535,7 @@ pub struct CaptureRequest {
 /// first, then id descending.
 ///
 /// `feature`, when set, is a feature id or a unique title.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListFilter {
     pub status: Option<TaskStatus>,
     pub project: Option<String>,
@@ -562,7 +562,7 @@ impl Default for ListFilter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditRequest {
     pub title: Option<String>,
     pub body: Option<String>,
@@ -639,13 +639,13 @@ pub struct Feature {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateFeatureRequest {
     pub title: String,
     pub body: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditFeatureRequest {
     pub title: Option<String>,
     pub body: Option<String>,
@@ -666,27 +666,27 @@ pub struct DeleteFeatureOutcome {
     pub tasks_detached: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyRequest {
     pub task_id: i64,
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRequest {
     pub task_id: i64,
     pub claim_token: Option<String>,
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRequest {
     pub task_id: i64,
     pub actor: Actor,
 }
 
 /// Hard-delete. Distinct from [`CancelRequest`], which keeps the task row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteRequest {
     pub task_id: i64,
     pub force: bool,
@@ -709,7 +709,7 @@ pub struct DeleteOutcome {
     pub dependencies_removed: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
     pub agent_id: String,
     pub capabilities: Vec<String>,
@@ -736,7 +736,7 @@ impl ClaimRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub task_id: i64,
     pub claim_token: String,
@@ -744,7 +744,7 @@ pub struct HeartbeatRequest {
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRequest {
     pub task_id: i64,
     pub claim_token: String,
@@ -753,7 +753,7 @@ pub struct StartRequest {
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRequest {
     pub task_id: i64,
     pub claim_token: Option<String>,
@@ -763,14 +763,14 @@ pub struct CompleteRequest {
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseRequest {
     pub task_id: i64,
     pub claim_token: String,
     pub actor: Actor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoverRequest {
     pub to: Option<StaleDisposition>,
     pub actor: Actor,
@@ -783,7 +783,7 @@ fn skip_false(value: &bool) -> bool {
 /// Request for [`crate::QueueService::tree`].
 ///
 /// Set `task_id` or `feature`, not both. `feature` is an id or a unique title.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeQuery {
     pub task_id: Option<i64>,
     pub feature: Option<String>,

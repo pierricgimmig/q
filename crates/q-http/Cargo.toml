@@ -1,0 +1,21 @@
+[package]
+name = "q-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP server and client over the shared queue service"
+
+[dependencies]
+axum.workspace = true
+q-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+q-store.workspace = true
+uuid.workspace = true

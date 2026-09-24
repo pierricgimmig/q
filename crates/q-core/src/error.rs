@@ -18,6 +18,9 @@ pub enum QueueError {
     Conflict(String),
     #[error("database error: {0}")]
     Database(String),
+    /// The remote q server could not be reached or returned a malformed reply.
+    #[error("server error: {0}")]
+    Transport(String),
 }
 
 impl QueueError {
@@ -30,6 +33,7 @@ impl QueueError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Conflict(_) => "conflict",
             Self::Database(_) => "database",
+            Self::Transport(_) => "transport",
         }
     }
 }

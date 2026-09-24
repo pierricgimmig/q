@@ -2,7 +2,7 @@
 
 Local-first work queue for coding and research agents. Capture an idea in one command, keep it in an inbox until a person marks it ready, then let an idle agent claim it through the CLI or an MCP server on stdio.
 
-`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate.
+`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
 
 ## Install
 
@@ -32,6 +32,43 @@ Every connection sets WAL mode, foreign keys, and a 5 second busy timeout. Overr
 ```bash
 q --db /tmp/queue.db status
 ```
+
+## Remote server
+
+`q serve` turns the local database into the single authority for a fleet of agents. One process owns the SQLite file and answers every service method over HTTP, so claims stay serialized by the same `BEGIN IMMEDIATE` transaction they use locally. There is no replica and no sync: two machines cannot take the same task because there is only one place to take it from.
+
+```bash
+# on the VPS
+q serve --bind 0.0.0.0:7777 --db /var/lib/q/queue.db --auth /etc/q/tokens.toml
+
+# on every other machine, and inside agents
+export Q_SERVER_URL="https://q.example.com"
+export Q_SERVER_TOKEN="..."
+q "Benchmark trace encoding variants"
+q claim --agent codex-vps-01 --json
+```
+
+`--server URL` and `--token TOKEN` are global flags that override `Q_SERVER_URL` and `Q_SERVER_TOKEN`. When a server is set, `--db` is ignored and `q mcp` forwards to the server too, so an MCP client only needs the environment variables or `["mcp", "--server", "https://q.example.com", "--token", "..."]`.
+
+Tokens live in a TOML file. Each has a role:
+
+```toml
+[[tokens]]
+name = "pierric"
+role = "human"
+secret = "replace-with-openssl-rand-hex-32"
+
+[[tokens]]
+name = "codex-vps"
+role = "agent"
+secret = "replace-with-openssl-rand-hex-32"
+```
+
+Secrets must be at least 16 characters. `human` tokens may call everything. `agent` tokens cannot call `ready` or `reopen`, so an agent cannot make work claimable, and any actor an agent sends is recorded as an agent. The rule that only humans mark work ready is enforced by the server, not by convention.
+
+Without `--auth` the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. `GET /v1/health` needs no token. Put TLS in front with Caddy or nginx; `q serve` speaks plain HTTP.
+
+The wire format is `POST /v1/<method>` with the request as JSON and the result as JSON. Errors are an `{"error": {"code", "message"}}` body with a 4xx or 5xx status, and the client turns them back into the same errors the local queue returns. An unreachable server is reported as `server error: cannot reach q server at URL`.
 
 ## Capture and discovery
 
@@ -185,7 +222,7 @@ q tree --feature "Cross-repo rollout" --json
 
 ## MCP
 
-`q mcp` speaks newline-delimited JSON-RPC on stdio. It does not open a network port. Protocol messages are the only bytes on stdout. Logs go to stderr.
+`q mcp` speaks newline-delimited JSON-RPC on stdio. It does not open a network port. Protocol messages are the only bytes on stdout. Logs go to stderr. With `--server` or `Q_SERVER_URL` set it forwards every tool call to a `q serve` authority instead of opening a local file.
 
 ```json
 {
@@ -271,10 +308,11 @@ crates/q-dispatch   eligibility rules used inside the claim transaction
 crates/q-project    git discovery and .agentqueue.toml
 crates/q-store      SQLite schema, migrations, and the service implementation
 crates/q-mcp        stdio JSON-RPC adapter
+crates/q-http       q serve (axum) and RemoteQueue, the HTTP client that implements QueueService
 crates/q-cli        the q binary
 ```
 
-CLI and MCP depend on the service trait. They do not run SQL.
+CLI, MCP, and the HTTP transport depend on the service trait. They do not run SQL.
 
 ## Tests
 
