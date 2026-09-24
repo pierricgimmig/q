@@ -20,6 +20,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - Default lease is 45 minutes (minimum 1 minute, maximum 24 hours). Heartbeat extends only a matching, unexpired token.
 - No eligible work is success, not an error: `found` is false and `reason` is `no_eligible_ready_tasks`.
 - Prefer `q --json` for machine output. Logs belong on stderr. In MCP mode, stdout is protocol only.
+- If `Q_SERVER_URL` is set, every `q` command and `q mcp` talk to a shared `q serve` authority with the bearer token in `Q_SERVER_TOKEN`. Do not pass `--db` in that case. Agent tokens cannot run `q ready` or `q reopen`; the server rejects them.
 - The queue does not launch agents, create worktrees, open pull requests, merge, or deploy.
 - A **feature** is an optional group of tasks that may span repos. Each task keeps its own repo and project. Pass a feature id or unique title to `q add --feature`, `q edit --feature`, `q ls --feature`, `q tree --feature`, or MCP `feature`. `q edit --clear-feature` detaches a task. Deleting a feature clears that link and keeps the tasks.
 - `q tree ID` prints the tasks that must be done before that task. Children are dependencies. `q tree --feature` does the same for every task in a feature. A repeated task is marked already shown. A dependency outside the feature is marked external.

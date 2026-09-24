@@ -15,6 +15,7 @@ anstream = "1"
 anstyle = "1"
 clap.workspace = true
 q-core.workspace = true
+q-http.workspace = true
 q-mcp.workspace = true
 q-project.workspace = true
 q-store.workspace = true

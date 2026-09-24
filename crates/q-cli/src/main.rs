@@ -17,6 +17,7 @@ use q_core::{
     ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
     TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
 };
+use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
 use time::OffsetDateTime;
@@ -51,6 +52,61 @@ fn init_tracing() {
         .try_init();
 }
 
+/// Where the queue lives: a local SQLite file or a `q serve` URL.
+enum Backend {
+    Local(PathBuf),
+    Remote(String),
+}
+
+impl Backend {
+    fn describe(&self, paint: Paint) -> String {
+        match self {
+            Self::Local(path) => {
+                format!("database: {}", paint.dim(&path.display().to_string()))
+            }
+            Self::Remote(url) => format!("server: {}", paint.dim(url)),
+        }
+    }
+
+    fn json_fields(&self) -> (&'static str, String) {
+        match self {
+            Self::Local(path) => ("db", path.display().to_string()),
+            Self::Remote(url) => ("server", url.clone()),
+        }
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Open the service the command will run against. `--server` (or
+/// `$Q_SERVER_URL`) selects the remote authority; otherwise the local file.
+fn open_service(cli: &cli::Cli) -> Result<(Arc<dyn QueueService>, Backend), CliError> {
+    let server = cli
+        .server
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env_nonempty("Q_SERVER_URL"));
+    match server {
+        Some(url) => {
+            let token = cli.token.clone().or_else(|| env_nonempty("Q_SERVER_TOKEN"));
+            let remote = RemoteQueue::new(&url, token)?;
+            tracing::info!(server = %remote.url(), "using remote queue");
+            let backend = Backend::Remote(remote.url().to_string());
+            Ok((Arc::new(remote), backend))
+        }
+        None => {
+            let db = db_path(cli);
+            tracing::info!(db = %db.display(), "opening queue");
+            let queue = Queue::open(&db)?;
+            Ok((Arc::new(queue), Backend::Local(db)))
+        }
+    }
+}
+
 struct Ui {
     json: bool,
     out: Paint,
@@ -63,22 +119,21 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
         out: style::paint_for(cli.color, style::Stream::Stdout),
         err: style::paint_for(cli.color, style::Stream::Stderr),
     };
-    let db = db_path(&cli);
     let repo = cli.repo.clone();
     let project = cli.project.clone();
     let directory = cli.directory.clone();
-    match cli.command {
+    match &cli.command {
         Commands::Mcp => {
-            tracing::info!(db = %db.display(), "opening queue");
-            let queue = Arc::new(Queue::open(&db)?);
+            let (queue, _) = open_service(&cli)?;
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
         }
+        Commands::Serve { bind, auth } => serve(&cli, bind, auth.as_deref()).await,
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
                 let home = skill::home_dir().map_err(CliError::message)?;
-                skill::install_skill(&home, &target, force, ui.json).map_err(CliError::message)
+                skill::install_skill(&home, target, *force, ui.json).map_err(CliError::message)
             }
         },
         Commands::Project { command } => match command {
@@ -88,20 +143,62 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 Ok(())
             }
             ProjectCommand::Init { yes, force } => {
-                init_project(directory.as_deref(), repo, project, yes, force, ui.out)
+                init_project(directory.as_deref(), repo, project, *yes, *force, ui.out)
             }
         },
-        other => {
-            tracing::info!(db = %db.display(), "opening queue");
-            let queue = Queue::open(&db)?;
-            dispatch(&queue, &db, repo, project, directory.as_deref(), other, &ui)
+        _ => {
+            let (queue, backend) = open_service(&cli)?;
+            dispatch(
+                queue.as_ref(),
+                &backend,
+                repo,
+                project,
+                directory.as_deref(),
+                cli.command,
+                &ui,
+            )
         }
     }
 }
 
+/// `q serve`: own the local file and answer remote CLI and MCP clients.
+async fn serve(cli: &cli::Cli, bind: &str, auth: Option<&Path>) -> Result<(), CliError> {
+    if cli.server.is_some() {
+        return Err(CliError::message(
+            "q serve owns a local database; it cannot be pointed at another --server",
+        ));
+    }
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|err| CliError::message(format!("invalid --bind {bind}: {err}")))?;
+    let auth = match auth {
+        Some(path) => Some(q_http::AuthConfig::load(path).map_err(CliError::message)?),
+        None => None,
+    };
+    q_http::check_bind(&addr, auth.as_ref()).map_err(CliError::message)?;
+    let db = db_path(cli);
+    let queue: Arc<dyn QueueService> = Arc::new(Queue::open(&db)?);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    let mode = match &auth {
+        Some(auth) => format!("{} token(s)", auth.tokens.len()),
+        None => "no auth, loopback only".to_string(),
+    };
+    eprintln!(
+        "q serve listening on http://{local} (database: {}, {mode})",
+        db.display()
+    );
+    q_http::serve_on(queue, listener, auth, async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    })
+    .await?;
+    Ok(())
+}
+
 fn dispatch(
-    queue: &Queue,
-    db: &Path,
+    queue: &dyn QueueService,
+    backend: &Backend,
     repo: Option<String>,
     project: Option<String>,
     directory: Option<&Path>,
@@ -469,13 +566,14 @@ fn dispatch(
         }
         Commands::Status => {
             let status = queue.status()?;
+            let (origin_key, origin) = backend.json_fields();
             let body = serde_json::json!({
-                "db": db,
+                origin_key: origin,
                 "counts": status.counts,
                 "active_claims": status.active_claims,
                 "expired_claims": status.expired_claims,
             });
-            emit(ui, &body, || print_status(db, &status, ui.out));
+            emit(ui, &body, || print_status(backend, &status, ui.out));
             Ok(())
         }
         Commands::RecoverStale { to } => {
@@ -518,13 +616,20 @@ fn dispatch(
             Ok(())
         }
         Commands::Feature { command } => dispatch_feature(queue, command, ui),
-        Commands::Project { .. } | Commands::Mcp | Commands::Skill { .. } => {
+        Commands::Project { .. }
+        | Commands::Mcp
+        | Commands::Serve { .. }
+        | Commands::Skill { .. } => {
             unreachable!("handled before queue open")
         }
     }
 }
 
-fn dispatch_feature(queue: &Queue, command: FeatureCommand, ui: &Ui) -> Result<(), CliError> {
+fn dispatch_feature(
+    queue: &dyn QueueService,
+    command: FeatureCommand,
+    ui: &Ui,
+) -> Result<(), CliError> {
     match command {
         FeatureCommand::Create { title, body } => {
             let feature = queue.create_feature(CreateFeatureRequest {
@@ -816,8 +921,8 @@ fn source_name(source: q_project::ContextSource) -> &'static str {
     }
 }
 
-fn print_status(db: &Path, status: &q_core::QueueStatus, paint: Paint) {
-    println!("database: {}", paint.dim(&db.display().to_string()));
+fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
+    println!("{}", backend.describe(paint));
     for (label, count) in [
         ("inbox", status.counts.inbox),
         ("ready", status.counts.ready),
