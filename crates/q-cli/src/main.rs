@@ -1,5 +1,6 @@
 mod cli;
 mod skill;
+mod style;
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use anstyle::Style;
 use clap::Parser;
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
@@ -18,8 +20,10 @@ use q_core::{
 use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
 use q_store::{default_db_path, Queue};
+use time::OffsetDateTime;
 
 use crate::cli::{Commands, FeatureCommand, ProjectCommand};
+use crate::style::Paint;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -30,8 +34,9 @@ async fn main() {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
+    let err_paint = style::paint_for(cli.color, style::Stream::Stderr);
     if let Err(error) = run(cli).await {
-        eprintln!("error: {error}");
+        eprintln!("{} {error}", err_paint.error_label());
         std::process::exit(1);
     }
 }
@@ -54,10 +59,12 @@ enum Backend {
 }
 
 impl Backend {
-    fn describe(&self) -> String {
+    fn describe(&self, paint: Paint) -> String {
         match self {
-            Self::Local(path) => format!("database: {}", path.display()),
-            Self::Remote(url) => format!("server: {url}"),
+            Self::Local(path) => {
+                format!("database: {}", paint.dim(&path.display().to_string()))
+            }
+            Self::Remote(url) => format!("server: {}", paint.dim(url)),
         }
     }
 
@@ -100,8 +107,18 @@ fn open_service(cli: &cli::Cli) -> Result<(Arc<dyn QueueService>, Backend), CliE
     }
 }
 
+struct Ui {
+    json: bool,
+    out: Paint,
+    err: Paint,
+}
+
 async fn run(cli: cli::Cli) -> Result<(), CliError> {
-    let json = cli.json;
+    let ui = Ui {
+        json: cli.json,
+        out: style::paint_for(cli.color, style::Stream::Stdout),
+        err: style::paint_for(cli.color, style::Stream::Stderr),
+    };
     let repo = cli.repo.clone();
     let project = cli.project.clone();
     let directory = cli.directory.clone();
@@ -113,20 +130,20 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
         }
         Commands::Serve { bind, auth } => serve(&cli, bind, auth.as_deref()).await,
         Commands::Skill { command } => match command {
-            None => skill::print_skill(json).map_err(CliError::message),
+            None => skill::print_skill(ui.json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
                 let home = skill::home_dir().map_err(CliError::message)?;
-                skill::install_skill(&home, target, *force, json).map_err(CliError::message)
+                skill::install_skill(&home, target, *force, ui.json).map_err(CliError::message)
             }
         },
         Commands::Project { command } => match command {
             ProjectCommand::Show => {
                 let context = resolve_context(directory.as_deref(), repo, project)?;
-                emit(json, &context, || print_context(&context));
+                emit(&ui, &context, || print_context(&context, ui.out));
                 Ok(())
             }
             ProjectCommand::Init { yes, force } => {
-                init_project(directory.as_deref(), repo, project, *yes, *force)
+                init_project(directory.as_deref(), repo, project, *yes, *force, ui.out)
             }
         },
         _ => {
@@ -138,7 +155,7 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 project,
                 directory.as_deref(),
                 cli.command,
-                json,
+                &ui,
             )
         }
     }
@@ -186,7 +203,7 @@ fn dispatch(
     project: Option<String>,
     directory: Option<&Path>,
     command: Commands,
-    json: bool,
+    ui: &Ui,
 ) -> Result<(), CliError> {
     match command {
         Commands::Add {
@@ -234,8 +251,8 @@ fn dispatch(
                     .and_then(|value| value.as_str().map(str::to_string)),
             })?;
             let id = task.id;
-            emit(json, &task, || {
-                println!("captured #{id} [{}] {}", task.status, task.title);
+            emit(ui, &task, || {
+                confirm(ui, "captured", id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
@@ -263,14 +280,14 @@ fn dispatch(
                 limit,
                 include_terminal: all,
             })?;
-            emit(json, &serde_json::json!({"tasks": tasks}), || {
-                print_task_list(&tasks);
+            emit(ui, &serde_json::json!({"tasks": tasks}), || {
+                print_task_list(&tasks, ui.out);
             });
             Ok(())
         }
         Commands::Show { id } => {
             let detail = queue.get(id)?;
-            emit(json, &detail, || print_detail(&detail));
+            emit(ui, &detail, || print_detail(&detail, ui.out));
             Ok(())
         }
         Commands::Tree { id, feature } => {
@@ -278,7 +295,7 @@ fn dispatch(
                 task_id: id,
                 feature,
             })?;
-            emit(json, &tree, || print_tree(&tree));
+            emit(ui, &tree, || print_tree(&tree, ui.out));
             Ok(())
         }
         Commands::Edit {
@@ -337,7 +354,9 @@ fn dispatch(
                 }
             }
             let task = queue.edit(id, request)?;
-            emit(json, &task, || println!("updated #{}", task.id));
+            emit(ui, &task, || {
+                confirm(ui, "updated", task.id, task.status.as_str(), &task.title);
+            });
             Ok(())
         }
         Commands::Ready { id } => {
@@ -346,9 +365,12 @@ fn dispatch(
                 actor: human_actor(),
             })?;
             for warning in &outcome.warnings {
-                eprintln!("warning: {warning}");
+                eprintln!("{} {warning}", ui.err.warning_label());
             }
-            emit(json, &outcome, || println!("task {id} is ready"));
+            let task = &outcome.task;
+            emit(ui, &outcome, || {
+                confirm(ui, "ready", task.id, task.status.as_str(), &task.title);
+            });
             Ok(())
         }
         Commands::Block { id, claim_token } => {
@@ -357,7 +379,9 @@ fn dispatch(
                 claim_token,
                 actor: human_actor(),
             })?;
-            emit(json, &task, || println!("blocked #{}", task.id));
+            emit(ui, &task, || {
+                confirm(ui, "blocked", task.id, task.status.as_str(), &task.title);
+            });
             Ok(())
         }
         Commands::Cancel { id } => {
@@ -365,7 +389,9 @@ fn dispatch(
                 task_id: id,
                 actor: human_actor(),
             })?;
-            emit(json, &task, || println!("cancelled #{}", task.id));
+            emit(ui, &task, || {
+                confirm(ui, "cancelled", task.id, task.status.as_str(), &task.title);
+            });
             Ok(())
         }
         Commands::Delete { id, force } => {
@@ -374,20 +400,26 @@ fn dispatch(
                 force,
                 actor: human_actor(),
             })?;
-            emit(json, &outcome, || {
-                println!(
-                    "deleted #{} [{}] {}",
-                    outcome.task_id, outcome.status, outcome.title
+            emit(ui, &outcome, || {
+                confirm(
+                    ui,
+                    "deleted",
+                    outcome.task_id,
+                    outcome.status.as_str(),
+                    &outcome.title,
                 );
                 if outcome.active_claim_cleared {
                     println!("cleared active claim");
                 }
                 println!(
-                    "removed claims={} events={} artifacts={} dependencies={}",
-                    outcome.claims_removed,
-                    outcome.events_removed,
-                    outcome.artifacts_removed,
-                    outcome.dependencies_removed
+                    "{}",
+                    ui.out.dim(&format!(
+                        "removed claims={} events={} artifacts={} dependencies={}",
+                        outcome.claims_removed,
+                        outcome.events_removed,
+                        outcome.artifacts_removed,
+                        outcome.dependencies_removed
+                    ))
                 );
             });
             Ok(())
@@ -417,13 +449,22 @@ fn dispatch(
                 request.allowed_projects.push(project);
             }
             let outcome = queue.claim_next(request)?;
-            emit(json, &outcome, || {
+            emit(ui, &outcome, || {
                 if outcome.found {
                     let task = outcome.task.as_ref().unwrap();
                     let claim = outcome.claim.as_ref().unwrap();
-                    println!("claimed #{} {}", task.task.id, task.task.title);
+                    confirm(
+                        ui,
+                        "claimed",
+                        task.task.id,
+                        task.task.status.as_str(),
+                        &task.task.title,
+                    );
                     println!("token: {}", claim.token);
-                    println!("lease_expires_at: {}", claim.lease_expires_at);
+                    println!(
+                        "lease_expires_at: {}",
+                        ui.out.dim(&format_timestamp(claim.lease_expires_at))
+                    );
                 } else {
                     println!("no eligible ready tasks");
                 }
@@ -445,10 +486,11 @@ fn dispatch(
                 lease,
                 actor: human_actor(),
             })?;
-            emit(json, &claim, || {
+            emit(ui, &claim, || {
                 println!(
-                    "heartbeat #{} until {}",
-                    claim.task_id, claim.lease_expires_at
+                    "heartbeat {} until {}",
+                    ui.out.dim(&format!("#{}", claim.task_id)),
+                    ui.out.dim(&format_timestamp(claim.lease_expires_at))
                 );
             });
             Ok(())
@@ -466,7 +508,15 @@ fn dispatch(
                 worktree_path: worktree,
                 actor: human_actor(),
             })?;
-            emit(json, &detail, || println!("started #{}", detail.task.id));
+            emit(ui, &detail, || {
+                confirm(
+                    ui,
+                    "started",
+                    detail.task.id,
+                    detail.task.status.as_str(),
+                    &detail.task.title,
+                );
+            });
             Ok(())
         }
         Commands::Complete {
@@ -492,8 +542,14 @@ fn dispatch(
                 artifacts,
                 actor: human_actor(),
             })?;
-            emit(json, &detail, || {
-                println!("#{} is now {}", detail.task.id, detail.task.status);
+            emit(ui, &detail, || {
+                confirm(
+                    ui,
+                    "completed",
+                    detail.task.id,
+                    detail.task.status.as_str(),
+                    &detail.task.title,
+                );
             });
             Ok(())
         }
@@ -503,8 +559,8 @@ fn dispatch(
                 claim_token,
                 actor: human_actor(),
             })?;
-            emit(json, &task, || {
-                println!("released #{} back to ready", task.id)
+            emit(ui, &task, || {
+                confirm(ui, "released", task.id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
@@ -517,19 +573,7 @@ fn dispatch(
                 "active_claims": status.active_claims,
                 "expired_claims": status.expired_claims,
             });
-            emit(json, &body, || {
-                println!("{}", backend.describe());
-                println!("inbox: {}", status.counts.inbox);
-                println!("ready: {}", status.counts.ready);
-                println!("claimed: {}", status.counts.claimed);
-                println!("in_progress: {}", status.counts.in_progress);
-                println!("review: {}", status.counts.review);
-                println!("blocked: {}", status.counts.blocked);
-                println!("done: {}", status.counts.done);
-                println!("cancelled: {}", status.counts.cancelled);
-                println!("active claims: {}", status.active_claims);
-                println!("expired claims: {}", status.expired_claims);
-            });
+            emit(ui, &body, || print_status(backend, &status, ui.out));
             Ok(())
         }
         Commands::RecoverStale { to } => {
@@ -541,14 +585,16 @@ fn dispatch(
                 to,
                 actor: human_actor(),
             })?;
-            emit(json, &serde_json::json!({"recovered": recovered}), || {
+            emit(ui, &serde_json::json!({"recovered": recovered}), || {
                 if recovered.is_empty() {
                     println!("no expired claims");
                 } else {
                     for record in &recovered {
                         println!(
-                            "recovered #{} {} -> {}",
-                            record.task_id, record.previous_status, record.new_status,
+                            "recovered {} {} -> {}",
+                            ui.out.dim(&format!("#{}", record.task_id)),
+                            ui.out.status(record.previous_status.as_str()),
+                            ui.out.status(record.new_status.as_str()),
                         );
                     }
                 }
@@ -557,24 +603,19 @@ fn dispatch(
         }
         Commands::Events { id } => {
             let events = queue.events(id)?;
-            emit(json, &serde_json::json!({"events": events}), || {
-                for event in &events {
-                    println!(
-                        "#{} {} {} {}",
-                        event.id, event.event_type, event.actor_type, event.created_at
-                    );
-                }
+            emit(ui, &serde_json::json!({"events": events}), || {
+                print_events(&events, ui.out, "");
             });
             Ok(())
         }
         Commands::Reopen { id } => {
             let task = queue.reopen(id, human_actor())?;
-            emit(json, &task, || {
-                println!("reopened #{} as {}", task.id, task.status);
+            emit(ui, &task, || {
+                confirm(ui, "reopened", task.id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
-        Commands::Feature { command } => dispatch_feature(queue, command, json),
+        Commands::Feature { command } => dispatch_feature(queue, command, ui),
         Commands::Project { .. }
         | Commands::Mcp
         | Commands::Serve { .. }
@@ -587,7 +628,7 @@ fn dispatch(
 fn dispatch_feature(
     queue: &dyn QueueService,
     command: FeatureCommand,
-    json: bool,
+    ui: &Ui,
 ) -> Result<(), CliError> {
     match command {
         FeatureCommand::Create { title, body } => {
@@ -596,36 +637,51 @@ fn dispatch_feature(
                 body,
             })?;
             let id = feature.id;
-            emit(json, &feature, || {
-                println!("created feature #{id} {}", feature.title);
+            emit(ui, &feature, || {
+                println!(
+                    "created feature {} {}",
+                    ui.out.dim(&format!("#{id}")),
+                    ui.out.bold(&feature.title),
+                );
             });
             Ok(())
         }
         FeatureCommand::Ls => {
             let features = queue.list_features()?;
-            emit(json, &serde_json::json!({"features": features}), || {
-                print_feature_list(&features);
+            emit(ui, &serde_json::json!({"features": features}), || {
+                print_feature_list(&features, ui.out);
             });
             Ok(())
         }
         FeatureCommand::Show { id } => {
             let feature = queue.get_feature(id)?;
-            emit(json, &feature, || print_feature(&feature));
+            emit(ui, &feature, || print_feature(&feature, ui.out));
             Ok(())
         }
         FeatureCommand::Edit { id, title, body } => {
+            if title.is_none() && body.is_none() {
+                return Err(CliError::message(
+                    "no changes specified; pass --title or --body",
+                ));
+            }
             let feature = queue.edit_feature(id, EditFeatureRequest { title, body })?;
-            emit(json, &feature, || {
-                println!("updated feature #{}", feature.id);
+            emit(ui, &feature, || {
+                println!(
+                    "updated feature {} {}",
+                    ui.out.dim(&format!("#{}", feature.id)),
+                    ui.out.bold(&feature.title),
+                );
             });
             Ok(())
         }
         FeatureCommand::Delete { id } => {
             let outcome = queue.delete_feature(id)?;
-            emit(json, &outcome, || {
+            emit(ui, &outcome, || {
                 println!(
-                    "deleted feature #{} {} ({} tasks detached)",
-                    outcome.id, outcome.title, outcome.tasks_detached
+                    "deleted feature {} {} ({} tasks detached)",
+                    ui.out.dim(&format!("#{}", outcome.id)),
+                    ui.out.bold(&outcome.title),
+                    outcome.tasks_detached
                 );
             });
             Ok(())
@@ -639,6 +695,7 @@ fn init_project(
     project: Option<String>,
     yes: bool,
     force: bool,
+    paint: Paint,
 ) -> Result<(), CliError> {
     let context = resolve_context(directory, repo, project)?;
     let root = context.git_root.clone().ok_or_else(|| {
@@ -651,17 +708,17 @@ fn init_project(
             path.display()
         )));
     }
-    if !yes && !confirm(&path)? {
+    if !yes && !confirm_write(&path)? {
         return Err(CliError::message(
             "refusing to write .agentqueue.toml without confirmation; pass --yes",
         ));
     }
     fs::write(&path, render_init_config(&context))?;
-    println!("wrote {}", path.display());
+    println!("wrote {}", paint.dim(&path.display().to_string()));
     Ok(())
 }
 
-fn confirm(path: &Path) -> Result<bool, CliError> {
+fn confirm_write(path: &Path) -> Result<bool, CliError> {
     if !io::stdin().is_terminal() {
         return Ok(false);
     }
@@ -742,10 +799,9 @@ fn parse_ids(value: Option<&str>) -> Result<Vec<i64>, CliError> {
         if part.is_empty() {
             continue;
         }
-        ids.push(
-            part.parse::<i64>()
-                .map_err(|_| CliError::message(format!("invalid task id '{part}'")))?,
-        );
+        ids.push(part.parse::<i64>().map_err(|_| {
+            CliError::message(format!("invalid task id '{part}'; expected an integer"))
+        })?);
     }
     Ok(ids)
 }
@@ -787,8 +843,8 @@ fn edit_in_editor(current: &str) -> Result<Option<String>, CliError> {
     Ok(Some(body))
 }
 
-fn emit(json: bool, value: &impl serde::Serialize, human: impl FnOnce()) {
-    if json {
+fn emit(ui: &Ui, value: &impl serde::Serialize, human: impl FnOnce()) {
+    if ui.json {
         serde_json::to_writer_pretty(io::stdout(), value).expect("write json");
         println!();
     } else {
@@ -796,28 +852,114 @@ fn emit(json: bool, value: &impl serde::Serialize, human: impl FnOnce()) {
     }
 }
 
-fn print_context(context: &ProjectContext) {
-    println!("source: {:?}", context.source);
-    println!("project: {}", context.project.as_deref().unwrap_or("-"));
-    println!("repo: {}", context.repo.as_deref().unwrap_or("-"));
-    println!("capture_path: {}", context.capture_path.display());
+fn confirm(ui: &Ui, verb: &str, id: i64, status: &str, title: &str) {
     println!(
-        "repo_relative_path: {}",
-        context.repo_relative_path.as_deref().unwrap_or("-")
+        "{verb} {} [{}] {}",
+        ui.out.dim(&format!("#{id}")),
+        ui.out.status(status),
+        ui.out.bold(title),
     );
-    println!(
-        "git_root: {}",
-        context
-            .git_root
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".into())
+}
+
+fn meta(paint: Paint, line: &str) {
+    println!("{}", paint.dim(line));
+}
+
+fn print_context(context: &ProjectContext, paint: Paint) {
+    meta(paint, &format!("source: {}", source_name(context.source)));
+    meta(
+        paint,
+        &format!("project: {}", context.project.as_deref().unwrap_or("-")),
     );
-    println!("git_head: {}", context.git_head.as_deref().unwrap_or("-"));
-    println!(
-        "agent_pool: {}",
-        context.agent_pool.as_deref().unwrap_or("-")
+    meta(
+        paint,
+        &format!("repo: {}", context.repo.as_deref().unwrap_or("-")),
     );
+    meta(
+        paint,
+        &format!("capture_path: {}", context.capture_path.display()),
+    );
+    meta(
+        paint,
+        &format!(
+            "repo_relative_path: {}",
+            context.repo_relative_path.as_deref().unwrap_or("-")
+        ),
+    );
+    meta(
+        paint,
+        &format!(
+            "git_root: {}",
+            context
+                .git_root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".into())
+        ),
+    );
+    meta(
+        paint,
+        &format!("git_head: {}", context.git_head.as_deref().unwrap_or("-")),
+    );
+    meta(
+        paint,
+        &format!(
+            "agent_pool: {}",
+            context.agent_pool.as_deref().unwrap_or("-")
+        ),
+    );
+}
+
+fn source_name(source: q_project::ContextSource) -> &'static str {
+    match source {
+        q_project::ContextSource::Explicit => "explicit",
+        q_project::ContextSource::PathRule => "path_rule",
+        q_project::ContextSource::ConfigFile => "config_file",
+        q_project::ContextSource::Git => "git",
+        q_project::ContextSource::GlobalMapping => "global_mapping",
+        q_project::ContextSource::Unassigned => "unassigned",
+    }
+}
+
+fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
+    println!("{}", backend.describe(paint));
+    for (label, count) in [
+        ("inbox", status.counts.inbox),
+        ("ready", status.counts.ready),
+        ("claimed", status.counts.claimed),
+        ("in_progress", status.counts.in_progress),
+        ("review", status.counts.review),
+        ("blocked", status.counts.blocked),
+        ("done", status.counts.done),
+        ("cancelled", status.counts.cancelled),
+    ] {
+        println!("{}: {count}", paint.status(label));
+    }
+    println!("active claims: {}", status.active_claims);
+    if status.expired_claims > 0 {
+        println!(
+            "{}: {}",
+            paint.paint(
+                Style::new().fg_color(Some(anstyle::AnsiColor::Red.into())),
+                "expired claims"
+            ),
+            status.expired_claims
+        );
+    } else {
+        println!("expired claims: {}", status.expired_claims);
+    }
+}
+
+fn print_events(events: &[q_core::Event], paint: Paint, indent: &str) {
+    for event in events {
+        println!(
+            "{indent}{} {} {} {}",
+            paint.dim(&format!("#{}", event.id)),
+            event.event_type,
+            paint.dim(&event.actor_type),
+            paint.dim(&format_timestamp(event.created_at)),
+        );
+    }
 }
 
 const TITLE_MAX_CHARS: usize = 64;
@@ -833,27 +975,28 @@ struct TaskListRow {
     title: String,
 }
 
-fn print_task_list(tasks: &[TaskSummary]) {
+fn print_task_list(tasks: &[TaskSummary], paint: Paint) {
     if tasks.is_empty() {
         println!("no tasks");
         return;
     }
-    println!("{}", render_task_table(tasks));
+    println!("{}", render_task_table(tasks, paint));
 }
 
-fn render_task_table(tasks: &[TaskSummary]) -> String {
-    let rows: Vec<TaskListRow> = tasks.iter().map(task_list_row).collect();
-    render_task_rows(&rows)
+fn render_task_table(tasks: &[TaskSummary], paint: Paint) -> String {
+    let now = OffsetDateTime::now_utc();
+    let rows: Vec<TaskListRow> = tasks.iter().map(|task| task_list_row(task, now)).collect();
+    render_task_rows_painted(&rows, paint)
 }
 
-fn task_list_row(task: &TaskSummary) -> TaskListRow {
+fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
     TaskListRow {
         id: task.id.to_string(),
         status: task.status.to_string(),
         feature: display_project(task.feature.as_deref()),
         project: display_project(task.project.as_deref()),
         priority: task.priority.to_string(),
-        updated: format_timestamp(task.updated_at),
+        updated: style::format_relative(task.updated_at, now),
         title: format_list_title(&task.title),
     }
 }
@@ -880,7 +1023,12 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+#[cfg(test)]
 fn render_task_rows(rows: &[TaskListRow]) -> String {
+    render_task_rows_painted(rows, Paint::plain())
+}
+
+fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
     let headers = [
         "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
     ];
@@ -894,9 +1042,25 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
         column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
     ];
+    let header_styles = [style::dim_style(); 7];
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push(format_task_line(&headers, &widths, &align_right));
+    lines.push(format_task_line(
+        &headers,
+        &header_styles,
+        &widths,
+        &align_right,
+        paint,
+    ));
     for row in rows {
+        let styles = [
+            style::dim_style(),
+            style::status_style(&row.status),
+            style::dim_style(),
+            style::dim_style(),
+            style::dim_style(),
+            style::dim_style(),
+            style::bold_style(),
+        ];
         lines.push(format_task_line(
             &[
                 row.id.as_str(),
@@ -907,8 +1071,10 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
                 row.updated.as_str(),
                 row.title.as_str(),
             ],
+            &styles,
             &widths,
             &align_right,
+            paint,
         ));
     }
     lines.join("\n")
@@ -922,33 +1088,44 @@ fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usiz
         .unwrap_or(0)
 }
 
-fn format_task_line(cells: &[&str], widths: &[usize], align_right: &[bool]) -> String {
+fn format_task_line(
+    cells: &[&str],
+    styles: &[Style],
+    widths: &[usize],
+    align_right: &[bool],
+    paint: Paint,
+) -> String {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index > 0 {
             line.push_str("  ");
         }
         let width = widths[index];
+        let pad = width.saturating_sub(cell.chars().count());
+        let painted = paint.paint(styles[index], cell);
         if align_right[index] {
-            line.push_str(&format!("{cell:>width$}"));
+            line.push_str(&" ".repeat(pad));
+            line.push_str(&painted);
         } else {
-            line.push_str(&format!("{cell:<width$}"));
+            line.push_str(&painted);
+            line.push_str(&" ".repeat(pad));
         }
     }
     line
 }
 
-fn print_feature_list(features: &[q_core::Feature]) {
+fn print_feature_list(features: &[q_core::Feature], paint: Paint) {
     if features.is_empty() {
         println!("no features");
         return;
     }
+    let now = OffsetDateTime::now_utc();
     let rows: Vec<FeatureListRow> = features
         .iter()
         .map(|feature| FeatureListRow {
             id: feature.id.to_string(),
             tasks: feature.task_count.to_string(),
-            updated: format_timestamp(feature.updated_at),
+            updated: style::format_relative(feature.updated_at, now),
             title: format_list_title(&feature.title),
         })
         .collect();
@@ -960,7 +1137,17 @@ fn print_feature_list(features: &[q_core::Feature]) {
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
         column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
     ];
-    println!("{}", format_task_line(&headers, &widths, &align_right));
+    let header_styles = [style::dim_style(); 4];
+    println!(
+        "{}",
+        format_task_line(&headers, &header_styles, &widths, &align_right, paint)
+    );
+    let styles = [
+        style::dim_style(),
+        style::dim_style(),
+        style::dim_style(),
+        style::bold_style(),
+    ];
     for row in &rows {
         println!(
             "{}",
@@ -971,8 +1158,10 @@ fn print_feature_list(features: &[q_core::Feature]) {
                     row.updated.as_str(),
                     row.title.as_str(),
                 ],
+                &styles,
                 &widths,
                 &align_right,
+                paint,
             )
         );
     }
@@ -985,12 +1174,22 @@ struct FeatureListRow {
     title: String,
 }
 
-fn print_feature(feature: &q_core::Feature) {
-    println!("#{} {}", feature.id, feature.title);
-    println!("tasks: {}", feature.task_count);
-    println!("public_id: {}", feature.public_id);
-    println!("created_at: {}", format_timestamp(feature.created_at));
-    println!("updated_at: {}", format_timestamp(feature.updated_at));
+fn print_feature(feature: &q_core::Feature, paint: Paint) {
+    println!(
+        "{} {}",
+        paint.dim(&format!("#{}", feature.id)),
+        paint.bold(&feature.title),
+    );
+    meta(paint, &format!("tasks: {}", feature.task_count));
+    meta(paint, &format!("public_id: {}", feature.public_id));
+    meta(
+        paint,
+        &format!("created_at: {}", format_timestamp(feature.created_at)),
+    );
+    meta(
+        paint,
+        &format!("updated_at: {}", format_timestamp(feature.updated_at)),
+    );
     if let Some(body) = &feature.body {
         println!("\n{body}");
     }
@@ -998,11 +1197,16 @@ fn print_feature(feature: &q_core::Feature) {
 
 const TREE_STATUS_WIDTH: usize = 11;
 
-fn print_tree(tree: &TaskTree) {
-    println!("{}", render_tree(tree));
+fn print_tree(tree: &TaskTree, paint: Paint) {
+    println!("{}", render_tree_with(tree, paint));
 }
 
+#[cfg(test)]
 fn render_tree(tree: &TaskTree) -> String {
+    render_tree_with(tree, Paint::plain())
+}
+
+fn render_tree_with(tree: &TaskTree, paint: Paint) -> String {
     if tree.roots.is_empty() {
         return match &tree.feature {
             Some(feature) => format!("no tasks in {}", feature.title),
@@ -1016,7 +1220,7 @@ fn render_tree(tree: &TaskTree) -> String {
         .or_else(|| tree.roots.first().and_then(|node| node.feature_id));
     tree.roots
         .iter()
-        .map(|root| render_tree_node(root, "", true, true, anchor))
+        .map(|root| render_tree_node(root, "", true, true, anchor, paint))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1027,6 +1231,7 @@ fn render_tree_node(
     is_root: bool,
     is_last: bool,
     anchor: Option<i64>,
+    paint: Paint,
 ) -> String {
     let connector = if is_root {
         ""
@@ -1035,11 +1240,15 @@ fn render_tree_node(
     } else {
         "├── "
     };
-    let status = format!("{:<TREE_STATUS_WIDTH$}", node.status.as_str());
+    let label = node.status.as_str();
+    let pad = TREE_STATUS_WIDTH.saturating_sub(label.chars().count());
+    let status = format!("{}{}", paint.status(label), " ".repeat(pad));
     let mut line = format!(
-        "{prefix}{connector}#{id}  {status}  {title}",
-        id = node.id,
-        title = format_list_title(&node.title),
+        "{prefix}{connector}{id}  {status}  {title}",
+        prefix = paint.dim(prefix),
+        connector = paint.dim(connector),
+        id = paint.dim(&format!("#{}", node.id)),
+        title = paint.bold(&format_list_title(&node.title)),
     );
     if let Some(project) = node
         .project
@@ -1047,27 +1256,23 @@ fn render_tree_node(
         .map(str::trim)
         .filter(|text| !text.is_empty())
     {
-        line.push_str("  [");
-        line.push_str(project);
-        line.push(']');
+        line.push_str(&paint.dim(&format!("  [{project}]")));
     }
     if let Some(feature) = node
         .feature
         .as_deref()
         .filter(|_| show_tree_feature(node, anchor))
     {
-        line.push_str("  {");
-        line.push_str(&format_list_title(feature));
-        line.push('}');
+        line.push_str(&paint.dim(&format!("  {{{}}}", format_list_title(feature))));
     }
     if node.external {
-        line.push_str("  (external)");
+        line.push_str(&paint.dim("  (external)"));
     }
     if node.already_shown {
-        line.push_str("  (already shown)");
+        line.push_str(&paint.dim("  (already shown)"));
     }
     if node.cycle {
-        line.push_str("  (cycle)");
+        line.push_str(&paint.dim("  (cycle)"));
     }
     let child_prefix = if is_root {
         String::new()
@@ -1079,7 +1284,14 @@ fn render_tree_node(
     let mut lines = vec![line];
     for (index, child) in node.depends_on.iter().enumerate() {
         let last = index + 1 == node.depends_on.len();
-        lines.push(render_tree_node(child, &child_prefix, false, last, anchor));
+        lines.push(render_tree_node(
+            child,
+            &child_prefix,
+            false,
+            last,
+            anchor,
+            paint,
+        ));
     }
     lines.join("\n")
 }
@@ -1092,26 +1304,73 @@ fn show_tree_feature(node: &TreeNode, anchor: Option<i64>) -> bool {
     }
 }
 
-fn print_detail(detail: &q_core::TaskDetail) {
+fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
     let task = &detail.task;
-    println!("#{} {} [{}]", task.id, task.title, task.status);
     println!(
-        "kind: {}  risk: {}  priority: {}",
-        task.kind, task.risk, task.priority
+        "{} {} [{}]",
+        paint.dim(&format!("#{}", task.id)),
+        paint.bold(&task.title),
+        paint.status(task.status.as_str()),
     );
-    println!("project: {}", task.project.as_deref().unwrap_or("-"));
-    println!("repo: {}", task.repo.as_deref().unwrap_or("-"));
-    println!("feature: {}", task.feature.as_deref().unwrap_or("-"));
-    println!("capture_path: {}", task.capture_path);
-    if let Some(relative) = &task.repo_relative_path {
-        println!("repo_relative_path: {relative}");
+    meta(
+        paint,
+        &format!(
+            "kind: {}  risk: {}  priority: {}",
+            task.kind, task.risk, task.priority
+        ),
+    );
+    meta(
+        paint,
+        &format!("project: {}", task.project.as_deref().unwrap_or("-")),
+    );
+    meta(
+        paint,
+        &format!("repo: {}", task.repo.as_deref().unwrap_or("-")),
+    );
+    meta(
+        paint,
+        &format!("feature: {}", task.feature.as_deref().unwrap_or("-")),
+    );
+    if !task.dependencies.is_empty() {
+        let ids = task
+            .dependencies
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        meta(paint, &format!("depends_on: {ids}"));
     }
-    println!("original_capture: {}", task.original_capture);
+    if !task.required_capabilities.is_empty() {
+        meta(
+            paint,
+            &format!("capabilities: {}", task.required_capabilities.join(", ")),
+        );
+    }
+    if let Some(pool) = &task.agent_pool {
+        meta(paint, &format!("agent_pool: {pool}"));
+    }
+    meta(
+        paint,
+        &format!("created_at: {}", format_timestamp(task.created_at)),
+    );
+    meta(
+        paint,
+        &format!("updated_at: {}", format_timestamp(task.updated_at)),
+    );
+    meta(paint, &format!("public_id: {}", task.public_id));
+    meta(paint, &format!("capture_path: {}", task.capture_path));
+    if let Some(relative) = &task.repo_relative_path {
+        meta(paint, &format!("repo_relative_path: {relative}"));
+    }
+    meta(
+        paint,
+        &format!("original_capture: {}", task.original_capture),
+    );
     if let Some(body) = &task.body {
         println!("\n{body}");
     }
     if !detail.acceptance_criteria.is_empty() {
-        println!("\nacceptance criteria:");
+        println!("\n{}", paint.bold("acceptance criteria:"));
         for item in &detail.acceptance_criteria {
             println!("- {item}");
         }
@@ -1121,16 +1380,26 @@ fn print_detail(detail: &q_core::TaskDetail) {
             "\nclaim: agent={} active={} token={}",
             claim.agent_id, claim.active, claim.token
         );
-        println!("lease_expires_at: {}", claim.lease_expires_at);
+        meta(
+            paint,
+            &format!(
+                "lease_expires_at: {}",
+                format_timestamp(claim.lease_expires_at)
+            ),
+        );
         if let Some(branch) = &claim.branch {
-            println!("branch: {branch}");
+            meta(paint, &format!("branch: {branch}"));
         }
     }
     if !detail.artifacts.is_empty() {
-        println!("\nartifacts:");
+        println!("\n{}", paint.bold("artifacts:"));
         for artifact in &detail.artifacts {
             println!("- {}: {}", artifact.kind, artifact.value);
         }
+    }
+    if !detail.events.is_empty() {
+        println!("\n{}", paint.bold("events:"));
+        print_events(&detail.events, paint, "  ");
     }
 }
 
@@ -1155,9 +1424,24 @@ impl std::fmt::Display for CliError {
 
 impl From<QueueError> for CliError {
     fn from(error: QueueError) -> Self {
-        Self {
-            message: error.to_string(),
-        }
+        let message = match error {
+            QueueError::NotFound(id) => format!("task {id} not found; try `q ls --all`"),
+            QueueError::FeatureNotFound(name) => {
+                format!("feature not found: {name}; try `q feature ls`")
+            }
+            QueueError::InvalidTransition { from, to } => {
+                format!("cannot move from {from} to {to}")
+            }
+            QueueError::TokenMismatch => {
+                "claim token does not match the active claim; pass the token from `q claim`"
+                    .to_string()
+            }
+            QueueError::ClaimExpired => {
+                "claim lease has expired; claim again or run `q recover-stale`".to_string()
+            }
+            other => other.to_string(),
+        };
+        Self { message }
     }
 }
 
@@ -1172,8 +1456,8 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_project, format_list_title, render_task_rows, render_tree, truncate_chars,
-        TaskListRow, TITLE_MAX_CHARS,
+        display_project, format_list_title, render_task_rows, render_task_rows_painted,
+        render_tree, render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
     };
     use q_core::{TaskStatus, TaskTree, TreeFeature, TreeNode};
 
@@ -1253,7 +1537,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
-                updated: "2026-09-22T20:04:00Z".into(),
+                updated: "3m ago".into(),
                 title: "Keep the inbox item".into(),
             },
             TaskListRow {
@@ -1262,7 +1546,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "beta".into(),
                 priority: "1".into(),
-                updated: "2026-09-22T20:02:00Z".into(),
+                updated: "1h ago".into(),
                 title: "Compare encodings".into(),
             },
             TaskListRow {
@@ -1271,7 +1555,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "0".into(),
-                updated: "2026-09-22T20:01:00Z".into(),
+                updated: "2d ago".into(),
                 title: "Unassigned capture".into(),
             },
         ];
@@ -1284,11 +1568,52 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
- 4  inbox   (none)   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
- 2  ready   (none)   beta       1  2026-09-22T20:02:00Z  Compare encodings
- 1  inbox   (none)   (none)     0  2026-09-22T20:01:00Z  Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
+ 4  inbox   (none)   alpha      0  3m ago   Keep the inbox item
+ 2  ready   (none)   beta       1  1h ago   Compare encodings
+ 1  inbox   (none)   (none)     0  2d ago   Unassigned capture"
         );
+    }
+
+    #[test]
+    fn color_does_not_change_visible_table_or_tree() {
+        let rows = vec![TaskListRow {
+            id: "2".into(),
+            status: "ready".into(),
+            feature: "(none)".into(),
+            project: "beta".into(),
+            priority: "1".into(),
+            updated: "3m ago".into(),
+            title: "Compare encodings".into(),
+        }];
+        let plain = render_task_rows(&rows);
+        let colored = render_task_rows_painted(&rows, crate::style::Paint::color());
+        assert!(colored.contains('\u{1b}'));
+        assert_eq!(anstream::adapter::strip_str(&colored).to_string(), plain);
+        assert!(colored.contains("32"));
+
+        let node = TreeNode {
+            id: 2,
+            status: TaskStatus::Blocked,
+            title: "Write the schema".into(),
+            project: Some("api".into()),
+            feature_id: None,
+            feature: None,
+            external: false,
+            already_shown: false,
+            cycle: false,
+            depends_on: vec![],
+        };
+        let tree = TaskTree {
+            feature: None,
+            roots: vec![node],
+        };
+        let plain = render_tree(&tree);
+        let colored = render_tree_with(&tree, crate::style::Paint::color());
+        assert!(colored.contains('\u{1b}'));
+        assert!(colored.contains("31"));
+        assert_eq!(anstream::adapter::strip_str(&colored).to_string(), plain);
+        assert!(plain.contains("└──") || plain.starts_with("#2"));
     }
 
     #[test]

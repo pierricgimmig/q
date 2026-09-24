@@ -772,6 +772,8 @@ dependencies = [
 name = "q-cli"
 version = "0.1.0"
 dependencies = [
+ "anstream",
+ "anstyle",
  "clap",
  "q-core",
  "q-http",
@@ -780,6 +782,7 @@ dependencies = [
  "q-store",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",

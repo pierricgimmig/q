@@ -124,7 +124,7 @@ q feature delete 1
 
 ```bash
 q ls
-q ls --all
+q ls -a
 q ls --status inbox
 q ls --status cancelled
 q show 184
@@ -136,15 +136,17 @@ q cancel 184
 q delete 184
 ```
 
-`q ls` (alias `q list`) hides `done` and `cancelled`. `--all` includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`.
+`q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
 
-Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `--json` prints the same rows as `{"tasks":[...]}`.
+Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
+
+On a terminal, status is colored: `inbox` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` dim green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
 
 ```text
-ID  STATUS  FEATURE  PROJECT  PRI  UPDATED               TITLE
- 4  inbox   (none)   alpha      0  2026-09-22T20:04:00Z  Keep the inbox item
- 2  ready   (none)   beta       1  2026-09-22T20:02:00Z  Compare encodings
- 1  inbox   (none)   (none)     0  2026-09-22T20:01:00Z  Unassigned capture
+ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
+ 4  inbox   (none)   alpha      0  3m ago   Keep the inbox item
+ 2  ready   (none)   beta       1  1h ago   Compare encodings
+ 1  inbox   (none)   (none)     0  2d ago   Unassigned capture
 ```
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
@@ -163,7 +165,7 @@ q tree 12 --json
 
 A task with no dependencies is one line. `--feature` prints every task in that feature. Roots are the tasks that no other task in the feature depends on, including tasks that depend on nothing. A dependency outside the feature is marked `(external)` and still expanded. A feature name in `{braces}` appears when it is not the feature you asked for. If a task would show up twice, the later copy says `(already shown)` and is not expanded again. An empty feature prints `no tasks in <title>`.
 
-Titles use the same 64-character ellipsis as `q ls`.
+Titles use the same 64-character ellipsis as `q ls`. Status words use the same colors as the list. Connectors stay the box-drawing characters below.
 
 ```text
 #3  inbox        Ship the rollout  [api]
@@ -316,9 +318,15 @@ CLI, MCP, and the HTTP transport depend on the service trait. They do not run SQ
 
 ## Tests
 
+CI (`.github/workflows/ci.yml`) runs these on every pull request and push to `main`. Build and test run on Linux, macOS, and Windows.
+
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo build --workspace --all-targets --locked
+cargo test --workspace --locked
+cargo deny --all-features --locked check   # cargo install --locked cargo-deny
 ```
+
+`--locked` fails if `Cargo.lock` is out of date, so run `cargo update -p <crate>` or a plain `cargo build` first when you change dependencies. The dependency policy (advisories, licenses, duplicate versions, sources) lives in `deny.toml`. A scheduled weekly run re-checks advisories against the current lockfile.
