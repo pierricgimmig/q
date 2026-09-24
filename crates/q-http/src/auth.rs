@@ -331,12 +331,17 @@ mod tests {
         assert!(store.snapshot().find_by_secret(&secret).is_some());
 
         // The store notices a token added after it was opened.
-        let file = std::fs::File::open(&path).unwrap();
-        let before = file.metadata().unwrap().modified().unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
         let agent = AuthConfig::create_token(&path, "bot", Role::Agent).unwrap();
         // Coarse mtime file systems may not advance within one test; force it.
+        // Windows needs a writable handle to set the time.
         let bumped = before + std::time::Duration::from_secs(2);
-        file.set_modified(bumped).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
         let snapshot = store.snapshot();
         assert_eq!(snapshot.tokens.len(), 2);
         assert_eq!(snapshot.find_by_secret(&agent).unwrap().role, Role::Agent);
