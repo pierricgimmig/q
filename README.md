@@ -280,9 +280,15 @@ CLI and MCP depend on the service trait. They do not run SQL.
 
 ## Tests
 
+CI (`.github/workflows/ci.yml`) runs these on every pull request and push to `main`. Build and test run on Linux, macOS, and Windows.
+
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release
+cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo build --workspace --all-targets --locked
+cargo test --workspace --locked
+cargo deny --all-features --locked check   # cargo install --locked cargo-deny
 ```
+
+`--locked` fails if `Cargo.lock` is out of date, so run `cargo update -p <crate>` or a plain `cargo build` first when you change dependencies. The dependency policy (advisories, licenses, duplicate versions, sources) lives in `deny.toml`. A scheduled weekly run re-checks advisories against the current lockfile.
