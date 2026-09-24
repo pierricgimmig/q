@@ -150,7 +150,7 @@ fn mcp_stdio_is_protocol_clean() {
     let db_dir = temp_root("mcp");
     let db = db_dir.join("queue.db");
     let mut child = bin()
-        .args(["mcp", "--db", db.to_str().unwrap()])
+        .args(["--color", "always", "mcp", "--db", db.to_str().unwrap()])
         .env("RUST_LOG", "info")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -173,6 +173,7 @@ fn mcp_stdio_is_protocol_clean() {
     let init: Value = serde_json::from_str(line.trim()).expect("initialize response");
     assert_eq!(init["result"]["serverInfo"]["name"], "q");
     assert!(!line.contains("INFO"));
+    assert!(!line.contains('\u{1b}'), "{line}");
 
     writeln!(
         stdin,
@@ -504,7 +505,14 @@ fn assert_aligned_table(table: &str) {
     let project_at = char_index(header, "PROJECT");
     let updated_at = char_index(header, "UPDATED");
     for line in &lines[1..] {
-        assert_eq!(char_index(line, "2026-"), updated_at, "{line}");
+        let updated = &line[byte_at(line, updated_at)..];
+        assert!(
+            updated.starts_with("just now")
+                || updated.contains(" ago")
+                || updated.starts_with("in "),
+            "{line}"
+        );
+        assert!(!updated.contains("T"), "{line}");
         let project = line
             .chars()
             .skip(project_at)
@@ -823,4 +831,163 @@ fn char_index(line: &str, needle: &str) -> usize {
         .find(needle)
         .unwrap_or_else(|| panic!("missing {needle} in {line}"));
     line[..byte].chars().count()
+}
+
+fn byte_at(line: &str, at: usize) -> usize {
+    line.char_indices()
+        .nth(at)
+        .map(|(index, _)| index)
+        .unwrap_or(line.len())
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[test]
+fn color_flags_leave_json_and_piped_auto_plain() {
+    let root = temp_root("color");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let captured = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "--color",
+        "always",
+        "Capture a colored inbox task",
+    ]));
+    assert!(!captured.stdout.contains(&0x1b));
+    let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    let id = created["id"].as_i64().unwrap().to_string();
+    assert!(created["updated_at"].as_str().unwrap().contains('T'));
+
+    run(bin().args(["--db", db_arg, "ready", &id]));
+    let cancelled = run(bin().args(["--db", db_arg, "--json", "add", "Cancelled row"]));
+    let cancelled: Value = serde_json::from_slice(&cancelled.stdout).unwrap();
+    let cancelled_id = cancelled["id"].as_i64().unwrap().to_string();
+    run(bin().args(["--db", db_arg, "cancel", &cancelled_id]));
+
+    let plain = run(bin()
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["--db", db_arg, "--color", "never", "ls", "--all"]));
+    let plain_text = String::from_utf8(plain.stdout.clone()).unwrap();
+    assert!(!plain_text.contains('\u{1b}'));
+    assert!(plain_text.contains("just now") || plain_text.contains(" ago"));
+    assert!(plain_text.contains("ready"));
+    assert!(plain_text.contains("cancelled"));
+
+    let forced = run(bin()
+        .env_remove("NO_COLOR")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--db", db_arg, "--color", "auto", "ls", "--all"]));
+    let forced_text = String::from_utf8(forced.stdout).unwrap();
+    assert!(forced_text.contains('\u{1b}'), "{forced_text}");
+    assert_eq!(strip_ansi(&forced_text), plain_text);
+    assert!(forced_text.contains("32"), "ready should be green");
+    assert!(
+        forced_text.contains('9'),
+        "cancelled should be struck through"
+    );
+
+    let no_color = run(bin()
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["--db", db_arg, "--color", "auto", "ls", "--all"]));
+    assert!(!String::from_utf8(no_color.stdout)
+        .unwrap()
+        .contains('\u{1b}'));
+
+    let empty_no_color = run(bin()
+        .env("NO_COLOR", "")
+        .env("CLICOLOR_FORCE", "1")
+        .env_remove("CLICOLOR")
+        .args(["--db", db_arg, "--color", "auto", "ls", "--all"]));
+    assert!(
+        String::from_utf8(empty_no_color.stdout)
+            .unwrap()
+            .contains('\u{1b}'),
+        "an empty NO_COLOR must not disable color"
+    );
+
+    let always = run(bin()
+        .env("NO_COLOR", "1")
+        .args(["--db", db_arg, "--color", "always", "ls", "--all"]));
+    let always_text = String::from_utf8(always.stdout).unwrap();
+    assert!(always_text.contains('\u{1b}'));
+    assert_eq!(strip_ansi(&always_text), plain_text);
+
+    let auto_pipe = run(bin()
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["--db", db_arg, "ls", "--all"]));
+    assert!(!auto_pipe.stdout.contains(&0x1b));
+
+    let show_plain = run(bin().args(["--db", db_arg, "--color", "never", "show", &id]));
+    let show_plain = String::from_utf8(show_plain.stdout).unwrap();
+    assert!(show_plain.contains("created_at: "));
+    assert!(
+        show_plain.contains('T') && show_plain.contains('Z'),
+        "{show_plain}"
+    );
+    assert!(!show_plain.contains(" ago"), "{show_plain}");
+    assert!(show_plain.contains("events:"), "{show_plain}");
+
+    let show_color = run(bin().args(["--db", db_arg, "--color", "always", "show", &id]));
+    let show_color = String::from_utf8(show_color.stdout).unwrap();
+    assert!(show_color.contains('\u{1b}'));
+    assert_eq!(strip_ansi(&show_color), show_plain);
+
+    let tree_plain = run(bin().args(["--db", db_arg, "--color", "never", "tree", &id]));
+    let tree_color = run(bin().args(["--db", db_arg, "--color", "always", "tree", &id]));
+    let tree_plain = String::from_utf8(tree_plain.stdout).unwrap();
+    let tree_color = String::from_utf8(tree_color.stdout).unwrap();
+    assert!(tree_color.contains('\u{1b}'));
+    assert!(tree_color.contains("├──") || tree_color.contains('#') || tree_plain.contains('#'));
+    assert_eq!(strip_ansi(&tree_color), tree_plain);
+
+    let json_always =
+        run(bin().args(["--db", db_arg, "--color", "always", "--json", "ls", "--all"]));
+    let json_never = run(bin().args(["--db", db_arg, "--color", "never", "--json", "ls", "--all"]));
+    assert_eq!(json_always.stdout, json_never.stdout);
+    assert!(!json_always.stdout.contains(&0x1b));
+    let body: Value = serde_json::from_slice(&json_always.stdout).unwrap();
+    assert!(body["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|task| task["updated_at"].as_str().unwrap().contains('T')));
+
+    let show_json_always =
+        run(bin().args(["--db", db_arg, "--color", "always", "--json", "show", &id]));
+    let show_json_never =
+        run(bin().args(["--db", db_arg, "--color", "never", "--json", "show", &id]));
+    assert_eq!(show_json_always.stdout, show_json_never.stdout);
+    assert!(!show_json_always.stdout.contains(&0x1b));
+
+    let tree_json_always =
+        run(bin().args(["--db", db_arg, "--color", "always", "--json", "tree", &id]));
+    let tree_json_never =
+        run(bin().args(["--db", db_arg, "--color", "never", "--json", "tree", &id]));
+    assert_eq!(tree_json_always.stdout, tree_json_never.stdout);
+    assert!(!tree_json_always.stdout.contains(&0x1b));
+
+    let _ = fs::remove_dir_all(root);
 }
