@@ -464,7 +464,7 @@ pub enum Commands {
         /// Address to listen on. Non-loopback addresses require --auth.
         #[arg(long, default_value = "127.0.0.1:7777", value_name = "ADDR")]
         bind: String,
-        /// TOML token file with [[tokens]] entries (name, role = human|agent, secret).
+        /// TOML token file with `[[tokens]]` entries (name, role = human|agent, secret).
         #[arg(long, value_name = "FILE")]
         auth: Option<PathBuf>,
     },
