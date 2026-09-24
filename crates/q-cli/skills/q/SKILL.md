@@ -48,7 +48,7 @@ q ls --feature "Cross-repo rollout"
 q edit 12 --clear-feature
 ```
 
-`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The table has feature, project, priority, and `updated_at`. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update.
+`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` (`-a`) includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The human table has feature, project, priority, and a relative `UPDATED` time, and it is colored on a terminal. Prefer `q --json` (`-j`) when reading tasks: JSON timestamps stay absolute and are never colored. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update. `q done` is `q complete`. `q rm` is `q delete`. `q recover` is `q recover-stale`.
 
 `q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready.
 

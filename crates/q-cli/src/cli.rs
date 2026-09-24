@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 pub fn preprocess(mut args: Vec<String>) -> Vec<String> {
     if let Some(index) = first_positional(&args) {
@@ -68,6 +68,10 @@ fn is_command(word: &str) -> bool {
             | "mcp"
             | "skill"
             | "help"
+            | "done"
+            | "rm"
+            | "recover"
+            | "canceled"
     )
 }
 
@@ -75,9 +79,11 @@ fn is_bool_flag(arg: &str) -> bool {
     matches!(
         arg,
         "--json"
+            | "-j"
             | "--yes"
             | "--force"
             | "--all"
+            | "-a"
             | "--help"
             | "-h"
             | "--version"
@@ -123,7 +129,20 @@ fn is_value_flag(arg: &str) -> bool {
             | "--set-project"
             | "--set-repo"
             | "--feature"
+            | "--color"
     )
+}
+
+/// When to color human stdout and stderr.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ColorMode {
+    /// Color on a terminal. Off when piped, when `NO_COLOR` is set, or when `CLICOLOR=0`.
+    #[default]
+    Auto,
+    /// ANSI color even when piped or when `NO_COLOR` is set.
+    Always,
+    /// Never emit ANSI color.
+    Never,
 }
 
 #[derive(Debug, Parser)]
@@ -139,8 +158,19 @@ pub struct Cli {
     pub db: Option<PathBuf>,
 
     /// Print machine-readable JSON on stdout. Logs stay on stderr.
-    #[arg(long, global = true)]
+    ///
+    /// JSON and `q mcp` are never colored.
+    #[arg(short = 'j', long, global = true)]
     pub json: bool,
+
+    /// Color for human output: auto, always, or never.
+    ///
+    /// auto colors a terminal and turns color off when stdout is piped, when
+    /// NO_COLOR is non-empty, or when CLICOLOR=0. CLICOLOR_FORCE turns color on
+    /// even through a pipe. always forces ANSI, including over NO_COLOR. never
+    /// disables color. JSON and `q mcp` ignore this flag.
+    #[arg(long, global = true, value_enum, default_value_t, value_name = "WHEN")]
+    pub color: ColorMode,
 
     /// Directory used for project discovery. Does not change the parent shell.
     #[arg(short = 'C', long = "directory", global = true, value_name = "DIR")]
@@ -165,20 +195,28 @@ pub enum Commands {
         /// Title words. Quoted text is the usual form: q "Fix the bug".
         #[arg(required = true, num_args = 1.., value_name = "TITLE")]
         title: Vec<String>,
+        /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+        /// Higher numbers are more urgent. Default 0.
         #[arg(long)]
         priority: Option<i32>,
+        /// low, medium, high, or external_action. Default low.
         #[arg(long, value_name = "RISK")]
         risk: Option<String>,
+        /// Markdown body. Missing sections warn on ready; they do not block it.
         #[arg(long)]
         body: Option<String>,
+        /// Read the body from a file instead of --body.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// Required capability. Repeatable. Comma-separated values are split.
         #[arg(long = "capability")]
         capability: Vec<String>,
+        /// Only agents in this pool may claim the task.
         #[arg(long, value_name = "POOL")]
         agent_pool: Option<String>,
+        /// Comma-separated task ids that must be done first.
         #[arg(long, value_name = "IDS")]
         depends_on: Option<String>,
         /// Feature id or unique title.
@@ -186,24 +224,31 @@ pub enum Commands {
         feature: Option<String>,
     },
     /// List tasks. Done and cancelled are hidden unless --all or --status is set.
-    #[command(alias = "list")]
+    #[command(visible_alias = "list")]
     Ls {
         /// Show only this status. Includes done or cancelled when that status is named.
+        ///
+        /// Statuses: inbox, ready, claimed, in_progress, review, blocked, done, cancelled.
         #[arg(long, value_name = "STATUS")]
         status: Option<String>,
+        /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
-        #[arg(long, default_value_t = 100)]
+        /// Maximum rows.
+        #[arg(short = 'n', long, default_value_t = 100)]
         limit: u32,
         /// Include done and cancelled tasks. Ignored when --status is set.
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
         /// Show only tasks in this feature. Id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
     },
     /// Show one task, its claim, artifacts, and recent events.
-    Show { id: i64 },
+    Show {
+        /// Task id.
+        id: i64,
+    },
     /// Show what must be done before a task, or before the tasks in a feature.
     ///
     /// Children are dependencies (do these first). A repeated node is marked
@@ -223,29 +268,42 @@ pub enum Commands {
     },
     /// Edit task fields. With no flags, open $VISUAL or $EDITOR on the body.
     Edit {
+        /// Task id.
         id: i64,
+        /// Replace the title.
         #[arg(long)]
         title: Option<String>,
+        /// Replace the body.
         #[arg(long)]
         body: Option<String>,
+        /// Read a replacement body from a file.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+        /// Replace the priority.
         #[arg(long)]
         priority: Option<i32>,
+        /// low, medium, high, or external_action.
         #[arg(long, value_name = "RISK")]
         risk: Option<String>,
+        /// Replace required capabilities. Repeatable. Commas are split.
         #[arg(long = "capability")]
         capability: Vec<String>,
+        /// Replace the agent pool.
         #[arg(long, value_name = "POOL")]
         agent_pool: Option<String>,
+        /// Replace dependencies with these comma-separated task ids.
         #[arg(long, value_name = "IDS")]
         depends_on: Option<String>,
+        /// Clear the project name.
         #[arg(long)]
         clear_project: bool,
+        /// Clear the repository identity.
         #[arg(long)]
         clear_repo: bool,
+        /// Clear the agent pool.
         #[arg(long)]
         clear_agent_pool: bool,
         /// Feature id or unique title.
@@ -256,20 +314,31 @@ pub enum Commands {
         clear_feature: bool,
     },
     /// Move a task to ready so agents may claim it.
-    Ready { id: i64 },
+    Ready {
+        /// Task id.
+        id: i64,
+    },
     /// Block a task. Claimed work also requires --claim-token.
     Block {
+        /// Task id.
         id: i64,
+        /// Token from `q claim`. Required when the task is claimed or in progress.
         #[arg(long)]
         claim_token: Option<String>,
     },
     /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
-    Cancel { id: i64 },
+    #[command(visible_alias = "canceled")]
+    Cancel {
+        /// Task id.
+        id: i64,
+    },
     /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
     ///
     /// Unlike cancel, nothing remains in the queue database. Events cascade with
     /// the task and are not retained. An unexpired claim requires --force.
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Task id.
         id: i64,
         /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
         #[arg(long)]
@@ -277,43 +346,59 @@ pub enum Commands {
     },
     /// Atomically claim one eligible ready task.
     Claim {
+        /// Worker id recorded on the claim.
         #[arg(long)]
         agent: String,
+        /// Capability this worker has. Repeatable. Commas are split.
         #[arg(long = "capability")]
         capability: Vec<String>,
+        /// Kind this worker accepts. Repeatable. Default: any kind.
         #[arg(long = "kind")]
         kind: Vec<String>,
         /// Default medium. High and external_action are excluded unless raised explicitly.
         #[arg(long, default_value = "medium")]
         max_risk: String,
+        /// Lease length. Default 45. Minimum 1, maximum 1440.
         #[arg(long)]
         lease_minutes: Option<u64>,
+        /// Only claim a task in this pool.
         #[arg(long, value_name = "POOL")]
         agent_pool: Option<String>,
     },
     /// Extend the lease for a matching, unexpired claim token.
     Heartbeat {
+        /// Task id.
         id: i64,
+        /// Token printed by `q claim`.
         #[arg(long)]
         claim_token: String,
+        /// New lease length in minutes. Default 45.
         #[arg(long)]
         lease_minutes: Option<u64>,
     },
     /// Mark claimed work in progress.
     Start {
+        /// Task id.
         id: i64,
+        /// Token printed by `q claim`.
         #[arg(long)]
         claim_token: String,
+        /// Branch name to record on the claim.
         #[arg(long)]
         branch: Option<String>,
+        /// Worktree path to record on the claim.
         #[arg(long)]
         worktree: Option<String>,
     },
     /// Complete claimed work, or accept a task that is already in review.
+    #[command(visible_alias = "done")]
     Complete {
+        /// Task id.
         id: i64,
+        /// Token printed by `q claim`. Omit when accepting a task already in review.
         #[arg(long)]
         claim_token: Option<String>,
+        /// Short note stored on the completion event.
         #[arg(long, default_value = "")]
         summary: String,
         #[arg(long, value_name = "review|done")]
@@ -324,22 +409,31 @@ pub enum Commands {
     },
     /// Return claimed work to ready.
     Release {
+        /// Task id.
         id: i64,
+        /// Token printed by `q claim`.
         #[arg(long)]
         claim_token: String,
     },
     /// Show queue counts and claim lease health.
     Status,
     /// Requeue expired claims and record a recovery event.
+    #[command(visible_alias = "recover")]
     RecoverStale {
         /// ready or blocked. Defaults to each project's stale policy.
         #[arg(long, value_name = "ready|blocked")]
         to: Option<String>,
     },
     /// Show the append-only event log for a task.
-    Events { id: i64 },
+    Events {
+        /// Task id.
+        id: i64,
+    },
     /// Reopen done work to ready, or cancelled work to inbox.
-    Reopen { id: i64 },
+    Reopen {
+        /// Task id.
+        id: i64,
+    },
     /// Named groups of tasks that may span repos.
     Feature {
         #[command(subcommand)]
@@ -379,32 +473,44 @@ pub enum FeatureCommand {
         /// Title words. Quoted text is the usual form.
         #[arg(required = true, num_args = 1.., value_name = "TITLE")]
         title: Vec<String>,
+        /// Optional description.
         #[arg(long)]
         body: Option<String>,
     },
     /// List features.
-    #[command(alias = "list")]
+    #[command(visible_alias = "list")]
     Ls,
     /// Show one feature.
-    Show { id: i64 },
+    Show {
+        /// Feature id.
+        id: i64,
+    },
     /// Edit a feature title or body.
     Edit {
+        /// Feature id.
         id: i64,
+        /// Replace the title.
         #[arg(long)]
         title: Option<String>,
+        /// Replace the body.
         #[arg(long)]
         body: Option<String>,
     },
     /// Delete a feature. Tasks stay; their feature is cleared.
-    Delete { id: i64 },
+    Delete {
+        /// Feature id.
+        id: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
     /// Write .agentqueue.toml at the git root.
     Init {
+        /// Write the file without prompting. Required when stdin is not a terminal.
         #[arg(long)]
         yes: bool,
+        /// Overwrite an existing .agentqueue.toml.
         #[arg(long)]
         force: bool,
     },
@@ -522,6 +628,67 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["q", "tree"]).is_err());
         assert!(Cli::try_parse_from(["q", "tree", "12", "--feature", "Rollout"]).is_err());
+    }
+
+    #[test]
+    fn color_flag_and_aliases_parse() {
+        let listed =
+            Cli::try_parse_from(["q", "--color", "always", "-j", "ls", "-a", "-n", "10"]).unwrap();
+        assert_eq!(listed.color, ColorMode::Always);
+        assert!(listed.json);
+        match listed.command {
+            Commands::Ls { all, limit, .. } => {
+                assert!(all);
+                assert_eq!(limit, 10);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["q", "--color", "rainbow", "ls"]).is_err());
+
+        let done = Cli::try_parse_from(["q", "done", "4", "--summary", "ok"]).unwrap();
+        match done.command {
+            Commands::Complete { id, summary, .. } => {
+                assert_eq!(id, 4);
+                assert_eq!(summary, "ok");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let removed = Cli::try_parse_from(["q", "rm", "9", "--force"]).unwrap();
+        match removed.command {
+            Commands::Delete { id, force } => {
+                assert_eq!(id, 9);
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["q", "recover"]).unwrap().command,
+            Commands::RecoverStale { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["q", "canceled", "3"]).unwrap().command,
+            Commands::Cancel { id: 3 }
+        ));
+    }
+
+    #[test]
+    fn color_and_aliases_are_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "--color".into(),
+            "never".into(),
+            "rm".into(),
+            "3".into(),
+        ]);
+        assert_eq!(args, vec!["--color", "never", "rm", "3"]);
+        assert_eq!(
+            preprocess(vec!["done".into(), "3".into()]),
+            vec!["done", "3"]
+        );
+        assert_eq!(preprocess(vec!["recover".into()]), vec!["recover"]);
+        assert_eq!(
+            preprocess(vec!["-j".into(), "Fix the bug".into()]),
+            vec!["add", "-j", "Fix the bug"]
+        );
     }
 
     #[test]
