@@ -199,6 +199,11 @@ async fn serve(
     } else {
         None
     };
+    if public_url.is_some() && store.is_none() {
+        return Err(CliError::message(
+            "--public-url requires a token file; create a token first or pass --auth FILE (an empty file denies all access)",
+        ));
+    }
     q_http::check_bind(&addr, store.as_ref()).map_err(CliError::message)?;
     let key_path = db
         .parent()
@@ -265,7 +270,7 @@ fn token_command(cli: &cli::Cli, command: &TokenCommand, ui: &Ui) -> Result<(), 
                         "Give it to that agent as Q_SERVER_TOKEN, or as a Bearer header for /mcp."
                     ),
                 }
-                println!("A running q serve picks it up without a restart.");
+                println!("A q serve started with a token file picks it up without a restart; restart servers started without authentication.");
             });
             Ok(())
         }

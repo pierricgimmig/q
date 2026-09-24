@@ -9,9 +9,9 @@ Wants=network-online.target
 [Service]
 User=q
 Group=q
-# --auth defaults to /var/lib/q/tokens.toml when that file exists.
+# Require authentication even before the first token is created.
 # --public-url must be the origin Caddy serves, so OAuth redirects are right.
-ExecStart=/usr/local/bin/q serve --bind 127.0.0.1:7777 --db /var/lib/q/queue.db --public-url https://q.example.com
+ExecStart=/usr/local/bin/q serve --bind 127.0.0.1:7777 --db /var/lib/q/queue.db --auth /var/lib/q/tokens.toml --public-url https://q.example.com
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true

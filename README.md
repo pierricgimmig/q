@@ -48,7 +48,7 @@ sudo -u q q --db /var/lib/q/queue.db token create codex-vps --role agent
 
 `deploy/install.sh` installs the binary, creates a `q` system user, writes `deploy/q.service` and `deploy/Caddyfile` with your hostname, and starts both. Without Caddy, put any TLS proxy in front of `127.0.0.1:7777` and pass `--public-url https://your.host` to `q serve` so OAuth redirects use the right origin.
 
-`q token create` prints the secret once and writes it to `tokens.toml` next to the database. A running server picks up new and revoked tokens without a restart. `q token ls` and `q token revoke NAME` manage the file. Secrets are random; nothing else is stored.
+`q token create` prints the secret once and writes it to `tokens.toml` next to the database. A server started with a token file picks up new and revoked tokens without a restart. An empty token file denies all access; revoking the last token keeps this file in place. Missing, unreadable, or invalid token files deny access until repaired. `q token ls` and `q token revoke NAME` manage the file. Secrets are random; nothing else is stored.
 
 ### Connect a chat app (Grok, Claude, ChatGPT)
 
@@ -106,7 +106,7 @@ secret = "..."
 
 Secrets must be at least 16 characters. `human` tokens may call everything. `agent` tokens cannot call `ready` or `reopen`, so an agent cannot make work claimable, and any actor an agent sends is recorded as an agent. The rule that only humans mark work ready is enforced by the server, not by convention.
 
-Without a token file the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. `GET /v1/health` and the OAuth discovery endpoints need no token.
+Without a token file the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. This local mode requires a restart to enable authentication after creating the first token. `--public-url` requires a token file. The systemd service always passes `--auth`, and the installer creates an empty token file before starting it. `GET /v1/health` and the OAuth discovery endpoints need no token.
 
 ### How sign-in works
 

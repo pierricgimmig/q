@@ -128,6 +128,7 @@ struct PendingCode {
     redirect_uri: String,
     code_challenge: String,
     principal: String,
+    credential_key: [u8; 32],
     expires_at: u64,
 }
 
@@ -347,6 +348,7 @@ impl OAuthServer {
             redirect_uri: form.params.redirect_uri.clone(),
             code_challenge: form.params.code_challenge.clone(),
             principal: token.name.clone(),
+            credential_key: self.key.principal_key(&token.name, &token.secret),
             expires_at: unix_now() + CODE_TTL_SECS,
         };
         if let Ok(mut codes) = self.codes.lock() {
@@ -374,7 +376,7 @@ impl OAuthServer {
     /// Exchange a code or refresh token for a new token pair.
     pub fn token(&self, tokens: &AuthConfig, form: &TokenForm) -> Result<Value, OAuthError> {
         let principal_name = match form.grant_type.as_str() {
-            "authorization_code" => self.redeem_code(form)?,
+            "authorization_code" => self.redeem_code(tokens, form)?,
             "refresh_token" => {
                 let refresh = form.refresh_token.as_deref().ok_or_else(|| {
                     OAuthError::new("invalid_request", "refresh_token is required")
@@ -408,7 +410,7 @@ impl OAuthServer {
         }))
     }
 
-    fn redeem_code(&self, form: &TokenForm) -> Result<String, OAuthError> {
+    fn redeem_code(&self, tokens: &AuthConfig, form: &TokenForm) -> Result<String, OAuthError> {
         let code = form
             .code
             .as_deref()
@@ -439,6 +441,16 @@ impl OAuthServer {
         let expected = base64url_encode(&sha256(verifier.as_bytes()));
         if !constant_time_eq(expected.as_bytes(), pending.code_challenge.as_bytes()) {
             return Err(OAuthError::new("invalid_grant", "PKCE verification failed"));
+        }
+        let token = tokens.find_by_name(&pending.principal).ok_or_else(|| {
+            OAuthError::new("invalid_grant", "the token used to sign in was revoked")
+        })?;
+        let current_key = self.key.principal_key(&token.name, &token.secret);
+        if !constant_time_eq(&current_key, &pending.credential_key) {
+            return Err(OAuthError::new(
+                "invalid_grant",
+                "the token used to sign in was rotated",
+            ));
         }
         Ok(pending.principal)
     }
@@ -487,10 +499,26 @@ impl OAuthServer {
 }
 
 fn redirect_uri_allowed(uri: &str) -> bool {
-    uri.starts_with("https://")
-        || uri.starts_with("http://localhost")
-        || uri.starts_with("http://127.0.0.1")
-        || uri.starts_with("http://[::1]")
+    let Ok(url) = url::Url::parse(uri) else {
+        return false;
+    };
+    if !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 pub fn urlencode(value: &str) -> String {
@@ -785,6 +813,90 @@ mod tests {
         // Tokens from another server's key are rejected.
         let other = OAuthServer::new(SigningKey::ephemeral());
         assert!(other.authenticate(&tokens, access).is_none());
+    }
+
+    #[test]
+    fn pending_codes_are_invalid_after_revocation_or_rotation() {
+        for recreate in [false, true] {
+            let server = OAuthServer::new(SigningKey::ephemeral());
+            let mut tokens = tokens();
+            let client_id = registered(&server);
+            let (verifier, challenge) = pkce();
+            let redirect = server
+                .authorize(
+                    &tokens,
+                    &AuthorizeForm {
+                        params: AuthorizeParams {
+                            response_type: "code".into(),
+                            client_id: client_id.clone(),
+                            redirect_uri: "https://chat.example/callback".into(),
+                            code_challenge: challenge,
+                            code_challenge_method: "S256".into(),
+                            ..AuthorizeParams::default()
+                        },
+                        token: tokens.tokens[0].secret.clone(),
+                    },
+                )
+                .unwrap();
+            let mut old = tokens.tokens.remove(0);
+            if recreate {
+                old.secret = "replacement-secret-0123456789".into();
+                tokens.tokens.push(old);
+            }
+            let form = TokenForm {
+                grant_type: "authorization_code".into(),
+                code: Some(redirect.split_once("code=").unwrap().1.into()),
+                code_verifier: Some(verifier),
+                client_id: Some(client_id),
+                redirect_uri: Some("https://chat.example/callback".into()),
+                ..TokenForm::default()
+            };
+            assert_eq!(
+                server.token(&tokens, &form).unwrap_err().code,
+                "invalid_grant"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_uris_require_https_or_an_actual_loopback_host() {
+        let server = OAuthServer::new(SigningKey::ephemeral());
+        for uri in [
+            "http://localhost.attacker.example/cb",
+            "http://127.0.0.1.attacker.example/cb",
+            "http://localhost@attacker.example/cb",
+            "http://127.0.0.1@attacker.example/cb",
+            "http://192.168.1.1/cb",
+            "https://example.com/cb#fragment",
+            "https://user:password@example.com/cb",
+            "not a url",
+        ] {
+            assert!(
+                server
+                    .register(RegisterRequest {
+                        redirect_uris: vec![uri.into()],
+                        client_name: None,
+                    })
+                    .is_err(),
+                "accepted {uri}"
+            );
+        }
+        for uri in [
+            "https://chat.example/callback?existing=1",
+            "http://localhost:8080/cb",
+            "http://127.0.0.1:8080/cb",
+            "http://[::1]:8080/cb",
+        ] {
+            assert!(
+                server
+                    .register(RegisterRequest {
+                        redirect_uris: vec![uri.into()],
+                        client_name: None,
+                    })
+                    .is_ok(),
+                "rejected {uri}"
+            );
+        }
     }
 
     #[test]

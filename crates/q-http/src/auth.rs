@@ -77,9 +77,6 @@ impl AuthConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.tokens.is_empty() {
-            return Err("token file defines no tokens".into());
-        }
         let mut names = std::collections::HashSet::new();
         for token in &self.tokens {
             let name = token.name.trim();
@@ -151,11 +148,6 @@ impl AuthConfig {
         config.tokens.retain(|token| token.name != name.trim());
         if config.tokens.len() == before {
             return Err(format!("no token named {name} in {}", path.display()));
-        }
-        if config.tokens.is_empty() {
-            std::fs::remove_file(path)
-                .map_err(|err| format!("cannot remove {}: {err}", path.display()))?;
-            return Ok(());
         }
         config.save(path)
     }
@@ -234,32 +226,31 @@ impl TokenStore {
         self.path.as_deref()
     }
 
-    /// Current configuration, re-read if the file changed. A file that has
-    /// become unreadable or invalid keeps the last good configuration.
+    /// Current configuration, re-read if the file changed. Missing, unreadable,
+    /// or invalid files deny all access until a valid configuration is restored.
     pub fn snapshot(&self) -> AuthConfig {
+        // Serialize reloads so an older snapshot cannot overwrite a revocation.
+        let Ok(mut loaded) = self.loaded.write() else {
+            return AuthConfig::default();
+        };
         if let Some(path) = &self.path {
             let modified = modified_at(path);
-            let stale = self
-                .loaded
-                .read()
-                .map(|loaded| loaded.modified != modified)
-                .unwrap_or(false);
-            if stale {
+            if modified.is_none() || loaded.modified != modified {
                 match AuthConfig::load(path) {
                     Ok(config) => {
-                        if let Ok(mut loaded) = self.loaded.write() {
-                            loaded.config = config;
-                            loaded.modified = modified;
-                        }
+                        loaded.config = config;
+                        loaded.modified = modified;
                     }
-                    Err(err) => tracing::warn!("token file not reloaded: {err}"),
+                    Err(err) => {
+                        tracing::warn!("token file unavailable; denying access: {err}");
+                        loaded.config = AuthConfig::default();
+                        // Retry even if a repaired file has the same timestamp.
+                        loaded.modified = None;
+                    }
                 }
             }
         }
-        self.loaded
-            .read()
-            .map(|loaded| loaded.config.clone())
-            .unwrap_or_default()
+        loaded.config.clone()
     }
 
     pub fn len(&self) -> usize {
@@ -318,7 +309,22 @@ mod tests {
             "[[tokens]]\nname=\"a\"\nrole=\"human\"\nsecret=\"0123456789abcdef\"\n[[tokens]]\nname=\"a\"\nrole=\"agent\"\nsecret=\"0123456789abcdefg\"\n",
         );
         assert!(dup.unwrap_err().contains("duplicate"));
-        assert!(AuthConfig::parse("").unwrap_err().contains("no tokens"));
+        assert!(AuthConfig::parse("tokens = []").unwrap().tokens.is_empty());
+    }
+
+    #[test]
+    fn token_store_denies_access_after_deletion_or_invalid_reload() {
+        let path = temp_path();
+        let secret = AuthConfig::create_token(&path, "me", Role::Human).unwrap();
+        let store = TokenStore::from_file(&path).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.snapshot().find_by_secret(&secret).is_none());
+        std::fs::write(&path, "not valid toml").unwrap();
+        assert!(store.snapshot().tokens.is_empty());
+        std::fs::write(&path, original).unwrap();
+        assert!(store.snapshot().find_by_secret(&secret).is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -355,7 +361,10 @@ mod tests {
             .find_by_name("bot")
             .is_none());
         AuthConfig::revoke_token(&path, "pierric").unwrap();
-        assert!(!path.exists());
+        assert!(path.exists());
+        assert!(AuthConfig::load(&path).unwrap().tokens.is_empty());
+        assert!(store.snapshot().tokens.is_empty());
+        std::fs::remove_file(path).unwrap();
         assert!(Role::parse("HUMAN").is_ok());
         assert!(Role::parse("root").is_err());
     }

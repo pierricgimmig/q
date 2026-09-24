@@ -870,6 +870,7 @@ dependencies = [
  "toml",
  "tracing",
  "ureq",
+ "url",
  "uuid",
 ]
 

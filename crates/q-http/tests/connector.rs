@@ -26,6 +26,10 @@ struct Server {
 
 impl Server {
     fn start(auth: Option<AuthConfig>) -> Self {
+        Self::start_store(auth.map(TokenStore::fixed))
+    }
+
+    fn start_store(auth: Option<TokenStore>) -> Self {
         let queue: Arc<dyn QueueService> = Arc::new(Queue::open(temp_db()).unwrap());
         let (stop, stopped) = oneshot::channel::<()>();
         let (ready, started) = std::sync::mpsc::channel::<String>();
@@ -39,7 +43,7 @@ impl Server {
                 let addr = listener.local_addr().unwrap();
                 ready.send(format!("http://{addr}")).unwrap();
                 let options = ServerOptions {
-                    auth: auth.map(TokenStore::fixed),
+                    auth,
                     public_url: Some(format!("http://{addr}")),
                     signing_key: SigningKey::ephemeral(),
                     base_dir: std::env::temp_dir(),
@@ -362,4 +366,36 @@ fn loopback_without_tokens_serves_mcp_to_an_anonymous_human() {
         json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]),
     );
     assert_eq!(status, 202);
+}
+
+#[test]
+fn empty_token_file_denies_access_and_reloads_creation_and_last_revocation() {
+    let path = std::env::temp_dir().join(format!("q-empty-auth-{}.toml", uuid::Uuid::new_v4()));
+    AuthConfig::default().save(&path).unwrap();
+    let server = Server::start_store(Some(TokenStore::from_file(&path).unwrap()));
+    let http = agent();
+    let request = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+    assert_eq!(mcp(&http, &server.url, None, request.clone()).0, 401);
+    let secret = AuthConfig::create_token(&path, "me", q_http::Role::Human).unwrap();
+    // Force an mtime change even on coarse timestamp filesystems.
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified + std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        mcp(&http, &server.url, Some(&secret), request.clone()).0,
+        200
+    );
+    assert_eq!(mcp(&http, &server.url, None, request.clone()).0, 401);
+    AuthConfig::revoke_token(&path, "me").unwrap();
+    assert_eq!(
+        mcp(&http, &server.url, Some(&secret), request.clone()).0,
+        401
+    );
+    assert_eq!(mcp(&http, &server.url, None, request.clone()).0, 401);
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(mcp(&http, &server.url, Some(&secret), request).0, 401);
 }

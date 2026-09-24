@@ -11,9 +11,16 @@ id -u q >/dev/null 2>&1 || useradd --system --home /var/lib/q --shell /usr/sbin/
 install -d -o q -g q -m 750 /var/lib/q
 install -m 755 "$BIN" /usr/local/bin/q
 
+# An empty file denies all access until the first token is created.
+# Preserve existing credentials on upgrades.
+if [ ! -e /var/lib/q/tokens.toml ]; then
+  install -o q -g q -m 600 /dev/null /var/lib/q/tokens.toml
+fi
+
 sed "s#https://q.example.com#https://${HOST}#" "$(dirname "$0")/q.service" > /etc/systemd/system/q.service
 systemctl daemon-reload
-systemctl enable --now q
+systemctl enable q
+systemctl restart q
 
 if command -v caddy >/dev/null 2>&1; then
   sed "s#q.example.com#${HOST}#" "$(dirname "$0")/Caddyfile" > /etc/caddy/Caddyfile
