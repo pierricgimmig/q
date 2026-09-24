@@ -3,9 +3,9 @@
 //! One process owns the SQLite file. It answers:
 //!
 //! - `POST /v1/<method>` for the CLI and `q mcp` running elsewhere
-//!   ([`crate::rpc`]);
+//!   (the `rpc` module);
 //! - `POST /mcp` for chat apps and IDE agents speaking MCP over HTTP
-//!   ([`crate::mcp`]);
+//!   (the `mcp` module);
 //! - the OAuth endpoints chat connectors use to sign in ([`crate::oauth`]).
 //!
 //! Claims stay serialized by the same `BEGIN IMMEDIATE` transaction they use

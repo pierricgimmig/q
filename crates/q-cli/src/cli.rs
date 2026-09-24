@@ -467,10 +467,10 @@ pub enum Commands {
         /// Address to listen on. Non-loopback addresses require a token file.
         #[arg(long, default_value = "127.0.0.1:7777", value_name = "ADDR")]
         bind: String,
-        /// Token file. Defaults to tokens.toml next to the database when that file exists.
+        /// Token file with `[[tokens]]` entries. Defaults to tokens.toml next to the database when that file exists.
         #[arg(long, value_name = "FILE")]
         auth: Option<PathBuf>,
-        /// Public origin, for example https://q.example.com. Used in OAuth metadata and redirects.
+        /// Public origin, for example `https://q.example.com`. Used in OAuth metadata and redirects.
         /// Defaults to the reverse proxy's X-Forwarded-Proto and Host headers.
         #[arg(long, value_name = "URL")]
         public_url: Option<String>,
