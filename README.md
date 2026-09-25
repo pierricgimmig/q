@@ -2,7 +2,7 @@
 
 Local-first work queue for coding and research agents. Capture an idea in one command, keep it in an inbox until a person marks it ready, then let an idle agent claim it through the CLI or an MCP server on stdio.
 
-`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
+`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store; queue SQL lives in the store crate and OAuth grant storage lives in the HTTP crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
 
 ## Install
 
@@ -108,11 +108,17 @@ Secrets must be at least 16 characters. `human` tokens may call everything. `age
 
 Without a token file the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. This local mode requires a restart to enable authentication after creating the first token. `--public-url` requires a token file. The systemd service always passes `--auth`, and the installer creates an empty token file before starting it. `GET /v1/health` and the OAuth discovery endpoints need no token.
 
+Agents have no domain or IP allowlist: CLI and server-to-server MCP clients send their bearer token and do not need an `Origin` header. For browser requests that do include `Origin`, q accepts only its own origin (scheme, hostname, and port), rejecting other origins, including `null`, with HTTP 403. An origin is not an agent identity and does not replace authentication.
+
+Set `--public-url https://q.example.com` behind a reverse proxy. This defines both the browser origin and OAuth server/resource URLs; request `Host` and forwarded headers cannot change them. Without it, q uses the listener's HTTP origin (the loopback address when binding all interfaces). No list of agent domains is needed.
+
 ### How sign-in works
 
 `q serve` is its own small OAuth 2.1 server. Connectors discover it at `/.well-known/oauth-authorization-server`, register a client at `/oauth/register`, run the PKCE code flow through `/oauth/authorize`, and exchange the code at `/oauth/token`. The sign-in page asks for a token-file secret, and the connector gets that token's role.
 
-There is no session database. Client ids, access tokens, and refresh tokens are HMAC-signed with a key in `oauth.key` next to the database, created on first start. Tokens for a principal are signed with a key derived from that principal's secret, so `q token revoke` invalidates every connector that signed in with it. Access tokens last a day and refresh tokens ninety days.
+Client ids, access tokens, and refresh tokens are HMAC-signed with a key in `oauth.key` next to the database, created on first start. Tokens for a principal are signed with a key derived from that principal's secret, so `q token revoke` invalidates every connector that signed in with it. Access tokens last a day and refresh tokens ninety days. OAuth requests may target only this server's `/mcp` resource, and issued tokens are bound to that resource and the registered client.
+
+Refresh tokens rotate on each use. q records grant identifiers, current nonce hashes, expiration, and revocation in `oauth.db` next to the queue database. Reusing an old refresh token revokes that grant's refresh and access tokens, requiring a new sign-in; this protection survives restarts. Clients must send `client_id` when refreshing and retain the replacement refresh token. Keep `oauth.db` and `oauth.key` across upgrades; deleting the grant database requires reconnecting OAuth clients. Upgrading from the earlier stateless token format also requires a one-time OAuth sign-in. Raw token-file secrets used by agents are unaffected.
 
 The service API is `POST /v1/<method>` with the request as JSON and the result as JSON. Errors are an `{"error": {"code", "message"}}` body with a 4xx or 5xx status, and the client turns them back into the same errors the local queue returns.
 

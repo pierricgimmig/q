@@ -30,6 +30,15 @@ impl Server {
     }
 
     fn start_store(auth: Option<TokenStore>) -> Self {
+        Self::start_public(auth, None)
+    }
+
+    fn start_public(auth: Option<TokenStore>, public_url: Option<String>) -> Self {
+        Self::start_bound(auth, public_url, "127.0.0.1:0")
+    }
+
+    fn start_bound(auth: Option<TokenStore>, public_url: Option<String>, bind: &str) -> Self {
+        let bind = bind.to_string();
         let queue: Arc<dyn QueueService> = Arc::new(Queue::open(temp_db()).unwrap());
         let (stop, stopped) = oneshot::channel::<()>();
         let (ready, started) = std::sync::mpsc::channel::<String>();
@@ -39,14 +48,18 @@ impl Server {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
+                let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+                let mut addr = listener.local_addr().unwrap();
+                if addr.ip().is_unspecified() {
+                    addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+                }
                 ready.send(format!("http://{addr}")).unwrap();
                 let options = ServerOptions {
                     auth,
-                    public_url: Some(format!("http://{addr}")),
+                    public_url,
                     signing_key: SigningKey::ephemeral(),
                     base_dir: std::env::temp_dir(),
+                    grants: Arc::new(q_http::GrantStore::in_memory().unwrap()),
                 };
                 serve_on(queue, listener, options, async move {
                     let _ = stopped.await;
@@ -193,6 +206,7 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
         .query("code_challenge_method", "S256")
         .query("state", "st4te")
         .query("scope", "mcp")
+        .query("resource", &format!("{url}/mcp"))
         .call()
         .unwrap()
         .into_string()
@@ -225,6 +239,7 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
             ("code_challenge_method", "S256"),
             ("state", "st4te"),
             ("token", HUMAN_SECRET),
+            ("resource", &format!("{url}/mcp")),
         ])
         .unwrap();
     assert_eq!(redirect.status(), 303);
@@ -247,6 +262,7 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
             ("grant_type", "authorization_code"),
             ("code", &code),
             ("code_verifier", verifier),
+            ("resource", &format!("{url}/mcp")),
             ("redirect_uri", "https://grok.example/oauth/callback"),
             ("client_id", &client_id),
         ])
@@ -315,7 +331,12 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
     // 7. Refresh works, and a raw agent secret as a bearer gets no ready tool.
     let refreshed: Value = http
         .post(token_endpoint)
-        .send_form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh)])
+        .send_form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("resource", &format!("{url}/mcp")),
+            ("client_id", &client_id),
+        ])
         .unwrap()
         .into_json()
         .unwrap();
@@ -398,4 +419,164 @@ fn empty_token_file_denies_access_and_reloads_creation_and_last_revocation() {
     assert_eq!(mcp(&http, &server.url, None, request.clone()).0, 401);
     std::fs::remove_file(path).unwrap();
     assert_eq!(mcp(&http, &server.url, Some(&secret), request).0, 401);
+}
+
+#[test]
+fn foreign_browser_origins_cannot_mutate_a_local_queue() {
+    let server = Server::start(None);
+    let http = agent();
+    let capture = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+        "params":{"name":"queue_capture", "arguments":{"title":"cross-origin write"}}});
+    for origin in [
+        "https://untrusted.example",
+        "null",
+        "http://localhost.attacker.example",
+        "http://127.0.0.1:1",
+    ] {
+        // A text/plain POST can be sent by a browser without a CORS preflight.
+        let denied = http
+            .post(&format!("{}/mcp", server.url))
+            .set("Origin", origin)
+            .set("Host", "untrusted.example")
+            .set("X-Forwarded-Host", "untrusted.example")
+            .set("X-Forwarded-Proto", "https")
+            .set("Content-Type", "text/plain")
+            .send_string(&capture.to_string())
+            .unwrap_err();
+        assert!(
+            matches!(denied, ureq::Error::Status(403, _)),
+            "{origin}: {denied}"
+        );
+    }
+    for method in ["GET", "DELETE", "OPTIONS"] {
+        let denied = http
+            .request(method, &format!("{}/mcp", server.url))
+            .set("Origin", "https://untrusted.example")
+            .call()
+            .unwrap_err();
+        assert!(
+            matches!(denied, ureq::Error::Status(403, _)),
+            "{method}: {denied}"
+        );
+    }
+    // The existing RPC endpoint must not offer a way around the browser guard.
+    let denied = http
+        .post(&format!("{}/v1/status", server.url))
+        .set("Origin", "https://untrusted.example")
+        .send_json(json!({}))
+        .unwrap_err();
+    assert!(matches!(denied, ureq::Error::Status(403, _)));
+    let (_, status) = mcp(
+        &http,
+        &server.url,
+        None,
+        json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"queue_status"}}),
+    );
+    assert_eq!(tool_text(&status)["counts"]["inbox"], 0);
+    // A same-origin browser request still works.
+    assert_eq!(
+        http.post(&format!("{}/mcp", server.url))
+            .set("Origin", &server.url)
+            .send_json(capture)
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn agents_need_no_origin_allowlist_and_headers_cannot_change_server_identity() {
+    let server = Server::start_public(
+        Some(TokenStore::fixed(auth())),
+        Some("https://queue.example".into()),
+    );
+    let http = agent();
+    let message = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+    // Normal agents send credentials, no browser Origin, regardless of their host/IP.
+    assert_eq!(
+        mcp(&http, &server.url, Some(AGENT_SECRET), message.clone()).0,
+        200
+    );
+    assert_eq!(mcp(&http, &server.url, None, message.clone()).0, 401);
+    assert_eq!(
+        http.post(&format!("{}/mcp", server.url))
+            .set("Authorization", &format!("Bearer {AGENT_SECRET}"))
+            .set("Origin", "https://queue.example:443")
+            .send_json(message.clone())
+            .unwrap()
+            .status(),
+        200
+    );
+    for origin in [
+        "http://queue.example",
+        "https://queue.example:8443",
+        "https://queue.example.attacker.example",
+        "https://queue.example/path",
+    ] {
+        let denied = http
+            .post(&format!("{}/mcp", server.url))
+            .set("Authorization", &format!("Bearer {AGENT_SECRET}"))
+            .set("Origin", origin)
+            .send_json(message.clone())
+            .unwrap_err();
+        assert!(
+            matches!(denied, ureq::Error::Status(403, _)),
+            "{origin}: {denied}"
+        );
+    }
+    let metadata: Value = http
+        .get(&format!(
+            "{}/.well-known/oauth-protected-resource",
+            server.url
+        ))
+        .set("Host", "attacker.example")
+        .set("X-Forwarded-Host", "attacker.example")
+        .set("X-Forwarded-Proto", "http")
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(metadata["resource"], "https://queue.example/mcp");
+    let denied = http
+        .post(&format!("{}/mcp", server.url))
+        .set("Host", "attacker.example")
+        .set("X-Forwarded-Host", "attacker.example")
+        .send_json(message)
+        .unwrap_err();
+    let ureq::Error::Status(401, response) = denied else {
+        panic!("expected 401")
+    };
+    assert!(response
+        .header("www-authenticate")
+        .unwrap()
+        .contains("https://queue.example/.well-known/"));
+}
+
+#[test]
+fn all_interface_listener_needs_no_public_hostname_for_token_agents() {
+    let server = Server::start_bound(Some(TokenStore::fixed(auth())), None, "0.0.0.0:0");
+    let http = agent();
+    assert_eq!(
+        mcp(
+            &http,
+            &server.url,
+            Some(AGENT_SECRET),
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"})
+        )
+        .0,
+        200
+    );
+    let metadata: Value = http
+        .get(&format!(
+            "{}/.well-known/oauth-protected-resource",
+            server.url
+        ))
+        .set("Host", "attacker.example")
+        .set("X-Forwarded-Host", "attacker.example")
+        .set("X-Forwarded-Proto", "https")
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(metadata["resource"], format!("{}/mcp", server.url));
 }

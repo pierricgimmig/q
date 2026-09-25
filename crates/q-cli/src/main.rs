@@ -210,6 +210,9 @@ async fn serve(
         .map(|dir| dir.join("oauth.key"))
         .unwrap_or_else(|| PathBuf::from("oauth.key"));
     let signing_key = q_http::SigningKey::load_or_create(&key_path).map_err(CliError::message)?;
+    let grants = Arc::new(
+        q_http::GrantStore::open(&db.with_file_name("oauth.db")).map_err(CliError::message)?,
+    );
     let queue: Arc<dyn QueueService> = Arc::new(Queue::open(&db)?);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -230,6 +233,7 @@ async fn serve(
     }
     let options = q_http::ServerOptions {
         auth: store,
+        grants,
         public_url: public_url.map(|url| url.trim_end_matches('/').to_string()),
         signing_key,
         base_dir: base_dir(cli.directory.as_deref())?,

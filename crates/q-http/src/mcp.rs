@@ -26,7 +26,7 @@ use crate::server::{authenticate, AppState};
 pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
     let principal = match authenticate(&state, &headers) {
         Ok(principal) => principal,
-        Err(_) => return unauthorized(&state, &headers),
+        Err(_) => return unauthorized(&state),
     };
     let message: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -102,8 +102,8 @@ fn actor_for(principal: &Principal) -> Actor {
 
 /// A 401 that points OAuth-capable clients at the resource metadata, per the
 /// MCP authorization spec.
-fn unauthorized(state: &AppState, headers: &HeaderMap) -> Response {
-    let base = crate::oauth::base_url(state.options.public_url.as_deref(), headers);
+fn unauthorized(state: &AppState) -> Response {
+    let base = state.options.public_url.as_deref().unwrap();
     let challenge = format!(
         "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\", error=\"invalid_token\""
     );

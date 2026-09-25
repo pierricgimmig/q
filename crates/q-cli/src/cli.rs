@@ -471,7 +471,8 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         auth: Option<PathBuf>,
         /// Public origin, for example `https://q.example.com`. Used in OAuth metadata and redirects.
-        /// Defaults to the reverse proxy's X-Forwarded-Proto and Host headers.
+        /// Also defines the accepted browser Origin. Defaults to the listener origin;
+        /// set this explicitly behind a reverse proxy. Agents need no Origin header.
         #[arg(long, value_name = "URL")]
         public_url: Option<String>,
     },

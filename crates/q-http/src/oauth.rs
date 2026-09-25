@@ -7,19 +7,19 @@
 //! Sign-in is deliberately simple: the authorize page asks for one of the
 //! secrets in the token file. The connector then acts with that token's role.
 //!
-//! There is no database. Client ids, access tokens, and refresh tokens are
+//! Client ids, access tokens, and refresh tokens are
 //! HMAC-signed payloads. The signing key lives in a small key file next to
 //! the queue database and is created on first start. Per-principal tokens
 //! are signed with a key derived from that principal's secret, so revoking
 //! or rotating a token in the token file invalidates every session it
 //! signed in. Authorization codes are the only in-memory state and expire in
-//! ten minutes.
+//! ten minutes. Refresh-token families are persisted in SQLite so rotation and
+//! replay revocation survive restarts.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -120,6 +120,9 @@ struct TokenPayload {
     exp: u64,
     #[serde(rename = "j")]
     nonce: String,
+    client_id: String,
+    aud: String,
+    grant_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +137,8 @@ struct PendingCode {
 
 pub struct OAuthServer {
     key: SigningKey,
+    resource: String,
+    grants: Arc<crate::GrantStore>,
     codes: Mutex<HashMap<String, PendingCode>>,
 }
 
@@ -210,12 +215,16 @@ pub struct TokenForm {
     pub client_id: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 impl OAuthServer {
-    pub fn new(key: SigningKey) -> Self {
+    pub fn new(key: SigningKey, resource: String, grants: Arc<crate::GrantStore>) -> Self {
         Self {
             key,
+            resource,
+            grants,
             codes: Mutex::new(HashMap::new()),
         }
     }
@@ -305,6 +314,17 @@ impl OAuthServer {
     /// here must be shown to the user, not redirected, because the redirect
     /// target itself may be wrong.
     pub fn check_authorize(&self, params: &AuthorizeParams) -> Result<(), OAuthError> {
+        self.check_resource(params.resource.as_deref())?;
+        if params
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope.split_whitespace().any(|s| s != "mcp"))
+        {
+            return Err(OAuthError::new(
+                "invalid_scope",
+                "only the mcp scope is supported",
+            ));
+        }
         let client = self.client(&params.client_id)?;
         if !client
             .redirect_uris
@@ -373,20 +393,48 @@ impl OAuthServer {
         Ok(url)
     }
 
-    /// Exchange a code or refresh token for a new token pair.
+    fn check_resource(&self, resource: Option<&str>) -> Result<(), OAuthError> {
+        // A missing indicator defaults to our sole resource; an explicit foreign
+        // resource must never silently acquire credentials for this queue.
+        if let Some(resource) = resource {
+            if url::Url::parse(resource)
+                .ok()
+                .as_ref()
+                .map(url::Url::as_str)
+                != Some(self.resource.as_str())
+            {
+                return Err(OAuthError::new(
+                    "invalid_target",
+                    "resource must identify this server's /mcp endpoint",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Exchange a code or rotate a refresh token. Replays revoke the family.
     pub fn token(&self, tokens: &AuthConfig, form: &TokenForm) -> Result<Value, OAuthError> {
-        let principal_name = match form.grant_type.as_str() {
-            "authorization_code" => self.redeem_code(tokens, form)?,
+        self.check_resource(form.resource.as_deref())?;
+        let client_id = form
+            .client_id
+            .as_deref()
+            .ok_or_else(|| OAuthError::new("invalid_client", "client_id is required"))?;
+        self.client(client_id)?;
+        let (principal_name, prior) = match form.grant_type.as_str() {
+            "authorization_code" => (self.redeem_code(tokens, form)?, None),
             "refresh_token" => {
                 let refresh = form.refresh_token.as_deref().ok_or_else(|| {
                     OAuthError::new("invalid_request", "refresh_token is required")
                 })?;
-                let principal = self
-                    .principal_from_token(tokens, refresh, "refresh")
+                let claims = self
+                    .verified_claims(tokens, refresh, "refresh")
                     .ok_or_else(|| {
                         OAuthError::new("invalid_grant", "refresh token is not valid")
                     })?;
-                principal.name
+                if claims.client_id != client_id {
+                    return Err(OAuthError::new("invalid_grant", "client_id mismatch"));
+                }
+                (claims.name.clone(), Some(claims))
             }
             other => {
                 return Err(OAuthError::new(
@@ -399,8 +447,54 @@ impl OAuthServer {
             OAuthError::new("invalid_grant", "the token used to sign in was revoked")
         })?;
         let key = self.key.principal_key(&token.name, &token.secret);
-        let access = self.issue(&key, &token.name, "access", ACCESS_TTL_SECS)?;
-        let refresh = self.issue(&key, &token.name, "refresh", REFRESH_TTL_SECS)?;
+        let grant_id = prior
+            .as_ref()
+            .map(|p| p.grant_id.clone())
+            .unwrap_or_else(|| base64url_encode(&random_bytes()));
+        let next_nonce = base64url_encode(&random_bytes());
+        let refresh_expiry = unix_now() + REFRESH_TTL_SECS;
+        let access = self.issue(
+            &key,
+            &TokenPayload {
+                kind: "access".into(),
+                name: token.name.clone(),
+                exp: unix_now() + ACCESS_TTL_SECS,
+                nonce: base64url_encode(&random_bytes()),
+                client_id: client_id.into(),
+                aud: self.resource.clone(),
+                grant_id: grant_id.clone(),
+            },
+        )?;
+        let refresh = self.issue(
+            &key,
+            &TokenPayload {
+                kind: "refresh".into(),
+                name: token.name.clone(),
+                exp: refresh_expiry,
+                nonce: next_nonce.clone(),
+                client_id: client_id.into(),
+                aud: self.resource.clone(),
+                grant_id: grant_id.clone(),
+            },
+        )?;
+        let storage_error =
+            |err| OAuthError::new("server_error", format!("grant storage failed: {err}"));
+        if let Some(prior) = prior {
+            if !self
+                .grants
+                .rotate(&grant_id, &prior.nonce, &next_nonce, refresh_expiry)
+                .map_err(storage_error)?
+            {
+                return Err(OAuthError::new(
+                    "invalid_grant",
+                    "refresh token was reused or revoked; sign in again",
+                ));
+            }
+        } else {
+            self.grants
+                .create(&grant_id, &next_nonce, refresh_expiry)
+                .map_err(storage_error)?;
+        }
         Ok(json!({
             "access_token": access,
             "token_type": "Bearer",
@@ -425,7 +519,7 @@ impl OAuthServer {
             .ok()
             .and_then(|mut codes| codes.remove(code))
             .ok_or_else(|| OAuthError::new("invalid_grant", "unknown or already used code"))?;
-        if pending.expires_at < unix_now() {
+        if pending.expires_at <= unix_now() {
             return Err(OAuthError::new("invalid_grant", "code expired"));
         }
         if let Some(client_id) = &form.client_id {
@@ -455,30 +549,22 @@ impl OAuthServer {
         Ok(pending.principal)
     }
 
-    fn issue(&self, key: &[u8], name: &str, kind: &str, ttl: u64) -> Result<String, OAuthError> {
-        let payload = TokenPayload {
-            kind: kind.into(),
-            name: name.into(),
-            exp: unix_now() + ttl,
-            nonce: base64url_encode(&random_bytes()[..12]),
-        };
-        let bytes = serde_json::to_vec(&payload).map_err(|err| {
+    fn issue(&self, key: &[u8], payload: &TokenPayload) -> Result<String, OAuthError> {
+        let bytes = serde_json::to_vec(payload).map_err(|err| {
             OAuthError::new("server_error", format!("cannot encode token: {err}"))
         })?;
         Ok(sign(key, &bytes))
     }
 
-    /// Resolve a bearer value issued by this server. `None` if it is not one
-    /// of ours, is expired, or its principal is gone from the token file.
-    pub fn principal_from_token(
+    fn verified_claims(
         &self,
         tokens: &AuthConfig,
         bearer: &str,
         kind: &str,
-    ) -> Option<Principal> {
+    ) -> Option<TokenPayload> {
         let (payload, mac) = unsigned_payload(bearer)?;
         let claims: TokenPayload = serde_json::from_slice(&payload).ok()?;
-        if claims.kind != kind || claims.exp < unix_now() {
+        if claims.kind != kind || claims.exp <= unix_now() || claims.aud != self.resource {
             return None;
         }
         let token = tokens.find_by_name(&claims.name)?;
@@ -486,7 +572,21 @@ impl OAuthServer {
         if !verify(&key, &payload, &mac) {
             return None;
         }
-        Some(Principal::from_token(token))
+        Some(claims)
+    }
+
+    /// Resolve an issued bearer, including credential and grant revocation.
+    pub fn principal_from_token(
+        &self,
+        tokens: &AuthConfig,
+        bearer: &str,
+        kind: &str,
+    ) -> Option<Principal> {
+        let claims = self.verified_claims(tokens, bearer, kind)?;
+        if !self.grants.active(&claims.grant_id) {
+            return None;
+        }
+        Some(Principal::from_token(tokens.find_by_name(&claims.name)?))
     }
 
     /// Resolve any bearer: a raw token-file secret or an access token.
@@ -616,31 +716,18 @@ pub fn sign_in_page(params: &AuthorizeParams, client_name: &str, error: Option<&
     )
 }
 
-/// Public origin for metadata and redirects: the configured URL, else the
-/// forwarded scheme and host from the reverse proxy, else the Host header.
-pub fn base_url(configured: Option<&str>, headers: &HeaderMap) -> String {
-    if let Some(url) = configured {
-        return url.trim_end_matches('/').to_string();
-    }
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or(v).trim().to_string())
-        .filter(|v| v == "http" || v == "https")
-        .unwrap_or_else(|| "http".to_string());
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(axum::http::header::HOST))
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or(v).trim().to_string())
-        .unwrap_or_else(|| "localhost".to_string());
-    format!("{proto}://{host}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::Role;
+
+    fn server() -> OAuthServer {
+        OAuthServer::new(
+            SigningKey::ephemeral(),
+            "https://q.example/mcp".into(),
+            Arc::new(crate::GrantStore::in_memory().unwrap()),
+        )
+    }
 
     fn tokens() -> AuthConfig {
         AuthConfig::parse(
@@ -669,7 +756,7 @@ mod tests {
 
     #[test]
     fn code_flow_with_pkce_issues_tokens_bound_to_the_principal() {
-        let server = OAuthServer::new(SigningKey::ephemeral());
+        let server = server();
         let tokens = tokens();
         let client_id = registered(&server);
         let (verifier, challenge) = pkce();
@@ -722,6 +809,7 @@ mod tests {
                 redirect_uri: Some(params.redirect_uri.clone()),
                 client_id: Some(client_id.clone()),
                 refresh_token: None,
+                resource: None,
             },
         );
         // A failed exchange consumes the code, as the spec requires.
@@ -754,6 +842,7 @@ mod tests {
                     redirect_uri: Some(params.redirect_uri.clone()),
                     client_id: Some(client_id.clone()),
                     refresh_token: None,
+                    resource: None,
                 },
             )
             .unwrap();
@@ -776,6 +865,7 @@ mod tests {
                     redirect_uri: None,
                     client_id: None,
                     refresh_token: None,
+                    resource: None,
                 },
             )
             .is_err());
@@ -786,6 +876,7 @@ mod tests {
                 &TokenForm {
                     grant_type: "refresh_token".into(),
                     refresh_token: Some(refresh.into()),
+                    client_id: Some(client_id.clone()),
                     ..TokenForm::default()
                 },
             )
@@ -811,14 +902,14 @@ mod tests {
             Role::Agent
         );
         // Tokens from another server's key are rejected.
-        let other = OAuthServer::new(SigningKey::ephemeral());
+        let other = self::server();
         assert!(other.authenticate(&tokens, access).is_none());
     }
 
     #[test]
     fn pending_codes_are_invalid_after_revocation_or_rotation() {
         for recreate in [false, true] {
-            let server = OAuthServer::new(SigningKey::ephemeral());
+            let server = server();
             let mut tokens = tokens();
             let client_id = registered(&server);
             let (verifier, challenge) = pkce();
@@ -860,7 +951,7 @@ mod tests {
 
     #[test]
     fn redirect_uris_require_https_or_an_actual_loopback_host() {
-        let server = OAuthServer::new(SigningKey::ephemeral());
+        let server = server();
         for uri in [
             "http://localhost.attacker.example/cb",
             "http://127.0.0.1.attacker.example/cb",
@@ -901,7 +992,7 @@ mod tests {
 
     #[test]
     fn registration_and_authorize_checks() {
-        let server = OAuthServer::new(SigningKey::ephemeral());
+        let server = server();
         assert_eq!(
             server
                 .register(RegisterRequest::default())
@@ -952,22 +1043,249 @@ mod tests {
         assert!(page.contains("name=\"code_challenge\""));
     }
 
+    fn code_form(server: &OAuthServer, tokens: &AuthConfig, client_id: &str) -> TokenForm {
+        let (verifier, challenge) = pkce();
+        let redirect = server
+            .authorize(
+                tokens,
+                &AuthorizeForm {
+                    params: AuthorizeParams {
+                        response_type: "code".into(),
+                        client_id: client_id.into(),
+                        redirect_uri: "https://chat.example/callback".into(),
+                        code_challenge: challenge,
+                        code_challenge_method: "S256".into(),
+                        resource: Some(server.resource.clone()),
+                        ..AuthorizeParams::default()
+                    },
+                    token: tokens.tokens[0].secret.clone(),
+                },
+            )
+            .unwrap();
+        TokenForm {
+            grant_type: "authorization_code".into(),
+            code: Some(redirect.split_once("code=").unwrap().1.into()),
+            code_verifier: Some(verifier),
+            client_id: Some(client_id.into()),
+            redirect_uri: Some("https://chat.example/callback".into()),
+            resource: Some(server.resource.clone()),
+            ..TokenForm::default()
+        }
+    }
+
+    fn refresh_form(server: &OAuthServer, issued: &Value, client_id: &str) -> TokenForm {
+        TokenForm {
+            grant_type: "refresh_token".into(),
+            client_id: Some(client_id.into()),
+            resource: Some(server.resource.clone()),
+            refresh_token: Some(issued["refresh_token"].as_str().unwrap().into()),
+            ..TokenForm::default()
+        }
+    }
+
     #[test]
-    fn base_url_prefers_configuration_then_forwarded_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", "127.0.0.1:7777".parse().unwrap());
-        assert_eq!(base_url(None, &headers), "http://127.0.0.1:7777");
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "q.example.com".parse().unwrap());
-        assert_eq!(base_url(None, &headers), "https://q.example.com");
+    fn resources_are_checked_during_authorization_exchange_refresh_and_use() {
+        let server = server();
+        let tokens = tokens();
+        let client_id = registered(&server);
+        let mut params = AuthorizeParams {
+            response_type: "code".into(),
+            client_id: client_id.clone(),
+            redirect_uri: "https://chat.example/callback".into(),
+            code_challenge: pkce().1,
+            code_challenge_method: "S256".into(),
+            resource: Some("https://other.example/mcp".into()),
+            ..AuthorizeParams::default()
+        };
         assert_eq!(
-            base_url(Some("https://q.example.com/"), &headers),
-            "https://q.example.com"
+            server
+                .authorize(
+                    &tokens,
+                    &AuthorizeForm {
+                        params: params.clone(),
+                        token: tokens.tokens[0].secret.clone(),
+                    }
+                )
+                .unwrap_err()
+                .code,
+            "invalid_target"
         );
-        let key = SigningKey::load_or_create(
-            &std::env::temp_dir().join(format!("q-key-{}", uuid::Uuid::new_v4())),
-        )
-        .unwrap();
+        params.resource = Some(server.resource.clone());
+        server.check_authorize(&params).unwrap();
+        params.scope = Some("mcp admin".into());
+        assert_eq!(
+            server.check_authorize(&params).unwrap_err().code,
+            "invalid_scope"
+        );
+
+        let mut form = code_form(&server, &tokens, &client_id);
+        form.resource = Some("https://other.example/mcp".into());
+        assert_eq!(
+            server.token(&tokens, &form).unwrap_err().code,
+            "invalid_target"
+        );
+        form.resource = Some(server.resource.clone());
+        let issued = server.token(&tokens, &form).unwrap();
+        let mut refresh = refresh_form(&server, &issued, &client_id);
+        refresh.resource = Some("https://other.example/mcp".into());
+        assert_eq!(
+            server.token(&tokens, &refresh).unwrap_err().code,
+            "invalid_target"
+        );
+        refresh.resource = Some(server.resource.clone());
+        server.token(&tokens, &refresh).unwrap();
+        // Even with the same signing key, principals, and grant database, a
+        // different resource cannot accept this token.
+        let other = OAuthServer::new(
+            server.key.clone(),
+            "https://other.example/mcp".into(),
+            server.grants.clone(),
+        );
+        assert!(other
+            .authenticate(&tokens, issued["access_token"].as_str().unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn refresh_binding_rotation_and_family_revocation_survive_restarts() {
+        let path = std::env::temp_dir().join(format!("q-grants-{}.db", uuid::Uuid::new_v4()));
+        let key = SigningKey::ephemeral();
+        let reopen = || {
+            OAuthServer::new(
+                key.clone(),
+                "https://q.example/mcp".into(),
+                Arc::new(crate::GrantStore::open(&path).unwrap()),
+            )
+        };
+        let server = reopen();
+        let tokens = tokens();
+        let client_id = registered(&server);
+        let issued = server
+            .token(&tokens, &code_form(&server, &tokens, &client_id))
+            .unwrap();
+        let independent = server
+            .token(&tokens, &code_form(&server, &tokens, &client_id))
+            .unwrap();
+        let mut form = refresh_form(&server, &issued, &client_id);
+        form.client_id = None;
+        assert_eq!(
+            server.token(&tokens, &form).unwrap_err().code,
+            "invalid_client"
+        );
+        form.client_id = Some("unregistered-client".into());
+        assert_eq!(
+            server.token(&tokens, &form).unwrap_err().code,
+            "invalid_client"
+        );
+        form.client_id = Some(
+            server
+                .register(RegisterRequest {
+                    redirect_uris: vec!["https://other-client.example/cb".into()],
+                    client_name: None,
+                })
+                .unwrap()["client_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        assert_eq!(
+            server.token(&tokens, &form).unwrap_err().code,
+            "invalid_grant"
+        );
+        form.client_id = Some(client_id.clone());
+        let rotated = server.token(&tokens, &form).unwrap();
+        assert_ne!(issued["refresh_token"], rotated["refresh_token"]);
+        drop(server);
+
+        let server = reopen();
+        assert!(server
+            .authenticate(&tokens, rotated["access_token"].as_str().unwrap())
+            .is_some());
+        let newest = server
+            .token(&tokens, &refresh_form(&server, &rotated, &client_id))
+            .unwrap();
+        // Replaying the original token invalidates the newest refresh AND access tokens.
+        assert_eq!(
+            server.token(&tokens, &form).unwrap_err().code,
+            "invalid_grant"
+        );
+        drop(server);
+        let server = reopen();
+        assert!(server
+            .authenticate(&tokens, newest["access_token"].as_str().unwrap())
+            .is_none());
+        assert_eq!(
+            server
+                .token(&tokens, &refresh_form(&server, &newest, &client_id))
+                .unwrap_err()
+                .code,
+            "invalid_grant"
+        );
+        assert!(server
+            .authenticate(&tokens, independent["access_token"].as_str().unwrap())
+            .is_some());
+        assert!(server
+            .authenticate(&tokens, &tokens.tokens[0].secret)
+            .is_some());
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_refreshes_cannot_both_consume_the_same_token() {
+        let path = std::env::temp_dir().join(format!("q-grants-{}.db", uuid::Uuid::new_v4()));
+        let key = SigningKey::ephemeral();
+        let server = OAuthServer::new(
+            key.clone(),
+            "https://q.example/mcp".into(),
+            Arc::new(crate::GrantStore::open(&path).unwrap()),
+        );
+        let tokens = tokens();
+        let client_id = registered(&server);
+        let issued = server
+            .token(&tokens, &code_form(&server, &tokens, &client_id))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                // Separate SQLite connections model separate processes/restarts too.
+                let contender = OAuthServer::new(
+                    key.clone(),
+                    server.resource.clone(),
+                    Arc::new(crate::GrantStore::open(&path).unwrap()),
+                );
+                let form = refresh_form(&server, &issued, &client_id);
+                let tokens = tokens.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    contender.token(&tokens, &form)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|r| r.as_ref().err().is_some_and(|e| e.code == "invalid_grant"))
+                .count(),
+            1
+        );
+        let winner = outcomes.into_iter().find_map(Result::ok).unwrap();
+        assert!(server
+            .authenticate(&tokens, winner["access_token"].as_str().unwrap())
+            .is_none());
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn signing_key_can_be_created() {
+        let path = std::env::temp_dir().join(format!("q-key-{}", uuid::Uuid::new_v4()));
+        let key = SigningKey::load_or_create(&path).unwrap();
         assert_ne!(key.0, [0u8; 32]);
+        assert_eq!(key.0, SigningKey::load_or_create(&path).unwrap().0);
+        std::fs::remove_file(path).unwrap();
     }
 }

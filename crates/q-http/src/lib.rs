@@ -8,13 +8,16 @@
 pub mod auth;
 pub mod client;
 mod crypto;
+mod grants;
 mod mcp;
 pub mod oauth;
+pub mod origin;
 mod rpc;
 pub mod server;
 pub mod wire;
 
 pub use auth::{AuthConfig, Principal, Role, TokenStore};
 pub use client::RemoteQueue;
+pub use grants::GrantStore;
 pub use oauth::SigningKey;
 pub use server::{check_bind, serve_on, ServerOptions};

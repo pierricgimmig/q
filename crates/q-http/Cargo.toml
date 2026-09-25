@@ -10,6 +10,7 @@ description = "HTTP server and client over the shared queue service"
 axum.workspace = true
 q-core.workspace = true
 q-mcp.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -863,6 +863,7 @@ dependencies = [
  "q-core",
  "q-mcp",
  "q-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

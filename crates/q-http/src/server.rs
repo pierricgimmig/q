@@ -30,6 +30,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -39,8 +40,8 @@ use tokio::net::TcpListener;
 
 use crate::auth::{Principal, TokenStore};
 use crate::oauth::{
-    base_url, sign_in_page, AuthorizeForm, AuthorizeParams, OAuthError, OAuthServer,
-    RegisterRequest, SigningKey, TokenForm,
+    sign_in_page, AuthorizeForm, AuthorizeParams, OAuthError, OAuthServer, RegisterRequest,
+    SigningKey, TokenForm,
 };
 use crate::wire::{ErrorBody, ErrorEnvelope, HealthBody};
 
@@ -48,9 +49,10 @@ pub struct ServerOptions {
     /// `None` accepts every request as an anonymous human (loopback only).
     pub auth: Option<TokenStore>,
     /// Public origin such as `https://q.example.com`. Used in OAuth metadata
-    /// and redirects. Derived from the reverse proxy's forwarded headers when
-    /// unset.
+    /// and redirects. Defaults to the listener address; proxies must set this.
     pub public_url: Option<String>,
+    /// Durable refresh-token rotation and replay detection.
+    pub grants: Arc<crate::GrantStore>,
     /// Key that signs OAuth client ids and tokens.
     pub signing_key: SigningKey,
     /// Directory MCP captures discover their repo and project from.
@@ -63,6 +65,7 @@ impl ServerOptions {
         Self {
             auth,
             public_url: None,
+            grants: Arc::new(crate::GrantStore::in_memory().expect("in-memory grant store")),
             signing_key: SigningKey::ephemeral(),
             base_dir: std::env::temp_dir(),
         }
@@ -76,14 +79,25 @@ pub struct AppState {
 }
 
 /// Build the router.
-pub fn router(queue: Arc<dyn QueueService>, options: ServerOptions) -> Router {
-    let oauth = OAuthServer::new(options.signing_key.clone());
+pub fn router(queue: Arc<dyn QueueService>, mut options: ServerOptions) -> Result<Router, String> {
+    let base = crate::origin::canonical_origin(
+        options
+            .public_url
+            .as_deref()
+            .ok_or("public_url must be resolved before building the router")?,
+    )?;
+    options.public_url = Some(base.clone());
+    let oauth = OAuthServer::new(
+        options.signing_key.clone(),
+        format!("{base}/mcp"),
+        options.grants.clone(),
+    );
     let state = Arc::new(AppState {
         queue,
         options,
         oauth,
     });
-    Router::new()
+    Ok(Router::new()
         .route("/v1/health", get(health))
         .route("/v1/:method", post(rpc))
         .route(
@@ -114,7 +128,11 @@ pub fn router(queue: Arc<dyn QueueService>, options: ServerOptions) -> Router {
             get(oauth_authorize_page).post(oauth_authorize_submit),
         )
         .route("/oauth/token", post(oauth_token))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::origin::guard,
+        ))
+        .with_state(state))
 }
 
 /// Refuse to expose an unauthenticated server beyond this machine.
@@ -131,10 +149,24 @@ pub fn check_bind(addr: &SocketAddr, auth: Option<&TokenStore>) -> Result<(), St
 pub async fn serve_on(
     queue: Arc<dyn QueueService>,
     listener: TcpListener,
-    options: ServerOptions,
+    mut options: ServerOptions,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let app = router(queue, options);
+    let mut addr = listener.local_addr()?;
+    check_bind(&addr, options.auth.as_ref()).map_err(std::io::Error::other)?;
+    if options.public_url.is_none() {
+        if addr.ip().is_unspecified() {
+            // Raw-token agents can still use an all-interface listener without
+            // configuring a public hostname. OAuth behind a proxy needs public_url.
+            addr.set_ip(if addr.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        options.public_url = Some(format!("http://{addr}"));
+    }
+    let app = router(queue, options).map_err(std::io::Error::other)?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
@@ -216,20 +248,20 @@ fn oauth_error(status: StatusCode, error: OAuthError) -> Response {
     no_store((status, Json(error.to_json())))
 }
 
-async fn authorization_server_metadata(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    let base = base_url(state.options.public_url.as_deref(), &headers);
-    Json(state.oauth.authorization_server_metadata(&base))
+async fn authorization_server_metadata(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(
+        state
+            .oauth
+            .authorization_server_metadata(state.options.public_url.as_deref().unwrap()),
+    )
 }
 
-async fn protected_resource_metadata(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    let base = base_url(state.options.public_url.as_deref(), &headers);
-    Json(state.oauth.protected_resource_metadata(&base))
+async fn protected_resource_metadata(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(
+        state
+            .oauth
+            .protected_resource_metadata(state.options.public_url.as_deref().unwrap()),
+    )
 }
 
 async fn oauth_register(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
