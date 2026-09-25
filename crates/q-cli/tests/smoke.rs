@@ -991,3 +991,32 @@ fn color_flags_leave_json_and_piped_auto_plain() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn public_server_requires_authentication_at_startup() {
+    let root = temp_root("public-auth");
+    let output = bin()
+        .args([
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--public-url",
+            "https://q.example.com",
+            "--db",
+        ])
+        .arg(root.join("queue.db"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--public-url requires a token file"));
+    let output = bin()
+        .args(["serve", "--bind", "127.0.0.1:0", "--db"])
+        .arg(root.join("queue.db"))
+        .arg("--auth")
+        .arg(root.join("missing.toml"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read token file"));
+    fs::remove_dir_all(root).unwrap();
+}

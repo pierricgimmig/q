@@ -2,7 +2,7 @@
 
 Local-first work queue for coding and research agents. Capture an idea in one command, keep it in an inbox until a person marks it ready, then let an idle agent claim it through the CLI or an MCP server on stdio.
 
-`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
+`q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store; queue SQL lives in the store crate and OAuth grant storage lives in the HTTP crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
 
 ## Install
 
@@ -35,40 +35,92 @@ q --db /tmp/queue.db status
 
 ## Remote server
 
-`q serve` turns the local database into the single authority for a fleet of agents. One process owns the SQLite file and answers every service method over HTTP, so claims stay serialized by the same `BEGIN IMMEDIATE` transaction they use locally. There is no replica and no sync: two machines cannot take the same task because there is only one place to take it from.
+`q serve` turns the local database into the single authority for a fleet of agents and for chat apps. One process owns the SQLite file and answers three things over HTTP: the service API for remote `q` and `q mcp` clients, MCP over HTTP at `/mcp` for chat connectors and IDE agents, and the OAuth endpoints chat connectors sign in with. Claims stay serialized by the same `BEGIN IMMEDIATE` transaction they use locally. There is no replica and no sync: two machines cannot take the same task because there is only one place to take it from.
+
+### VPS in five commands
 
 ```bash
-# on the VPS
-q serve --bind 0.0.0.0:7777 --db /var/lib/q/queue.db --auth /etc/q/tokens.toml
+# on the VPS, with the q binary in the current directory
+sudo ./deploy/install.sh q.example.com          # user, systemd unit, Caddy TLS
+sudo -u q q --db /var/lib/q/queue.db token create pierric --role human
+sudo -u q q --db /var/lib/q/queue.db token create codex-vps --role agent
+```
 
-# on every other machine, and inside agents
+`deploy/install.sh` installs the binary, creates a `q` system user, writes `deploy/q.service` and `deploy/Caddyfile` with your hostname, and starts both. Without Caddy, put any TLS proxy in front of `127.0.0.1:7777` and pass `--public-url https://your.host` to `q serve` so OAuth redirects use the right origin.
+
+`q token create` prints the secret once and writes it to `tokens.toml` next to the database. A server started with a token file picks up new and revoked tokens without a restart. An empty token file denies all access; revoking the last token keeps this file in place. Missing, unreadable, or invalid token files deny access until repaired. `q token ls` and `q token revoke NAME` manage the file. Secrets are random; nothing else is stored.
+
+### Connect a chat app (Grok, Claude, ChatGPT)
+
+1. In the app, add a custom connector with the URL `https://q.example.com/mcp`.
+2. The app discovers the OAuth endpoints and sends you to the q sign-in page.
+3. Paste your human token from `q token create` and click Allow.
+
+The connector now acts as you: it can capture, list, edit, cancel, and mark tasks ready. The `queue_ready` and `queue_reopen` tools only appear for human tokens. A connector signed in with an agent token never sees them, and the server refuses them anyway.
+
+Grok Bot and other clients that take a URL plus a static header instead of a sign-in flow work too: send `Authorization: Bearer <secret>` with a token-file secret.
+
+### Connect an agent (Codex, Claude Code, scripts)
+
+Agents that run on a machine use the `q` binary there. Two environment variables switch every command, including `q mcp`, to the server:
+
+```bash
 export Q_SERVER_URL="https://q.example.com"
-export Q_SERVER_TOKEN="..."
-q "Benchmark trace encoding variants"
+export Q_SERVER_TOKEN="<that agent's secret>"
 q claim --agent codex-vps-01 --json
 ```
 
-`--server URL` and `--token TOKEN` are global flags that override `Q_SERVER_URL` and `Q_SERVER_TOKEN`. When a server is set, `--db` is ignored and `q mcp` forwards to the server too, so an MCP client only needs the environment variables or `["mcp", "--server", "https://q.example.com", "--token", "..."]`.
+For an MCP client config, the same values go in `env`:
 
-Tokens live in a TOML file. Each has a role:
+```json
+{
+  "mcpServers": {
+    "q": {
+      "command": "/absolute/path/to/q",
+      "args": ["mcp"],
+      "env": { "Q_SERVER_URL": "https://q.example.com", "Q_SERVER_TOKEN": "..." }
+    }
+  }
+}
+```
+
+Clients that speak MCP over HTTP directly can skip the local binary and use `https://q.example.com/mcp` with the bearer header.
+
+`--server URL` and `--token TOKEN` are global flags that override `Q_SERVER_URL` and `Q_SERVER_TOKEN`. When a server is set, `--db` is ignored.
+
+### Tokens and roles
+
+Tokens live in a TOML file, by default `tokens.toml` next to the database:
 
 ```toml
 [[tokens]]
 name = "pierric"
 role = "human"
-secret = "replace-with-openssl-rand-hex-32"
+secret = "..."
 
 [[tokens]]
 name = "codex-vps"
 role = "agent"
-secret = "replace-with-openssl-rand-hex-32"
+secret = "..."
 ```
 
 Secrets must be at least 16 characters. `human` tokens may call everything. `agent` tokens cannot call `ready` or `reopen`, so an agent cannot make work claimable, and any actor an agent sends is recorded as an agent. The rule that only humans mark work ready is enforced by the server, not by convention.
 
-Without `--auth` the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. `GET /v1/health` needs no token. Put TLS in front with Caddy or nginx; `q serve` speaks plain HTTP.
+Without a token file the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. This local mode requires a restart to enable authentication after creating the first token. `--public-url` requires a token file. The systemd service always passes `--auth`, and the installer creates an empty token file before starting it. `GET /v1/health` and the OAuth discovery endpoints need no token.
 
-The wire format is `POST /v1/<method>` with the request as JSON and the result as JSON. Errors are an `{"error": {"code", "message"}}` body with a 4xx or 5xx status, and the client turns them back into the same errors the local queue returns. An unreachable server is reported as `server error: cannot reach q server at URL`.
+Agents have no domain or IP allowlist: CLI and server-to-server MCP clients send their bearer token and do not need an `Origin` header. For browser requests that do include `Origin`, q accepts only its own origin (scheme, hostname, and port), rejecting other origins, including `null`, with HTTP 403. An origin is not an agent identity and does not replace authentication.
+
+Set `--public-url https://q.example.com` behind a reverse proxy. This defines both the browser origin and OAuth server/resource URLs; request `Host` and forwarded headers cannot change them. Without it, q uses the listener's HTTP origin (the loopback address when binding all interfaces). No list of agent domains is needed.
+
+### How sign-in works
+
+`q serve` is its own small OAuth 2.1 server. Connectors discover it at `/.well-known/oauth-authorization-server`, register a client at `/oauth/register`, run the PKCE code flow through `/oauth/authorize`, and exchange the code at `/oauth/token`. The sign-in page asks for a token-file secret, and the connector gets that token's role.
+
+Client ids, access tokens, and refresh tokens are HMAC-signed with a key in `oauth.key` next to the database, created on first start. Tokens for a principal are signed with a key derived from that principal's secret, so `q token revoke` invalidates every connector that signed in with it. Access tokens last a day and refresh tokens ninety days. OAuth requests may target only this server's `/mcp` resource, and issued tokens are bound to that resource and the registered client.
+
+Refresh tokens rotate on each use. q records grant identifiers, current nonce hashes, expiration, and revocation in `oauth.db` next to the queue database. Reusing an old refresh token revokes that grant's refresh and access tokens, requiring a new sign-in; this protection survives restarts. Clients must send `client_id` when refreshing and retain the replacement refresh token. Keep `oauth.db` and `oauth.key` across upgrades; deleting the grant database requires reconnecting OAuth clients. Upgrading from the earlier stateless token format also requires a one-time OAuth sign-in. Raw token-file secrets used by agents are unaffected.
+
+The service API is `POST /v1/<method>` with the request as JSON and the result as JSON. Errors are an `{"error": {"code", "message"}}` body with a 4xx or 5xx status, and the client turns them back into the same errors the local queue returns.
 
 ## Capture and discovery
 
@@ -255,8 +307,13 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_complete` | Complete or send to review, with summary and artifacts. |
 | `queue_release` | Return a claim to ready. Requires the claim token. |
 | `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |
+| `queue_status` | Counts per status plus active and expired claims. |
+| `queue_edit` | Edit task fields, including feature, dependencies, and `clear_*` flags. |
+| `queue_cancel` | Cancel a task, keeping its history. |
+| `queue_ready` | Move a task to ready. Only listed for human tokens over `q serve`. |
+| `queue_reopen` | Move a done task back to ready. Only listed for human tokens over `q serve`. |
 
-Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError: true`. There is no free-form update tool.
+Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError: true`. Over stdio there is no ready tool: a local agent cannot make work claimable. Over `q serve`, the ready and reopen tools appear only for human tokens.
 
 `queue_claim_next` example:
 
@@ -310,7 +367,8 @@ crates/q-dispatch   eligibility rules used inside the claim transaction
 crates/q-project    git discovery and .agentqueue.toml
 crates/q-store      SQLite schema, migrations, and the service implementation
 crates/q-mcp        stdio JSON-RPC adapter
-crates/q-http       q serve (axum) and RemoteQueue, the HTTP client that implements QueueService
+crates/q-http       q serve: service API, MCP over HTTP, OAuth sign-in; and RemoteQueue, the HTTP client
+deploy/             systemd unit, Caddyfile, and install script for a VPS
 crates/q-cli        the q binary
 ```
 

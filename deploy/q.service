@@ -1,0 +1,24 @@
+# systemd unit for q serve. Install with:
+#   sudo cp deploy/q.service /etc/systemd/system/q.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now q
+[Unit]
+Description=q agent work queue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=q
+Group=q
+# Require authentication even before the first token is created.
+# --public-url must be the origin Caddy serves, so OAuth redirects are right.
+ExecStart=/usr/local/bin/q serve --bind 127.0.0.1:7777 --db /var/lib/q/queue.db --auth /var/lib/q/tokens.toml --public-url https://q.example.com
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/q
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
