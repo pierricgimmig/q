@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
+    QueueService, ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery,
+    NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -192,6 +193,8 @@ fn dispatch_tool(
         "queue_complete" => queue_complete(queue, args),
         "queue_release" => queue_release(queue, args),
         "queue_delete" => queue_delete(queue, args),
+        "queue_log" => queue_log(queue, args),
+        "queue_artifact" => queue_artifact(queue, args),
         other => Err(ToolFailure::Invalid(format!("unknown tool {other}"))),
     }
 }
@@ -467,22 +470,7 @@ fn queue_complete(
         Some(status) => Some(TaskStatus::parse(&status).map_err(ToolFailure::from)?),
         None => None,
     };
-    let mut artifacts = Vec::new();
-    if let Some(value) = args.get("artifacts") {
-        let items = value
-            .as_array()
-            .ok_or_else(|| ToolFailure::Invalid("artifacts must be an array".into()))?;
-        for item in items {
-            let object = item
-                .as_object()
-                .ok_or_else(|| ToolFailure::Invalid("each artifact must be an object".into()))?;
-            expect_keys(object, &["kind", "value"])?;
-            artifacts.push(ArtifactInput {
-                kind: required_string(object, "kind")?,
-                value: required_string(object, "value")?,
-            });
-        }
-    }
+    let artifacts = artifact_inputs(args)?;
     let detail = queue.complete(CompleteRequest {
         task_id: required_task_id(args)?,
         claim_token: Some(required_string(args, "claim_token")?),
@@ -492,6 +480,55 @@ fn queue_complete(
         actor: Actor::agent("mcp"),
     })?;
     Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
+}
+
+/// Parse the optional `artifacts` array: objects with `kind`, `value`, and
+/// optional `content` (text stored in the database).
+fn artifact_inputs(args: &Map<String, Value>) -> Result<Vec<ArtifactInput>, ToolFailure> {
+    let mut artifacts = Vec::new();
+    if let Some(value) = args.get("artifacts") {
+        let items = value
+            .as_array()
+            .ok_or_else(|| ToolFailure::Invalid("artifacts must be an array".into()))?;
+        for item in items {
+            let object = item
+                .as_object()
+                .ok_or_else(|| ToolFailure::Invalid("each artifact must be an object".into()))?;
+            expect_keys(object, &["kind", "value", "content"])?;
+            artifacts.push(ArtifactInput {
+                kind: required_string(object, "kind")?,
+                value: required_string(object, "value")?,
+                content: optional_string(object, "content")?,
+            });
+        }
+    }
+    Ok(artifacts)
+}
+
+fn queue_log(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    expect_keys(
+        args,
+        &["task_id", "id", "claim_token", "message", "artifacts"],
+    )?;
+    let detail = queue.log(LogRequest {
+        task_id: required_task_id(args)?,
+        claim_token: optional_string(args, "claim_token")?,
+        message: optional_string(args, "message")?,
+        artifacts: artifact_inputs(args)?,
+        actor: Actor::agent("mcp"),
+    })?;
+    Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
+}
+
+fn queue_artifact(
+    queue: &dyn QueueService,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["artifact_id"])?;
+    let id = optional_i64(args, "artifact_id")?
+        .ok_or_else(|| ToolFailure::Invalid("artifact_id is required".into()))?;
+    let artifact = queue.artifact(id)?;
+    Ok(serde_json::to_value(artifact).unwrap_or(Value::Null))
 }
 
 fn queue_delete(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
@@ -866,17 +903,34 @@ fn tool_definitions() -> Vec<Value> {
                     "claim_token": {"type": "string"},
                     "summary": {"type": "string"},
                     "status": {"type": "string", "enum": ["review", "done"]},
-                    "artifacts": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["kind", "value"],
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "value": {"type": "string"}
-                            }
-                        }
-                    }
+                    "artifacts": ARTIFACTS_SCHEMA
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_log",
+            "Append to a task's log: a timestamped note (thinking steps, progress), artifacts, or both. Pass the claim token so the entry is attributed to your agent id. An artifact with content stores that text (for example a Markdown or HTML report) in the database.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "claim_token": {"type": "string"},
+                    "message": {"type": "string"},
+                    "artifacts": ARTIFACTS_SCHEMA
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_artifact",
+            "Fetch one artifact by id with its stored content.",
+            json!({
+                "type": "object",
+                "required": ["artifact_id"],
+                "properties": {
+                    "artifact_id": {"type": "integer"}
                 },
                 "additionalProperties": false
             }),
@@ -910,7 +964,29 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+/// Schema for an `artifacts` array on complete and log.
+const ARTIFACTS_SCHEMA: &str = "__artifacts__";
+
+fn tool(name: &str, description: &str, mut input_schema: Value) -> Value {
+    if let Some(artifacts) = input_schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("artifacts"))
+    {
+        if artifacts.as_str() == Some(ARTIFACTS_SCHEMA) {
+            *artifacts = json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "value"],
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "value": {"type": "string"},
+                        "content": {"type": "string", "description": "Text to store in the database, such as a report body"}
+                    }
+                }
+            });
+        }
+    }
     json!({
         "name": name,
         "description": description,
@@ -1012,9 +1088,104 @@ mod tests {
             "queue_complete",
             "queue_release",
             "queue_delete",
+            "queue_log",
+            "queue_artifact",
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }
+    }
+
+    #[test]
+    fn queue_log_and_queue_artifact_round_trip() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let captured = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "log me"}}),
+        );
+        let id = tool_body(&captured)["id"].as_i64().unwrap();
+        queue
+            .mark_ready(q_core::ReadyRequest {
+                task_id: id,
+                actor: Actor::human(None),
+            })
+            .unwrap();
+        let claimed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-7"}}),
+        );
+        let token = tool_body(&claimed)["claim"]["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let logged = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_log", "arguments": {
+                "task_id": id,
+                "claim_token": token,
+                "message": "Thinking: start with the parser",
+                "artifacts": [{"kind": "report", "value": "notes.md", "content": "# Notes\n"}]
+            }}),
+        );
+        assert_eq!(logged["result"]["isError"], false, "{logged}");
+        let detail = tool_body(&logged);
+        let note = detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "task_note")
+            .unwrap();
+        assert_eq!(note["actor_id"], "bot-7");
+        let artifact_id = detail["artifacts"][0]["id"].as_i64().unwrap();
+        assert_eq!(detail["artifacts"][0]["content_bytes"], 8);
+
+        let fetched = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_artifact", "arguments": {"artifact_id": artifact_id}}),
+        );
+        assert_eq!(tool_body(&fetched)["content"], "# Notes\n");
+
+        let empty = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_log", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(empty["error"]["code"], -32602, "{empty}");
+        assert!(empty["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("message or at least one artifact"));
+
+        let unknown_key = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "note": "x"}}),
+        );
+        assert_eq!(unknown_key["error"]["code"], -32602);
     }
 
     fn tool_body(response: &Value) -> Value {

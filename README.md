@@ -203,6 +203,10 @@ q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
   --artifact report=./docs/benchmarks/trace-encoding.md
 q release 184 --claim-token TOKEN
+q log 184 "Encoder read; the varint path is the slow one" --claim-token TOKEN
+q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.md
+q log 184
+q artifact 7
 ```
 
 `q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. No eligible work is success, not an error:
@@ -216,6 +220,26 @@ Default lease is 45 minutes (minimum 1 minute, maximum 24 hours). Heartbeat exte
 Default `--max-risk` is `medium`. High and `external_action` tasks are not selected unless the claim raises the ceiling. External-action tasks also require `allow_external_actions` on the project, which defaults to false. Empty repo, project, and kind filters mean unrestricted. Required capabilities must be a subset of the worker's capabilities. Dependencies must be `done`. A project's `max_parallel_jobs` counts claimed and in-progress tasks.
 
 If the project sets `require_pr` and the task kind is implementation, `complete` lands in `review` even when the requested target is `done`. A human can then accept it with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready so it can be claimed again, or cancelled work back to inbox.
+
+## Task log and artifacts
+
+Every task has a log: the append-only event list. Each entry has a UTC timestamp, the event, who did it, and what changed. State changes are recorded by the queue itself (`task_created`, `task_ready`, `task_claimed` with the agent id, `task_started`, `task_completed`, and so on, each with the `from -> to` move). Agents add their own entries while they work:
+
+- `q log ID "message" --claim-token TOKEN` appends a `task_note`. The token attributes the note to the claiming agent; a human runs it without a token and is recorded by `$USER`.
+- `q log ID --artifact kind=value` records a reference such as a PR URL or a path. `--attach [KIND=]PATH` reads a file and stores its text in the database (kind defaults to `report`), so a Markdown or HTML report survives even if the file goes away. Both work on `q complete` too.
+- `q log ID` with nothing to add prints the log, oldest first. `q events ID` is the same list.
+- `q show ID` lists artifacts with their ids and the stored size. `q artifact ARTIFACT_ID` prints the stored content; `--json` returns the artifact with `content`.
+
+```text
+2026-09-27T04:27:43Z  task_claimed    agent:claude-fable-01  ready -> claimed
+2026-09-27T04:27:43Z  task_started    agent:claude-fable-01  claimed -> in_progress  branch agent/task-1
+2026-09-27T04:27:43Z  task_note       agent:claude-fable-01  Reading the encoder; suspect varint path
+2026-09-27T04:27:43Z  artifact_added  agent:claude-fable-01  report: report.md (artifact 2)
+2026-09-27T04:27:43Z  task_note       human:pierric          reviewer: looks right
+2026-09-27T04:27:43Z  task_completed  agent:claude-fable-01  in_progress -> done  Report committed
+```
+
+Logging never changes a task's status. A wrong or expired token is rejected the same way as on `q complete`.
 
 ## Admin
 
@@ -270,6 +294,8 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_start` | Mark a claim in progress and record branch or worktree. |
 | `queue_block` | Block claimed work. Requires the claim token. |
 | `queue_complete` | Complete or send to review, with summary and artifacts. |
+| `queue_log` | Append a note and/or artifacts to a task's log. Artifacts may carry `content` to store in the database. |
+| `queue_artifact` | Fetch one artifact by id with its stored content. |
 | `queue_release` | Return a claim to ready. Requires the claim token. |
 | `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |
 

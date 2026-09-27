@@ -12,7 +12,8 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - Capture creates an **inbox** task. Inbox work is never claimable.
 - After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json`; with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
 - A human must run `q ready ID` before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
-- Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, and release.
+- Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, release, and log.
+- Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
 - `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason. Claim tokens are still required for claimed work.
 - Default claim risk is `medium`. `high` and `external_action` are excluded unless the claim sets `--max-risk` or MCP `maximum_risk`. `external_action` also needs the project flag `allow_external_actions`, which defaults to false.
@@ -41,6 +42,10 @@ q claim --agent codex-local-01 --capability rust --json
 q heartbeat 184 --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" --artifact report=./docs/benchmarks/trace-encoding.md
+q log 184 "Encoder read; varint path is the slow one" --claim-token TOKEN
+q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.md --artifact pr=https://github.com/acme/x/pull/7
+q log 184
+q artifact 7
 q release 184 --claim-token TOKEN
 q block 184 --claim-token TOKEN
 q cancel 184
@@ -69,6 +74,8 @@ q edit 12 --clear-feature
 - `queue_start` — mark a claim in progress and record a branch or worktree
 - `queue_block` — block claimed work with the claim token
 - `queue_complete` — complete or send to review, with a summary and artifacts
+- `queue_log` — append a note and/or artifacts to the task log; pass `claim_token` so the entry carries your agent id. An artifact `{kind, value, content}` stores `content` in the database
+- `queue_artifact` — fetch one artifact by `artifact_id` with its stored content
 - `queue_release` — return a claim to ready with the claim token
 - `queue_delete` — hard-delete a task (`task_id`, optional `force`). Unlike cancel, the row and its events are removed.
 

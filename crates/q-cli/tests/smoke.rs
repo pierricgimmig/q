@@ -1187,3 +1187,148 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn log_and_artifact_commands_keep_a_per_task_log() {
+    let root = temp_root("log");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let id = add_task(db_arg, "Write the report", "alpha", None, None);
+    run(bin().args(["--db", db_arg, "ready", &id.to_string()]));
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot-9"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+    let id_arg = id.to_string();
+
+    let wrong = bin()
+        .args([
+            "--db",
+            db_arg,
+            "log",
+            &id_arg,
+            "hi",
+            "--claim-token",
+            "nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("claim token"));
+
+    let noted = run(bin().args([
+        "--db",
+        db_arg,
+        "log",
+        &id_arg,
+        "Reading the encoder",
+        "--claim-token",
+        &token,
+    ]));
+    let noted = String::from_utf8(noted.stdout).unwrap();
+    assert!(
+        noted.starts_with(&format!("logged #{id} task_note Reading the encoder")),
+        "{noted}"
+    );
+
+    let report = root.join("report.md");
+    fs::write(&report, "# Findings\n\nfine\n").unwrap();
+    run(bin().args([
+        "--db",
+        db_arg,
+        "log",
+        &id_arg,
+        "--claim-token",
+        &token,
+        "--attach",
+        report.to_str().unwrap(),
+        "--artifact",
+        "pr=https://example.com/pr/1",
+    ]));
+
+    // Humans annotate without a token.
+    run(bin()
+        .env("USER", "reviewer")
+        .args(["--db", db_arg, "log", &id_arg, "looks right"]));
+
+    let log = run(bin().args(["--db", db_arg, "log", &id_arg]));
+    let log = String::from_utf8(log.stdout).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(lines[0].contains("task_created"), "{log}");
+    assert!(
+        lines.iter().any(|line| line.contains("task_claimed")
+            && line.contains("agent:bot-9")
+            && line.contains("ready -> claimed")),
+        "{log}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("task_note")
+            && line.contains("agent:bot-9")
+            && line.contains("Reading the encoder")),
+        "{log}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("artifact_added")
+                && line.contains("pr: https://example.com/pr/1")),
+        "{log}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("task_note")
+            && line.contains("human:reviewer")
+            && line.contains("looks right")),
+        "{log}"
+    );
+    let detail_columns: std::collections::HashSet<usize> = lines
+        .iter()
+        .map(|line| {
+            line.find("  human:")
+                .or_else(|| line.find("  agent:"))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(detail_columns.len(), 1, "actor column is aligned: {log}");
+
+    let shown = run(bin().args(["--db", db_arg, "show", &id_arg]));
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains("report: "), "{shown}");
+    assert!(shown.contains("bytes stored, q artifact "), "{shown}");
+    let json = run(bin().args(["--db", db_arg, "--json", "show", &id_arg]));
+    let detail: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let stored = detail["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "report")
+        .unwrap();
+    assert_eq!(stored["content_bytes"], 17);
+    let reference = detail["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "pr")
+        .unwrap();
+    assert!(reference.get("content_bytes").is_none());
+
+    let artifact_id = stored["id"].as_i64().unwrap().to_string();
+    let content = run(bin().args(["--db", db_arg, "artifact", &artifact_id]));
+    assert_eq!(
+        String::from_utf8(content.stdout).unwrap(),
+        "# Findings\n\nfine\n"
+    );
+    let reference_id = reference["id"].as_i64().unwrap().to_string();
+    let plain = run(bin().args(["--db", db_arg, "artifact", &reference_id]));
+    assert!(String::from_utf8(plain.stdout)
+        .unwrap()
+        .contains("reference only"));
+
+    let events = run(bin().args(["--db", db_arg, "--json", "events", &id_arg]));
+    let events: Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == "task_note"));
+
+    let _ = fs::remove_dir_all(root);
+}

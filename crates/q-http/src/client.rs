@@ -5,11 +5,12 @@
 use std::time::Duration;
 
 use q_core::{
-    Actor, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimOutcome, ClaimRequest,
-    CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest,
-    EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter, QueueError,
-    QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord,
-    ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary, TaskTree, TreeQuery,
+    Actor, ArtifactContent, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimOutcome,
+    ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome,
+    DeleteRequest, EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter,
+    LogRequest, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
+    RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary, TaskTree,
+    TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -159,6 +160,14 @@ impl QueueService for RemoteQueue {
 
     fn recover_stale(&self, request: RecoverRequest) -> Result<Vec<RecoveryRecord>, QueueError> {
         self.call("recover_stale", &request)
+    }
+
+    fn log(&self, request: LogRequest) -> Result<TaskDetail, QueueError> {
+        self.call("log", &request)
+    }
+
+    fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError> {
+        self.call("artifact", &IdBody { id: artifact_id })
     }
 
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError> {

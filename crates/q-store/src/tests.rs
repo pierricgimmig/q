@@ -9,9 +9,9 @@ use rusqlite::{params, Connection};
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
     CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
-    HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, ReadyRequest,
-    RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, TaskKind,
-    TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
+    HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
+    ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
+    TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -138,7 +138,7 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let feature_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
@@ -403,10 +403,10 @@ fn complete_release_and_block_require_the_claim_token() {
             claim_token: Some(token),
             summary: "Benchmark report committed".into(),
             target: Some(TaskStatus::Done),
-            artifacts: vec![ArtifactInput {
-                kind: "report".into(),
-                value: "./docs/benchmarks/trace-encoding.md".into(),
-            }],
+            artifacts: vec![ArtifactInput::reference(
+                "report",
+                "./docs/benchmarks/trace-encoding.md",
+            )],
             actor: actor(),
         })
         .unwrap();
@@ -833,10 +833,7 @@ fn delete_rejects_an_active_claim_unless_forced_and_clears_it() {
             claim_token: Some(token),
             summary: "shipped".into(),
             target: Some(TaskStatus::Done),
-            artifacts: vec![ArtifactInput {
-                kind: "report".into(),
-                value: "notes".into(),
-            }],
+            artifacts: vec![ArtifactInput::reference("report", "notes")],
             actor: actor(),
         })
         .unwrap();
@@ -1466,7 +1463,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let rejected = conn.execute(
         "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
         params![task_id],
@@ -1685,4 +1682,191 @@ fn tree_cycle_from_a_raw_edge_does_not_panic() {
     assert_eq!(back.id, left);
     assert!(back.cycle);
     assert!(back.depends_on.is_empty());
+}
+
+#[test]
+fn log_appends_attributed_notes_and_stored_artifacts() {
+    let (queue, _path) = queue();
+    let id = capture(&queue, "log me");
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-log").claim.unwrap().token;
+
+    let err = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some("nope".into()),
+            message: Some("hello".into()),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, QueueError::TokenMismatch), "{err}");
+
+    let err = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: Some("   ".into()),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, QueueError::InvalidInput(_)), "{err}");
+
+    let detail = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: Some("  Reading the encoder  ".into()),
+            artifacts: vec![
+                ArtifactInput::reference("pr", "https://example.com/pr/1"),
+                ArtifactInput {
+                    kind: "report".into(),
+                    value: "report.md".into(),
+                    content: Some("# Report\n\nfine\n".into()),
+                },
+            ],
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(
+        detail.task.status,
+        TaskStatus::Claimed,
+        "log does not move status"
+    );
+    let note = detail
+        .events
+        .iter()
+        .find(|event| event.event_type == q_core::NOTE_EVENT)
+        .unwrap();
+    assert_eq!(note.actor_type, "agent");
+    assert_eq!(note.actor_id.as_deref(), Some("agent-log"));
+    assert_eq!(note.payload["message"], "Reading the encoder");
+    assert_eq!(note.payload["artifact_ids"].as_array().unwrap().len(), 2);
+    let reference = detail.artifacts.iter().find(|a| a.kind == "pr").unwrap();
+    assert_eq!(reference.content_bytes, None);
+    let report = detail
+        .artifacts
+        .iter()
+        .find(|a| a.kind == "report")
+        .unwrap();
+    assert_eq!(report.content_bytes, Some(15));
+    assert_eq!(
+        queue.artifact(report.id).unwrap().content.as_deref(),
+        Some("# Report\n\nfine\n")
+    );
+    assert_eq!(queue.artifact(reference.id).unwrap().content, None);
+    assert!(queue.artifact(999_999).is_err());
+    let added = detail
+        .events
+        .iter()
+        .filter(|event| event.event_type == "artifact_added")
+        .count();
+    assert_eq!(added, 2);
+
+    // A human can annotate without a token and is recorded as human.
+    let detail = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: None,
+            message: Some("reviewer: looks right".into()),
+            artifacts: vec![],
+            actor: Actor::human(Some("pierric".into())),
+        })
+        .unwrap();
+    let last = detail.events.last().unwrap();
+    assert_eq!(last.event_type, q_core::NOTE_EVENT);
+    assert_eq!(last.actor_type, "human");
+    assert_eq!(last.actor_id.as_deref(), Some("pierric"));
+
+    // The full log keeps every entry in order.
+    let types: Vec<String> = queue
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "task_created",
+            "task_edited",
+            "task_ready",
+            "task_claimed",
+            "artifact_added",
+            "artifact_added",
+            "task_note",
+            "task_note",
+        ]
+    );
+}
+
+#[test]
+fn migration_v3_adds_artifact_content_and_keeps_legacy_rows() {
+    let path = temp_db();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(super::schema::SCHEMA_V1).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+         );
+         INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-01-01T00:00:00Z');
+         INSERT INTO tasks (
+            public_id, title, original_capture, status, kind, priority, risk, capture_path,
+            required_capabilities_json, created_at, updated_at
+         ) VALUES (
+            '018f1a7e-7b6a-7c10-8000-000000000002', 'legacy', 'legacy', 'done',
+            'implementation', 0, 'low', '/tmp', '[]', '2026-01-01T00:00:00Z',
+            '2026-01-01T00:00:00Z'
+         );
+         INSERT INTO artifacts (task_id, kind, value, created_at)
+         VALUES (1, 'pr', 'https://example.com/pr/1', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let queue = Queue::open(&path).unwrap();
+    let detail = queue.get(1).unwrap();
+    assert_eq!(detail.artifacts.len(), 1);
+    assert_eq!(detail.artifacts[0].content_bytes, None);
+    let legacy = queue.artifact(detail.artifacts[0].id).unwrap();
+    assert_eq!(legacy.content, None);
+    assert_eq!(legacy.artifact.kind, "pr");
+
+    let detail = queue
+        .log(LogRequest {
+            task_id: 1,
+            claim_token: None,
+            message: None,
+            artifacts: vec![ArtifactInput {
+                kind: "report".into(),
+                value: "report.html".into(),
+                content: Some("<h1>Report</h1>".into()),
+            }],
+            actor: actor(),
+        })
+        .unwrap();
+    let stored = detail
+        .artifacts
+        .iter()
+        .find(|a| a.kind == "report")
+        .unwrap();
+    assert_eq!(stored.content_bytes, Some(15));
+    assert_eq!(
+        queue.artifact(stored.id).unwrap().content.as_deref(),
+        Some("<h1>Report</h1>")
+    );
+
+    // Reopening applies nothing new and keeps the version.
+    drop(queue);
+    let queue = Queue::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 3);
+    assert_eq!(queue.get(1).unwrap().artifacts.len(), 2);
 }

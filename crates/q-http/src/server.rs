@@ -27,8 +27,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use q_core::{
     Actor, ActorKind, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest, TreeQuery,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
+    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest, TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -318,6 +318,15 @@ pub fn dispatch(
             stamp(&mut request.actor, principal);
             reply(queue.recover_stale(request))
         }
+        "log" => {
+            let mut request: LogRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.log(request))
+        }
+        "artifact" => {
+            let IdBody { id } = parse(body)?;
+            reply(queue.artifact(id))
+        }
         "events" => {
             let IdBody { id } = parse(body)?;
             reply(queue.events(id))
@@ -506,6 +515,12 @@ mod tests {
                 &self,
                 _: RecoverRequest,
             ) -> Result<Vec<q_core::RecoveryRecord>, QueueError> {
+                unreachable!()
+            }
+            fn log(&self, _: LogRequest) -> Result<q_core::TaskDetail, QueueError> {
+                unreachable!()
+            }
+            fn artifact(&self, _: i64) -> Result<q_core::ArtifactContent, QueueError> {
                 unreachable!()
             }
             fn events(&self, _: i64) -> Result<Vec<q_core::Event>, QueueError> {
