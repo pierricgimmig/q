@@ -131,6 +131,8 @@ fn is_value_flag(arg: &str) -> bool {
             | "--depends-on"
             | "--limit"
             | "--interval"
+            | "--rows"
+            | "--cols"
             | "--body-file"
             | "--to"
             | "--artifact"
@@ -294,6 +296,12 @@ pub enum Commands {
         /// Draw one frame and exit instead of refreshing.
         #[arg(long)]
         once: bool,
+        /// Fit the frame to this many rows. Defaults to the terminal height.
+        #[arg(long, value_name = "N")]
+        rows: Option<usize>,
+        /// Fit each line to this many columns. Defaults to the terminal width.
+        #[arg(long, value_name = "N")]
+        cols: Option<usize>,
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show {
@@ -738,20 +746,26 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["q", "--color", "rainbow", "ls"]).is_err());
 
-        let top =
-            Cli::try_parse_from(["q", "top", "-i", "0.5", "-n", "5", "-a", "--once"]).unwrap();
+        let top = Cli::try_parse_from([
+            "q", "top", "-i", "0.5", "-n", "5", "-a", "--once", "--rows", "20", "--cols", "80",
+        ])
+        .unwrap();
         match top.command {
             Commands::Top {
                 interval,
                 limit,
                 all,
                 once,
+                rows,
+                cols,
                 ..
             } => {
                 assert_eq!(interval, 0.5);
                 assert_eq!(limit, 5);
                 assert!(all);
                 assert!(once);
+                assert_eq!(rows, Some(20));
+                assert_eq!(cols, Some(80));
             }
             other => panic!("unexpected {other:?}"),
         }

@@ -1121,6 +1121,68 @@ fn top_once_prints_counts_table_and_changes() {
     assert!(!fast.status.success());
     assert!(String::from_utf8_lossy(&fast.stderr).contains("--interval"));
 
+    // The table has priority over recent changes when the frame is fitted.
+    for n in 2..=14 {
+        add_task(
+            db_arg,
+            &format!("Task {n} with a title long enough to need cutting on a narrow screen"),
+            "alpha",
+            None,
+            None,
+        );
+    }
+    let fitted = run(bin().args([
+        "--db", db_arg, "top", "--once", "--rows", "14", "--cols", "70",
+    ]));
+    let fitted = String::from_utf8(fitted.stdout).unwrap();
+    let lines: Vec<&str> = fitted.lines().collect();
+    assert!(lines[1].starts_with("inbox "), "{fitted}");
+    assert!(
+        lines[2].starts_with("claims 0 active"),
+        "counts split at 70 cols: {fitted}"
+    );
+    assert!(lines[2].chars().count() <= 70, "{fitted}");
+    let table: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.contains("  inbox   ") || line.contains("  ready   "))
+        .collect();
+    assert!(
+        table.iter().all(|line| line.chars().count() <= 70),
+        "{fitted}"
+    );
+    assert!(
+        table.iter().all(|line| line.ends_with('…')),
+        "titles are cut: {fitted}"
+    );
+    let more = lines
+        .iter()
+        .find(|line| line.ends_with("more; pass -n or a taller terminal"))
+        .expect("hidden count");
+    let hidden: usize = more.split_whitespace().next().unwrap().parse().unwrap();
+    assert_eq!(table.len() + hidden, 14, "{fitted}");
+    assert!(
+        !fitted.contains("recent changes"),
+        "no room left for changes: {fitted}"
+    );
+    // Head (1 + 2 wrapped-or-split) + blank + header + rows + more <= rows - 1.
+    assert!(lines.len() <= 13, "{fitted}");
+
+    let tall = run(bin().args([
+        "--db", db_arg, "top", "--once", "--rows", "40", "--cols", "200",
+    ]));
+    let tall = String::from_utf8(tall.stdout).unwrap();
+    assert_eq!(
+        tall.matches("  inbox   ").count() + tall.matches("  ready   ").count(),
+        14,
+        "{tall}"
+    );
+    assert!(!tall.contains("more; pass -n"), "{tall}");
+    assert!(tall.contains("recent changes\n  none yet"), "{tall}");
+    assert!(
+        tall.lines().nth(1).unwrap().contains("|  claims 0 active"),
+        "one line at 200 cols: {tall}"
+    );
+
     let _ = fs::remove_dir_all(root);
 }
 
