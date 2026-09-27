@@ -117,7 +117,10 @@ fn capture_ready_and_claim_json_stay_on_protocol_streams() {
     let ready_out = String::from_utf8_lossy(&ready.stdout);
     assert!(ready_out.contains("ready"), "{ready_out}");
     let ready_err = String::from_utf8_lossy(&ready.stderr);
-    assert!(ready_err.contains("Goal"), "{ready_err}");
+    assert!(
+        !ready_err.contains("missing recommended section"),
+        "sparse bodies do not warn on ready: {ready_err}"
+    );
     let shown = run(bin().args([
         "--db",
         db.to_str().unwrap(),

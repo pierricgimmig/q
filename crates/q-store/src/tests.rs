@@ -196,10 +196,11 @@ fn sparse_inbox_task_can_be_marked_ready() {
         })
         .unwrap();
     assert_eq!(outcome.task.status, TaskStatus::Ready);
-    assert!(outcome
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("Goal")));
+    assert!(
+        outcome.warnings.is_empty(),
+        "a sparse body is not a warning: {:?}",
+        outcome.warnings
+    );
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
     let events = queue.events(id).unwrap();
     assert!(events.iter().any(|event| event.event_type == "task_ready"));

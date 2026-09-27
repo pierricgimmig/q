@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
-    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
-    Actor, Artifact, ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
-    Claim, ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest,
-    CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
-    EditRequest, Event, Feature, HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy,
-    QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
-    RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task,
-    TaskDetail, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
+    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, Actor, Artifact,
+    ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
+    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
+    DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
+    Feature, HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
+    QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest,
+    RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind,
+    TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -1373,15 +1373,14 @@ impl QueueService for Queue {
         let (_, now) = now_parts();
         let task = load_task_in(&tx, request.task_id)?;
         ensure_transition(task.status, TaskStatus::Ready)?;
-        let risk_note = if task.risk >= RiskLevel::High {
-            Some(format!(
+        let warnings: Vec<String> = if task.risk >= RiskLevel::High {
+            vec![format!(
                 "risk is {}; default claims will not select this task",
                 task.risk
-            ))
+            )]
         } else {
-            None
+            Vec::new()
         };
-        let warnings = readiness_warnings(task.body.as_deref(), risk_note);
         set_status(&tx, task.id, task.status, TaskStatus::Ready, &now)?;
         tx.execute(
             "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
