@@ -130,6 +130,14 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     if current < 2 {
         apply_v2(&tx, &applied_at)?;
     }
+    if current < 3 {
+        apply_v3(&tx, &applied_at)?;
+    }
+    // Additive column checks run on every open, independent of the version
+    // row. A database migrated by another branch can already sit above the
+    // version a step is gated on, as `apply_v2` guards `feature_id` too.
+    ensure_artifact_content(&tx)?;
+    ensure_task_progress(&tx)?;
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
@@ -166,5 +174,49 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), Queu
         params![applied_at],
     )
     .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+/// v3: artifacts may store their content (a report body) in the database.
+fn apply_v3(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    ensure_artifact_content(tx)?;
+    ensure_task_progress(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+/// Add `artifacts.content` when it is missing. Safe to call on every open.
+fn ensure_artifact_content(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    let has_content: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('artifacts') WHERE name = 'content'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueueError::Database(err.to_string()))?;
+    if has_content == 0 {
+        tx.execute_batch("ALTER TABLE artifacts ADD COLUMN content TEXT;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Add `tasks.progress` (percent complete) when it is missing.
+fn ensure_task_progress(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    let has_progress: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'progress'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueueError::Database(err.to_string()))?;
+    if has_progress == 0 {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN progress INTEGER;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
     Ok(())
 }

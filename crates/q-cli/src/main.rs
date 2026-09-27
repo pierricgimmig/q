@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 use anstyle::Style;
 use clap::Parser;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
     CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
-    EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
-    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
+    EditFeatureRequest, EditRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode,
+    TreeQuery,
 };
 use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
@@ -127,6 +129,54 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             let (queue, _) = open_service(&cli)?;
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
+        }
+        Commands::Top {
+            interval,
+            status,
+            kind,
+            limit,
+            all,
+            feature,
+            once,
+        } => {
+            let (interval, limit, all, once) = (*interval, *limit, *all, *once);
+            let (status, kind, feature) = (status.clone(), kind.clone(), feature.clone());
+            if ui.json {
+                return Err(CliError::message(
+                    "q top is interactive; use q ls --json or q status --json",
+                ));
+            }
+            if !interval.is_finite() || interval < 0.1 {
+                return Err(CliError::message("--interval must be at least 0.1 seconds"));
+            }
+            let status = match status {
+                Some(status) => Some(TaskStatus::parse(&status)?),
+                None => None,
+            };
+            let kind = match kind {
+                Some(kind) => Some(TaskKind::parse(&kind)?),
+                None => None,
+            };
+            let filter = ListFilter {
+                status,
+                project: project.clone(),
+                repo: repo.clone(),
+                kind,
+                feature,
+                limit: TOP_FETCH_LIMIT,
+                include_terminal: true,
+            };
+            let screen = io::stdout().is_terminal() && !once;
+            let options = TopOptions {
+                interval: std::time::Duration::from_secs_f64(interval),
+                show_terminal: all || filter.status.is_some(),
+                limit: limit.max(1) as usize,
+                once,
+                screen,
+                keys: screen && io::stdin().is_terminal(),
+            };
+            let (queue, backend) = open_service(&cli)?;
+            run_top(queue.as_ref(), &backend, &filter, &options, &ui).await
         }
         Commands::Serve {
             bind,
@@ -350,13 +400,19 @@ fn dispatch(
             risk,
             body,
             body_file,
+            edit,
             capability,
             agent_pool,
             depends_on,
             feature,
+            hold,
         } => {
             let context = resolve_context(directory, repo, project)?;
-            let body = read_body(body, body_file.as_deref())?;
+            let mut body = read_body(body, body_file.as_deref())?;
+            if edit {
+                let seed = body.clone().unwrap_or_else(q_core::body_template);
+                body = require_editor(edit_in_editor(&seed)?)?;
+            }
             let kind = match kind {
                 Some(kind) => TaskKind::parse(&kind)?,
                 None => context.default_kind.unwrap_or(TaskKind::Implementation),
@@ -386,10 +442,11 @@ fn dispatch(
                 context_source: serde_json::to_value(context.source)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string)),
+                hold,
             })?;
             let id = task.id;
             emit(ui, &task, || {
-                confirm(ui, "captured", id, task.status.as_str(), &task.title);
+                confirm_capture(ui, id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
@@ -440,6 +497,7 @@ fn dispatch(
             title,
             body,
             body_file,
+            edit,
             kind,
             priority,
             risk,
@@ -478,7 +536,13 @@ fn dispatch(
             request.clear_agent_pool = clear_agent_pool;
             request.feature = feature;
             request.clear_feature = clear_feature;
-            if !request.has_changes() {
+            if edit {
+                let seed = match request.body.take() {
+                    Some(body) => body,
+                    None => queue.get(id)?.task.body.unwrap_or_default(),
+                };
+                request.body = Some(require_editor(edit_in_editor(&seed)?)?.unwrap_or_default());
+            } else if !request.has_changes() {
                 let current = queue.get(id)?;
                 let edited = edit_in_editor(current.task.body.as_deref().unwrap_or(""))?;
                 match edited {
@@ -496,17 +560,31 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Ready { id } => {
-            let outcome = queue.mark_ready(ReadyRequest {
+        Commands::Ready { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                let outcome = queue.mark_ready(ReadyRequest {
+                    task_id: id,
+                    actor: human_actor(),
+                })?;
+                for warning in &outcome.warnings {
+                    eprintln!("{} {warning}", ui.err.warning_label());
+                }
+                Ok(outcome)
+            },
+            |outcome| {
+                let task = &outcome.task;
+                confirm(ui, "ready", task.id, task.status.as_str(), &task.title);
+            },
+        ),
+        Commands::Hold { id } => {
+            let task = queue.hold(HoldRequest {
                 task_id: id,
                 actor: human_actor(),
             })?;
-            for warning in &outcome.warnings {
-                eprintln!("{} {warning}", ui.err.warning_label());
-            }
-            let task = &outcome.task;
-            emit(ui, &outcome, || {
-                confirm(ui, "ready", task.id, task.status.as_str(), &task.title);
+            emit(ui, &task, || {
+                confirm(ui, "held", task.id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
@@ -521,23 +599,28 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Cancel { id } => {
-            let task = queue.cancel(CancelRequest {
-                task_id: id,
-                actor: human_actor(),
-            })?;
-            emit(ui, &task, || {
-                confirm(ui, "cancelled", task.id, task.status.as_str(), &task.title);
-            });
-            Ok(())
-        }
-        Commands::Delete { id, force } => {
-            let outcome = queue.delete(DeleteRequest {
-                task_id: id,
-                force,
-                actor: human_actor(),
-            })?;
-            emit(ui, &outcome, || {
+        Commands::Cancel { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                Ok(queue.cancel(CancelRequest {
+                    task_id: id,
+                    actor: human_actor(),
+                })?)
+            },
+            |task| confirm(ui, "cancelled", task.id, task.status.as_str(), &task.title),
+        ),
+        Commands::Delete { ids, force } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                Ok(queue.delete(DeleteRequest {
+                    task_id: id,
+                    force,
+                    actor: human_actor(),
+                })?)
+            },
+            |outcome| {
                 confirm(
                     ui,
                     "deleted",
@@ -558,9 +641,8 @@ fn dispatch(
                         outcome.dependencies_removed
                     ))
                 );
-            });
-            Ok(())
-        }
+            },
+        ),
         Commands::Claim {
             agent,
             capability,
@@ -602,6 +684,7 @@ fn dispatch(
                         "lease_expires_at: {}",
                         ui.out.dim(&format_timestamp(claim.lease_expires_at))
                     );
+                    print_progress_hint(ui, task.task.id, &claim.token);
                 } else {
                     println!("no eligible ready tasks");
                 }
@@ -640,7 +723,7 @@ fn dispatch(
         } => {
             let detail = queue.start(StartRequest {
                 task_id: id,
-                claim_token,
+                claim_token: claim_token.clone(),
                 branch,
                 worktree_path: worktree,
                 actor: human_actor(),
@@ -653,6 +736,7 @@ fn dispatch(
                     detail.task.status.as_str(),
                     &detail.task.title,
                 );
+                print_progress_hint(ui, detail.task.id, &claim_token);
             });
             Ok(())
         }
@@ -662,15 +746,13 @@ fn dispatch(
             summary,
             status,
             artifact,
+            attach,
         } => {
             let target = match status {
                 Some(status) => Some(TaskStatus::parse(&status)?),
                 None => None,
             };
-            let mut artifacts = Vec::new();
-            for item in artifact {
-                artifacts.push(parse_artifact(&item)?);
-            }
+            let artifacts = collect_artifacts(artifact, attach)?;
             let detail = queue.complete(CompleteRequest {
                 task_id: id,
                 claim_token,
@@ -745,16 +827,73 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Reopen { id } => {
-            let task = queue.reopen(id, human_actor())?;
-            emit(ui, &task, || {
-                confirm(ui, "reopened", task.id, task.status.as_str(), &task.title);
+        Commands::Reopen { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| Ok(queue.reopen(id, human_actor())?),
+            |task| confirm(ui, "reopened", task.id, task.status.as_str(), &task.title),
+        ),
+        Commands::Log {
+            id,
+            message,
+            claim_token,
+            progress,
+            artifact,
+            attach,
+        } => {
+            let artifacts = collect_artifacts(artifact, attach)?;
+            let message = message.filter(|text| !text.trim().is_empty());
+            if message.is_none() && progress.is_none() && artifacts.is_empty() {
+                let events = queue.events(id)?;
+                emit(ui, &serde_json::json!({"events": events}), || {
+                    print_events(&events, ui.out, "");
+                });
+                return Ok(());
+            }
+            let added = artifacts.len();
+            let detail = queue.log(LogRequest {
+                task_id: id,
+                claim_token,
+                message,
+                progress,
+                artifacts,
+                actor: human_actor(),
+            })?;
+            emit(ui, &detail, || {
+                let last = detail.events.last();
+                println!(
+                    "logged {} {}",
+                    ui.out.dim(&format!("#{id}")),
+                    match last {
+                        Some(event) => describe_event(event, ui.out),
+                        None => format!("{added} artifact(s)"),
+                    }
+                );
+            });
+            Ok(())
+        }
+        Commands::Artifact { id } => {
+            let artifact = queue.artifact(id)?;
+            emit(ui, &artifact, || match &artifact.content {
+                Some(content) => {
+                    print!("{content}");
+                    if !content.ends_with('\n') {
+                        println!();
+                    }
+                }
+                None => println!(
+                    "{}: {} {}",
+                    artifact.artifact.kind,
+                    artifact.artifact.value,
+                    ui.out.dim("(reference only, no stored content)")
+                ),
             });
             Ok(())
         }
         Commands::Feature { command } => dispatch_feature(queue, command, ui),
         Commands::Project { .. }
         | Commands::Mcp
+        | Commands::Top { .. }
         | Commands::Serve { .. }
         | Commands::Token { .. }
         | Commands::Skill { .. } => {
@@ -953,10 +1092,54 @@ fn parse_artifact(value: &str) -> Result<ArtifactInput, CliError> {
     if kind.is_empty() || artifact_value.is_empty() {
         return Err(CliError::message("artifact kind and value are required"));
     }
+    Ok(ArtifactInput::reference(kind, artifact_value))
+}
+
+/// `--artifact kind=value` references plus `--attach [kind=]path` files whose
+/// text is stored in the database.
+fn collect_artifacts(
+    references: Vec<String>,
+    attachments: Vec<PathBuf>,
+) -> Result<Vec<ArtifactInput>, CliError> {
+    let mut artifacts = Vec::new();
+    for item in references {
+        artifacts.push(parse_artifact(&item)?);
+    }
+    for item in attachments {
+        artifacts.push(read_attachment(&item)?);
+    }
+    Ok(artifacts)
+}
+
+const ATTACH_DEFAULT_KIND: &str = "report";
+
+fn read_attachment(spec: &Path) -> Result<ArtifactInput, CliError> {
+    let text = spec.to_string_lossy();
+    let (kind, path) = match text.split_once('=') {
+        Some((kind, path)) if !kind.trim().is_empty() && !kind.contains(['/', '\\']) => {
+            (kind.trim().to_string(), PathBuf::from(path.trim()))
+        }
+        _ => (ATTACH_DEFAULT_KIND.to_string(), spec.to_path_buf()),
+    };
+    let content = fs::read_to_string(&path)
+        .map_err(|err| CliError::message(format!("read {}: {err}", path.display())))?;
     Ok(ArtifactInput {
-        kind: kind.to_string(),
-        value: artifact_value.to_string(),
+        kind,
+        value: path.display().to_string(),
+        content: Some(content),
     })
+}
+
+/// Turn the editor result into a body. `None` means no editor is configured;
+/// a blank result means no body.
+fn require_editor(edited: Option<String>) -> Result<Option<String>, CliError> {
+    match edited {
+        Some(body) if body.trim().is_empty() => Ok(None),
+        Some(body) => Ok(Some(body)),
+        None => Err(CliError::message(
+            "--edit needs $VISUAL or $EDITOR to be set",
+        )),
+    }
 }
 
 fn edit_in_editor(current: &str) -> Result<Option<String>, CliError> {
@@ -983,11 +1166,99 @@ fn edit_in_editor(current: &str) -> Result<Option<String>, CliError> {
 
 fn emit(ui: &Ui, value: &impl serde::Serialize, human: impl FnOnce()) {
     if ui.json {
-        serde_json::to_writer_pretty(io::stdout(), value).expect("write json");
-        println!();
+        print_json(value);
     } else {
         human();
     }
+}
+
+fn print_json(value: &impl serde::Serialize) {
+    serde_json::to_writer_pretty(io::stdout(), value).expect("write json");
+    println!();
+}
+
+/// One failed id in a multi-id command, as reported under `errors` in `--json`.
+#[derive(serde::Serialize)]
+struct TaskError {
+    id: i64,
+    error: String,
+}
+
+/// Machine output for a lifecycle command given more than one id.
+#[derive(serde::Serialize)]
+struct BatchOutcome<T: serde::Serialize> {
+    results: Vec<T>,
+    errors: Vec<TaskError>,
+}
+
+/// Apply a lifecycle command to each id in order.
+///
+/// With exactly one id the behavior is unchanged: the outcome document is
+/// printed (or the human confirmation), and an error propagates as before.
+/// With several ids, each failure is reported for that id and the rest still
+/// run. Human output prints one confirmation or error line per id as it
+/// happens; `--json` prints a single `{"results":[...],"errors":[...]}`
+/// document where each result has the single-id shape. The command exits
+/// non-zero if any id failed.
+fn for_each_task<T: serde::Serialize>(
+    ui: &Ui,
+    ids: &[i64],
+    mut act: impl FnMut(i64) -> Result<T, CliError>,
+    human: impl Fn(&T),
+) -> Result<(), CliError> {
+    let single = ids.len() == 1;
+    let mut results = Vec::with_capacity(ids.len());
+    let mut errors = Vec::new();
+    for &id in ids {
+        match act(id) {
+            Ok(outcome) => {
+                if !ui.json {
+                    human(&outcome);
+                }
+                results.push(outcome);
+            }
+            Err(error) if single => return Err(error),
+            Err(error) => {
+                if !ui.json {
+                    eprintln!(
+                        "{} {} {error}",
+                        ui.err.error_label(),
+                        ui.err.dim(&format!("#{id}"))
+                    );
+                }
+                errors.push(TaskError {
+                    id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    let failed = errors.len();
+    if ui.json {
+        match results.as_slice() {
+            [only] if single => print_json(only),
+            _ => print_json(&BatchOutcome { results, errors }),
+        }
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(CliError::message(format!(
+            "{failed} of {} tasks failed",
+            ids.len()
+        )))
+    }
+}
+
+/// Printed after a claim or start so an agent sees how to keep `PROG`
+/// current without reading the skill. The command is ready to paste.
+fn print_progress_hint(ui: &Ui, id: i64, token: &str) {
+    println!(
+        "{}",
+        ui.out.dim(&format!(
+            "report progress: q log {id} --progress <0-100> --claim-token {token}"
+        ))
+    );
 }
 
 fn confirm(ui: &Ui, verb: &str, id: i64, status: &str, title: &str) {
@@ -997,6 +1268,22 @@ fn confirm(ui: &Ui, verb: &str, id: i64, status: &str, title: &str) {
         ui.out.status(status),
         ui.out.bold(title),
     );
+}
+
+/// Capture confirmation: a blank line, then exactly one line. The title is
+/// collapsed to one line and truncated with an ellipsis like `q ls`.
+fn confirm_capture(ui: &Ui, id: i64, status: &str, title: &str) {
+    println!();
+    println!("{}", capture_line(ui.out, id, status, title));
+}
+
+fn capture_line(paint: Paint, id: i64, status: &str, title: &str) -> String {
+    format!(
+        "captured {} [{}] {}",
+        paint.dim(&format!("#{id}")),
+        paint.status(status),
+        paint.bold(&format_list_title(title)),
+    )
 }
 
 fn meta(paint: Paint, line: &str) {
@@ -1059,10 +1346,423 @@ fn source_name(source: q_project::ContextSource) -> &'static str {
     }
 }
 
+/// Store maximum. `q top` fetches this many so completions and deletions
+/// beyond the visible rows still show up as changes.
+const TOP_FETCH_LIMIT: u32 = 500;
+const TOP_CHANGE_ROWS: usize = 10;
+
+struct TopOptions {
+    interval: std::time::Duration,
+    show_terminal: bool,
+    limit: usize,
+    once: bool,
+    /// Redraw in place with ANSI clears. Off when stdout is not a terminal.
+    screen: bool,
+    /// Put the terminal in raw mode so typed keys are not echoed and `q`
+    /// quits. Off when stdin or stdout is not a terminal; Ctrl-C quits then.
+    keys: bool,
+}
+
+/// One line in the recent-changes list, with the time it was noticed.
+struct TopChange {
+    at: OffsetDateTime,
+    id: i64,
+    /// Status before the change. `None` for a task seen for the first time.
+    from: Option<TaskStatus>,
+    /// Status after the change. `None` when the task was deleted.
+    to: Option<TaskStatus>,
+    /// Progress after the change, shown next to a non-terminal status.
+    progress: Option<u8>,
+    title: String,
+}
+
+const TOP_CHANGE_NEW: &str = "new";
+const TOP_CHANGE_DELETED: &str = "deleted";
+
+impl TopChange {
+    fn before_label(&self) -> &str {
+        self.from.map(TaskStatus::as_str).unwrap_or(TOP_CHANGE_NEW)
+    }
+
+    fn after_label(&self) -> String {
+        match (self.to, self.progress) {
+            (None, _) => TOP_CHANGE_DELETED.to_string(),
+            (Some(status), Some(percent))
+                if !matches!(status, TaskStatus::Done | TaskStatus::Cancelled) =>
+            {
+                format!("{} {percent}%", status.as_str())
+            }
+            (Some(status), _) => status.as_str().to_string(),
+        }
+    }
+}
+
+async fn run_top(
+    queue: &dyn QueueService,
+    backend: &Backend,
+    filter: &ListFilter,
+    options: &TopOptions,
+    ui: &Ui,
+) -> Result<(), CliError> {
+    let mut previous: Option<std::collections::HashMap<i64, TaskSummary>> = None;
+    let mut changes: std::collections::VecDeque<TopChange> = std::collections::VecDeque::new();
+    let mut stdout = io::stdout();
+    // The guard restores the terminal when it drops: on quit, on error, and
+    // while unwinding from a panic. The last frame stays on screen so the
+    // final state is still readable.
+    let _terminal = TopTerminal::enter(options)?;
+    let mut keys = options.keys.then(spawn_key_reader);
+    loop {
+        let frame = top_frame(
+            queue,
+            backend,
+            filter,
+            options,
+            ui.out,
+            &mut previous,
+            &mut changes,
+        )?;
+        if options.keys {
+            // Raw mode turns off output post-processing, so a bare newline
+            // no longer returns the carriage.
+            print!("\x1b[H\x1b[2J{}", raw_line_endings(&frame));
+        } else if options.screen {
+            print!("\x1b[H\x1b[2J{frame}");
+        } else {
+            print!("{frame}");
+        }
+        stdout.flush()?;
+        if options.once {
+            return Ok(());
+        }
+        // A key that is not a quit key must not postpone the next redraw, so
+        // the deadline is fixed once per frame.
+        let deadline = tokio::time::Instant::now() + options.interval;
+        let quit = loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break false,
+                _ = tokio::signal::ctrl_c() => break true,
+                key = next_key(&mut keys) => {
+                    if is_top_quit_key(&key) {
+                        break true;
+                    }
+                }
+            }
+        };
+        if quit {
+            return Ok(());
+        }
+    }
+}
+
+/// Terminal state `q top` changes for the duration of the run: the hidden
+/// cursor on a screen, and raw mode when keys are read. Dropping it puts
+/// both back, so an error or a panic never leaves the shell without echo.
+struct TopTerminal {
+    screen: bool,
+    raw: bool,
+}
+
+impl TopTerminal {
+    fn enter(options: &TopOptions) -> Result<Self, CliError> {
+        let mut terminal = Self {
+            screen: false,
+            raw: false,
+        };
+        if options.screen {
+            print!("\x1b[?25l");
+            terminal.screen = true;
+        }
+        if options.keys {
+            // Set before the mode change so a failure still drops back
+            // through disable_raw_mode, which is harmless when nothing changed.
+            terminal.raw = true;
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|err| CliError::message(format!("cannot read keys: {err}")))?;
+        }
+        Ok(terminal)
+    }
+}
+
+impl Drop for TopTerminal {
+    fn drop(&mut self) {
+        if self.raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        if self.screen {
+            print!("\x1b[?25h");
+        }
+        let _ = io::stdout().flush();
+    }
+}
+
+/// Forward key presses from the terminal to the redraw loop. Reads run on
+/// their own thread because crossterm blocks; the thread stops within one
+/// poll interval of the receiver going away.
+fn spawn_key_reader() -> tokio::sync::mpsc::UnboundedReceiver<KeyEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while !tx.is_closed() {
+            match crossterm::event::poll(std::time::Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    // Windows reports releases and repeats too; act on presses.
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        if tx.send(key).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// The next key press, or a future that never resolves when keys are not
+/// being read, so `select!` can always include it.
+async fn next_key(keys: &mut Option<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>>) -> KeyEvent {
+    match keys {
+        Some(rx) => match rx.recv().await {
+            Some(key) => key,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// `q` (either case), Esc, and Ctrl-C leave `q top`, like `top` itself.
+/// In raw mode Ctrl-C arrives as a key, not a signal.
+fn is_top_quit_key(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyCode::Char('c') | KeyCode::Char('C') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Esc => true,
+        _ => false,
+    }
+}
+
+/// Turn `\n` into `\r\n` for a raw-mode terminal without doubling a
+/// carriage return that is already there.
+fn raw_line_endings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
+    let mut previous = None;
+    for ch in text.chars() {
+        if ch == '\n' && previous != Some('\r') {
+            out.push('\r');
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
+}
+
+/// Fetch the queue, record what changed since the last frame, and render.
+fn top_frame(
+    queue: &dyn QueueService,
+    backend: &Backend,
+    filter: &ListFilter,
+    options: &TopOptions,
+    paint: Paint,
+    previous: &mut Option<std::collections::HashMap<i64, TaskSummary>>,
+    changes: &mut std::collections::VecDeque<TopChange>,
+) -> Result<String, CliError> {
+    let status = queue.status()?;
+    let tasks = queue.list(filter.clone())?;
+    let now = OffsetDateTime::now_utc();
+    let current: std::collections::HashMap<i64, TaskSummary> =
+        tasks.iter().map(|task| (task.id, task.clone())).collect();
+    if let Some(before) = previous.as_ref() {
+        for change in top_changes(before, &current, &tasks, now) {
+            changes.push_back(change);
+        }
+        while changes.len() > TOP_CHANGE_ROWS {
+            changes.pop_front();
+        }
+    }
+    *previous = Some(current);
+
+    let visible: Vec<TaskSummary> = tasks
+        .iter()
+        .filter(|task| {
+            options.show_terminal
+                || !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
+        })
+        .take(options.limit)
+        .cloned()
+        .collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} {}  {}  every {}  {}\n",
+        paint.bold("q top"),
+        backend.describe(paint),
+        paint.dim(&format_timestamp(now)),
+        paint.dim(&format!("{:.1}s", options.interval.as_secs_f64())),
+        paint.dim(if options.keys {
+            "q quits"
+        } else {
+            "Ctrl-C quits"
+        }),
+    ));
+    out.push_str(&format!("{}\n\n", render_top_counts(&status, paint)));
+    if visible.is_empty() {
+        out.push_str("no tasks\n");
+    } else {
+        out.push_str(&render_task_table(&visible, paint));
+        out.push('\n');
+    }
+    out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
+    if changes.is_empty() {
+        out.push_str(&format!("  {}\n", paint.dim("none yet")));
+    }
+    out.push_str(&render_top_changes(changes, paint));
+    Ok(out)
+}
+
+/// Newest first, in aligned columns: time, id, from, to, title.
+fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Paint) -> String {
+    let id_width = changes
+        .iter()
+        .map(|change| change.id.to_string().len() + 1)
+        .max()
+        .unwrap_or(0);
+    let from_width = changes
+        .iter()
+        .map(|change| change.before_label().len())
+        .max()
+        .unwrap_or(0);
+    let to_width = changes
+        .iter()
+        .map(|change| change.after_label().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for change in changes.iter().rev() {
+        let id = format!("#{}", change.id);
+        let from = change.before_label();
+        let to = change.after_label();
+        let to = to.as_str();
+        out.push_str(&format!(
+            "  {}  {}{}  {}{}  {} {}{}  {}\n",
+            paint.dim(&format_clock(change.at)),
+            " ".repeat(id_width - id.len()),
+            paint.dim(&id),
+            paint_top_status(from, paint),
+            " ".repeat(from_width - from.len()),
+            paint.dim("->"),
+            paint_top_status(to, paint),
+            " ".repeat(to_width - to.len()),
+            paint.bold(&change.title),
+        ));
+    }
+    out
+}
+
+/// A status name is colored like the table; the `new` and `deleted`
+/// pseudo-states are dim.
+fn paint_top_status(label: &str, paint: Paint) -> String {
+    if label == TOP_CHANGE_NEW || label == TOP_CHANGE_DELETED {
+        paint.dim(label)
+    } else {
+        paint.status(label)
+    }
+}
+
+fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
+    let counts = &status.counts;
+    let mut parts = Vec::new();
+    for (label, count) in [
+        ("held", counts.held),
+        ("ready", counts.ready),
+        ("claimed", counts.claimed),
+        ("in_progress", counts.in_progress),
+        ("review", counts.review),
+        ("blocked", counts.blocked),
+        ("done", counts.done),
+        ("cancelled", counts.cancelled),
+    ] {
+        parts.push(format!(
+            "{} {}",
+            paint.status(label),
+            paint.bold(&count.to_string())
+        ));
+    }
+    let expired = if status.expired_claims > 0 {
+        paint.paint(
+            Style::new().fg_color(Some(anstyle::AnsiColor::Red.into())),
+            &format!("{} expired", status.expired_claims),
+        )
+    } else {
+        format!("{} expired", status.expired_claims)
+    };
+    format!(
+        "{}  {}  claims {} active, {}",
+        parts.join("  "),
+        paint.dim("|"),
+        status.active_claims,
+        expired
+    )
+}
+
+/// Describe additions, status moves, and deletions between two fetches.
+/// Ordered by the current list first, then deletions.
+fn top_changes(
+    before: &std::collections::HashMap<i64, TaskSummary>,
+    after: &std::collections::HashMap<i64, TaskSummary>,
+    order: &[TaskSummary],
+    now: OffsetDateTime,
+) -> Vec<TopChange> {
+    let mut changes = Vec::new();
+    for task in order {
+        let from = match before.get(&task.id) {
+            None => None,
+            Some(old) if old.status != task.status || old.progress != task.progress => {
+                Some(old.status)
+            }
+            Some(_) => continue,
+        };
+        changes.push(TopChange {
+            at: now,
+            id: task.id,
+            from,
+            to: Some(task.status),
+            progress: task.progress,
+            title: format_list_title(&task.title),
+        });
+    }
+    let mut gone: Vec<&TaskSummary> = before
+        .values()
+        .filter(|task| !after.contains_key(&task.id))
+        .collect();
+    gone.sort_by_key(|task| task.id);
+    for task in gone {
+        changes.push(TopChange {
+            at: now,
+            id: task.id,
+            from: Some(task.status),
+            to: None,
+            progress: None,
+            title: format_list_title(&task.title),
+        });
+    }
+    changes
+}
+
+fn format_clock(at: OffsetDateTime) -> String {
+    let (h, m, s) = at.to_hms();
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
     println!("{}", backend.describe(paint));
     for (label, count) in [
-        ("inbox", status.counts.inbox),
+        ("held", status.counts.held),
         ("ready", status.counts.ready),
         ("claimed", status.counts.claimed),
         ("in_progress", status.counts.in_progress),
@@ -1088,16 +1788,88 @@ fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
     }
 }
 
+/// The task log: one line per event with time, event, who, and detail.
+/// Columns are padded so the log reads as a table.
 fn print_events(events: &[q_core::Event], paint: Paint, indent: &str) {
+    let type_width = events
+        .iter()
+        .map(|event| event.event_type.len())
+        .max()
+        .unwrap_or(0);
+    let who_width = events
+        .iter()
+        .map(|event| event_actor(event).len())
+        .max()
+        .unwrap_or(0);
     for event in events {
+        let who = event_actor(event);
+        let detail = event_detail(event, paint);
         println!(
-            "{indent}{} {} {} {}",
-            paint.dim(&format!("#{}", event.id)),
-            event.event_type,
-            paint.dim(&event.actor_type),
+            "{indent}{}  {}{}  {}{}  {}",
             paint.dim(&format_timestamp(event.created_at)),
+            paint.bold(&event.event_type),
+            " ".repeat(type_width - event.event_type.len()),
+            paint.dim(&who),
+            " ".repeat(who_width - who.len()),
+            detail,
         );
     }
+}
+
+/// `agent:claude-01`, `human:pierric`, or `system:q`.
+fn event_actor(event: &q_core::Event) -> String {
+    match event.actor_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => format!("{}:{id}", event.actor_type),
+        None => event.actor_type.clone(),
+    }
+}
+
+/// What the event did: a status move, a note, an artifact, or a branch.
+fn event_detail(event: &q_core::Event, paint: Paint) -> String {
+    let payload = &event.payload;
+    let field = |key: &str| payload.get(key).and_then(|value| value.as_str());
+    let mut parts = Vec::new();
+    if let (Some(from), Some(to)) = (field("from"), field("to")) {
+        parts.push(format!(
+            "{} {} {}",
+            paint.status(from),
+            paint.dim("->"),
+            paint.status(to)
+        ));
+    }
+    if let Some(percent) = payload.get("progress").and_then(|value| value.as_u64()) {
+        parts.push(format!("progress {percent}%"));
+    }
+    if let Some(message) = field("message") {
+        parts.push(message.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    if let (Some(kind), Some(value)) = (field("kind"), field("value")) {
+        let id = payload
+            .get("artifact_id")
+            .and_then(|value| value.as_i64())
+            .map(|id| paint.dim(&format!(" (artifact {id})")))
+            .unwrap_or_default();
+        parts.push(format!("{kind}: {value}{id}"));
+    }
+    if let Some(summary) = field("summary") {
+        if !summary.is_empty() {
+            parts.push(summary.to_string());
+        }
+    }
+    if let Some(branch) = field("branch") {
+        parts.push(format!("branch {branch}"));
+    }
+    if let Some(agent) = field("agent_id") {
+        if event.actor_id.as_deref() != Some(agent) {
+            parts.push(format!("agent {agent}"));
+        }
+    }
+    parts.join("  ")
+}
+
+/// Short form used in confirmations: `event detail`.
+fn describe_event(event: &q_core::Event, paint: Paint) -> String {
+    format!("{} {}", event.event_type, event_detail(event, paint))
 }
 
 const TITLE_MAX_CHARS: usize = 64;
@@ -1109,7 +1881,11 @@ struct TaskListRow {
     feature: String,
     project: String,
     priority: String,
+    /// Percent complete as `40%`, or blank.
+    progress: String,
     updated: String,
+    /// Newest `pr` artifact value. Shown as a clickable `PR` on a terminal.
+    pr_url: Option<String>,
     title: String,
 }
 
@@ -1134,9 +1910,27 @@ fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
         feature: display_project(task.feature.as_deref()),
         project: display_project(task.project.as_deref()),
         priority: task.priority.to_string(),
+        progress: format_progress(task.progress),
         updated: style::format_relative(task.updated_at, now),
+        pr_url: task.pr_url.clone(),
         title: format_list_title(&task.title),
     }
+}
+
+const PR_LABEL: &str = "PR";
+
+/// What the PR column shows: `PR` on a terminal (linked), the URL when piped.
+fn pr_cell(row: &TaskListRow, paint: Paint) -> &str {
+    match &row.pr_url {
+        Some(url) => paint.link_text(PR_LABEL, url),
+        None => "",
+    }
+}
+
+fn format_progress(progress: Option<u8>) -> String {
+    progress
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_default()
 }
 
 fn display_project(project: Option<&str>) -> String {
@@ -1168,23 +1962,27 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
 
 fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
     let headers = [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TITLE",
     ];
-    let align_right = [true, false, false, false, true, false, false];
+    let align_right = [true, false, false, false, true, true, false, false, false];
     let widths = [
         column_width("ID", rows.iter().map(|row| row.id.as_str())),
         column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
         column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
         column_width("PROJECT", rows.iter().map(|row| row.project.as_str())),
         column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
+        column_width("PROG", rows.iter().map(|row| row.progress.as_str())),
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
+        column_width("PR", rows.iter().map(|row| pr_cell(row, paint))),
         column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
     ];
-    let header_styles = [style::dim_style(); 7];
+    let header_styles = [style::dim_style(); 9];
+    let no_links = [None; 9];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
         &headers,
         &header_styles,
+        &no_links,
         &widths,
         &align_right,
         paint,
@@ -1196,9 +1994,13 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
             style::dim_style(),
             style::dim_style(),
             style::dim_style(),
+            style::status_style(&row.status),
             style::dim_style(),
+            Style::new(),
             style::bold_style(),
         ];
+        let mut links = [None; 9];
+        links[7] = row.pr_url.as_deref();
         lines.push(format_task_line(
             &[
                 row.id.as_str(),
@@ -1206,10 +2008,13 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
                 row.feature.as_str(),
                 row.project.as_str(),
                 row.priority.as_str(),
+                row.progress.as_str(),
                 row.updated.as_str(),
+                pr_cell(row, paint),
                 row.title.as_str(),
             ],
             &styles,
+            &links,
             &widths,
             &align_right,
             paint,
@@ -1226,9 +2031,12 @@ fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usiz
         .unwrap_or(0)
 }
 
+/// One table line. A cell with a link is wrapped as a hyperlink instead of
+/// styled; its visible text is still `cells[index]`, so padding is unchanged.
 fn format_task_line(
     cells: &[&str],
     styles: &[Style],
+    links: &[Option<&str>],
     widths: &[usize],
     align_right: &[bool],
     paint: Paint,
@@ -1240,7 +2048,10 @@ fn format_task_line(
         }
         let width = widths[index];
         let pad = width.saturating_sub(cell.chars().count());
-        let painted = paint.paint(styles[index], cell);
+        let painted = match links.get(index).copied().flatten() {
+            Some(url) => paint.link(cell, url),
+            None => paint.paint(styles[index], cell),
+        };
         if align_right[index] {
             line.push_str(&" ".repeat(pad));
             line.push_str(&painted);
@@ -1278,7 +2089,14 @@ fn print_feature_list(features: &[q_core::Feature], paint: Paint) {
     let header_styles = [style::dim_style(); 4];
     println!(
         "{}",
-        format_task_line(&headers, &header_styles, &widths, &align_right, paint)
+        format_task_line(
+            &headers,
+            &header_styles,
+            &[None; 4],
+            &widths,
+            &align_right,
+            paint
+        )
     );
     let styles = [
         style::dim_style(),
@@ -1297,6 +2115,7 @@ fn print_feature_list(features: &[q_core::Feature], paint: Paint) {
                     row.title.as_str(),
                 ],
                 &styles,
+                &[None; 4],
                 &widths,
                 &align_right,
                 paint,
@@ -1457,6 +2276,9 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
             task.kind, task.risk, task.priority
         ),
     );
+    if let Some(percent) = task.progress {
+        meta(paint, &format!("progress: {percent}%"));
+    }
     meta(
         paint,
         &format!("project: {}", task.project.as_deref().unwrap_or("-")),
@@ -1532,7 +2354,23 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
     if !detail.artifacts.is_empty() {
         println!("\n{}", paint.bold("artifacts:"));
         for artifact in &detail.artifacts {
-            println!("- {}: {}", artifact.kind, artifact.value);
+            let stored = match artifact.content_bytes {
+                Some(bytes) => paint.dim(&format!(
+                    "  ({bytes} bytes stored, q artifact {})",
+                    artifact.id
+                )),
+                None => String::new(),
+            };
+            let value = if artifact.kind == "pr" || artifact.value.starts_with("http") {
+                paint.link(&artifact.value, &artifact.value)
+            } else {
+                artifact.value.clone()
+            };
+            println!(
+                "- {} {}: {value}{stored}",
+                paint.dim(&format!("#{}", artifact.id)),
+                artifact.kind,
+            );
         }
     }
     if !detail.events.is_empty() {
@@ -1594,10 +2432,70 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_project, format_list_title, render_task_rows, render_task_rows_painted,
-        render_tree, render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
+        capture_line, display_project, format_list_title, is_top_quit_key, raw_line_endings,
+        render_task_rows, render_task_rows_painted, render_tree, render_tree_with, truncate_chars,
+        TaskListRow, TITLE_MAX_CHARS,
     };
+    use crate::style::Paint;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use q_core::{TaskStatus, TaskTree, TreeFeature, TreeNode};
+
+    #[test]
+    fn capture_confirmation_is_one_truncated_line() {
+        let short = capture_line(
+            Paint::plain(),
+            184,
+            "held",
+            "Benchmark trace encoding variants",
+        );
+        assert_eq!(
+            short,
+            "captured #184 [held] Benchmark trace encoding variants"
+        );
+
+        let long = format!("first line\nsecond {}", "x".repeat(TITLE_MAX_CHARS + 20));
+        let line = capture_line(Paint::plain(), 7, "held", &long);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.starts_with("captured #7 [held] first line second x"),
+            "{line}"
+        );
+        assert!(line.ends_with('…'), "{line}");
+        let title = line.trim_start_matches("captured #7 [held] ");
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn top_quits_on_q_esc_and_ctrl_c_only() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(is_top_quit_key(&plain(KeyCode::Char('q'))));
+        assert!(is_top_quit_key(&KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(is_top_quit_key(&plain(KeyCode::Esc)));
+        assert!(is_top_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+
+        assert!(!is_top_quit_key(&plain(KeyCode::Char('c'))));
+        assert!(!is_top_quit_key(&plain(KeyCode::Char('a'))));
+        assert!(!is_top_quit_key(&plain(KeyCode::Enter)));
+        assert!(!is_top_quit_key(&plain(KeyCode::Char(' '))));
+        assert!(
+            !is_top_quit_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            "Ctrl-Q is not a quit key"
+        );
+    }
+
+    #[test]
+    fn raw_line_endings_add_carriage_returns_once() {
+        assert_eq!(raw_line_endings("a\nb\n"), "a\r\nb\r\n");
+        assert_eq!(raw_line_endings("a\r\nb"), "a\r\nb");
+        assert_eq!(raw_line_endings("\n\n"), "\r\n\r\n");
+        assert_eq!(raw_line_endings("no newline"), "no newline");
+    }
 
     #[test]
     fn unassigned_project_uses_a_stable_label() {
@@ -1623,11 +2521,13 @@ mod tests {
         let rows = vec![
             TaskListRow {
                 id: "12".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "rollout".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "2026-09-22T20:00:00Z".into(),
+                pr_url: None,
                 title: "Short".into(),
             },
             TaskListRow {
@@ -1636,7 +2536,9 @@ mod tests {
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "10".into(),
+                progress: "".into(),
                 updated: "2026-09-22T19:00:00Z".into(),
+                pr_url: None,
                 title: format_list_title(&long),
             },
         ];
@@ -1671,12 +2573,14 @@ mod tests {
         let rows = vec![
             TaskListRow {
                 id: "4".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "3m ago".into(),
-                title: "Keep the inbox item".into(),
+                pr_url: None,
+                title: "Keep the held item".into(),
             },
             TaskListRow {
                 id: "2".into(),
@@ -1684,16 +2588,20 @@ mod tests {
                 feature: "(none)".into(),
                 project: "beta".into(),
                 priority: "1".into(),
+                progress: "".into(),
                 updated: "1h ago".into(),
+                pr_url: None,
                 title: "Compare encodings".into(),
             },
             TaskListRow {
                 id: "1".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "2d ago".into(),
+                pr_url: None,
                 title: "Unassigned capture".into(),
             },
         ];
@@ -1706,11 +2614,46 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
- 4  inbox   (none)   alpha      0  3m ago   Keep the inbox item
- 2  ready   (none)   beta       1  1h ago   Compare encodings
- 1  inbox   (none)   (none)     0  2d ago   Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
+ 4  held    (none)   alpha      0        3m ago       Keep the held item
+ 2  ready   (none)   beta       1        1h ago       Compare encodings
+ 1  held    (none)   (none)     0        2d ago       Unassigned capture"
         );
+    }
+
+    #[test]
+    fn pr_column_links_on_a_terminal_and_prints_the_url_when_plain() {
+        let mut row = TaskListRow {
+            id: "9".into(),
+            status: "done".into(),
+            feature: "(none)".into(),
+            project: "alpha".into(),
+            priority: "0".into(),
+            progress: "100%".into(),
+            updated: "1h ago".into(),
+            pr_url: Some("https://example.com/pr/9".into()),
+            title: "Shipped".into(),
+        };
+        let plain = render_task_rows(std::slice::from_ref(&row));
+        assert!(
+            plain.contains("UPDATED  PR                        TITLE"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("1h ago   https://example.com/pr/9  Shipped"),
+            "{plain}"
+        );
+        let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color());
+        assert!(
+            color.contains("\x1b]8;;https://example.com/pr/9\x1b\\"),
+            "{color:?}"
+        );
+        let visible = anstream::adapter::strip_str(&color).to_string();
+        assert!(visible.contains("UPDATED  PR  TITLE"), "{visible}");
+        assert!(visible.contains("1h ago   PR  Shipped"), "{visible}");
+        row.pr_url = None;
+        let none = render_task_rows(std::slice::from_ref(&row));
+        assert!(none.contains("1h ago       Shipped"), "{none}");
     }
 
     #[test]
@@ -1721,7 +2664,9 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
             feature: "(none)".into(),
             project: "beta".into(),
             priority: "1".into(),
+            progress: "".into(),
             updated: "3m ago".into(),
+            pr_url: None,
             title: "Compare encodings".into(),
         }];
         let plain = render_task_rows(&rows);
@@ -1758,7 +2703,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
     fn tree_layout_marks_external_repeats_and_empty_features() {
         let types = TreeNode {
             id: 4,
-            status: TaskStatus::Inbox,
+            status: TaskStatus::Held,
             title: "Add the types".into(),
             project: Some("api".into()),
             feature_id: Some(1),
@@ -1796,7 +2741,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
         };
         let ship = TreeNode {
             id: 3,
-            status: TaskStatus::Inbox,
+            status: TaskStatus::Held,
             title: "Ship the rollout".into(),
             project: Some("api".into()),
             feature_id: Some(1),
@@ -1818,7 +2763,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
             cycle: false,
             depends_on: vec![TreeNode {
                 id: 3,
-                status: TaskStatus::Inbox,
+                status: TaskStatus::Held,
                 title: "Ship the rollout".into(),
                 project: Some("api".into()),
                 feature_id: Some(1),
@@ -1839,14 +2784,14 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
         assert_eq!(
             render_tree(&tree),
             "\
-#3  inbox        Ship the rollout  [api]
+#3  held         Ship the rollout  [api]
 ├── #1  done         Shared schema  [db]  {Other}  (external)
-│   └── #4  inbox        Add the types  [api]  (already shown)
+│   └── #4  held         Add the types  [api]  (already shown)
 └── #2  ready        Write the schema  [api]
-    └── #4  inbox        Add the types  [api]
+    └── #4  held         Add the types  [api]
 
 #5  blocked      Write the notes
-└── #3  inbox        Ship the rollout  [api]  (cycle)"
+└── #3  held         Ship the rollout  [api]  (cycle)"
         );
 
         let empty = TaskTree {

@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
+    QueueService, ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery,
+    NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -136,7 +137,7 @@ impl Session {
                         "protocolVersion": version,
                         "capabilities": { "tools": { "listChanged": false } },
                         "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                        "instructions": "Local queue. Inbox tasks cannot be claimed until marked ready. High and external-action risk are excluded from default claims."
+                        "instructions": "Local queue. Captured tasks are ready and claimable at once unless captured with hold, which keeps them held until a human marks them ready. High and external-action risk are excluded from default claims."
                     }),
                 ))
             }
@@ -265,6 +266,8 @@ fn dispatch_tool(
         "queue_complete" => queue_complete(queue, ctx, args),
         "queue_release" => queue_release(queue, ctx, args),
         "queue_delete" => queue_delete(queue, ctx, args),
+        "queue_log" => queue_log(queue, args),
+        "queue_artifact" => queue_artifact(queue, args),
         other => Err(ToolFailure::Invalid(format!("unknown tool {other}"))),
     }
 }
@@ -420,6 +423,7 @@ fn queue_capture(
             "dependencies",
             "agent_pool",
             "feature",
+            "hold",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -464,6 +468,7 @@ fn queue_capture(
         context_source: serde_json::to_value(context.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
+        hold: optional_bool(args, "hold")?,
     })?;
     serde_json::to_value(task).map_err(|err| ToolFailure::Invalid(err.to_string()))
 }
@@ -681,22 +686,7 @@ fn queue_complete(
         Some(status) => Some(TaskStatus::parse(&status).map_err(ToolFailure::from)?),
         None => None,
     };
-    let mut artifacts = Vec::new();
-    if let Some(value) = args.get("artifacts") {
-        let items = value
-            .as_array()
-            .ok_or_else(|| ToolFailure::Invalid("artifacts must be an array".into()))?;
-        for item in items {
-            let object = item
-                .as_object()
-                .ok_or_else(|| ToolFailure::Invalid("each artifact must be an object".into()))?;
-            expect_keys(object, &["kind", "value"])?;
-            artifacts.push(ArtifactInput {
-                kind: required_string(object, "kind")?,
-                value: required_string(object, "value")?,
-            });
-        }
-    }
+    let artifacts = artifact_inputs(args)?;
     let detail = queue.complete(CompleteRequest {
         task_id: required_task_id(args)?,
         claim_token: Some(required_string(args, "claim_token")?),
@@ -706,6 +696,72 @@ fn queue_complete(
         actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
+}
+
+/// Parse the optional `artifacts` array: objects with `kind`, `value`, and
+/// optional `content` (text stored in the database).
+fn artifact_inputs(args: &Map<String, Value>) -> Result<Vec<ArtifactInput>, ToolFailure> {
+    let mut artifacts = Vec::new();
+    if let Some(value) = args.get("artifacts") {
+        let items = value
+            .as_array()
+            .ok_or_else(|| ToolFailure::Invalid("artifacts must be an array".into()))?;
+        for item in items {
+            let object = item
+                .as_object()
+                .ok_or_else(|| ToolFailure::Invalid("each artifact must be an object".into()))?;
+            expect_keys(object, &["kind", "value", "content"])?;
+            artifacts.push(ArtifactInput {
+                kind: required_string(object, "kind")?,
+                value: required_string(object, "value")?,
+                content: optional_string(object, "content")?,
+            });
+        }
+    }
+    Ok(artifacts)
+}
+
+fn queue_log(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    expect_keys(
+        args,
+        &[
+            "task_id",
+            "id",
+            "claim_token",
+            "message",
+            "progress",
+            "artifacts",
+        ],
+    )?;
+    let progress = match optional_u64(args, "progress")? {
+        Some(percent) if percent <= 100 => Some(percent as u8),
+        Some(_) => {
+            return Err(ToolFailure::Invalid(
+                "progress is a percent from 0 to 100".into(),
+            ))
+        }
+        None => None,
+    };
+    let detail = queue.log(LogRequest {
+        task_id: required_task_id(args)?,
+        claim_token: optional_string(args, "claim_token")?,
+        message: optional_string(args, "message")?,
+        progress,
+        artifacts: artifact_inputs(args)?,
+        actor: Actor::agent("mcp"),
+    })?;
+    Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
+}
+
+fn queue_artifact(
+    queue: &dyn QueueService,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["artifact_id"])?;
+    let id = optional_i64(args, "artifact_id")?
+        .ok_or_else(|| ToolFailure::Invalid("artifact_id is required".into()))?;
+    let artifact = queue.artifact(id)?;
+    Ok(serde_json::to_value(artifact).unwrap_or(Value::Null))
 }
 
 fn queue_delete(
@@ -898,13 +954,17 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
     let mut tools = vec![
         tool(
             "queue_capture",
-            "Capture an inbox task. Inbox work is never claimable until a human marks it ready.",
+            "Capture a task. It is ready and claimable at once unless hold is true, which keeps it held until a human runs q ready.",
             json!({
                 "type": "object",
                 "required": ["title"],
                 "properties": {
                     "title": {"type": "string"},
                     "body": {"type": "string"},
+                    "hold": {
+                        "type": "boolean",
+                        "description": "Create the task as held instead of ready. Held work is never claimable until a human marks it ready. Defaults to false."
+                    },
                     "repo": {"type": "string"},
                     "project": {"type": "string"},
                     "capture_path": {"type": "string"},
@@ -928,7 +988,10 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "description": "held, ready, claimed, in_progress, review, blocked, done, or cancelled."
+                    },
                     "project": {"type": "string"},
                     "repo": {"type": "string"},
                     "kind": {"type": "string"},
@@ -1083,17 +1146,35 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "claim_token": {"type": "string"},
                     "summary": {"type": "string"},
                     "status": {"type": "string", "enum": ["review", "done"]},
-                    "artifacts": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["kind", "value"],
-                            "properties": {
-                                "kind": {"type": "string"},
-                                "value": {"type": "string"}
-                            }
-                        }
-                    }
+                    "artifacts": ARTIFACTS_SCHEMA
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_log",
+            "Append to a task's log: a timestamped note (thinking steps, findings), a progress percent, artifacts, or any mix. Pass the claim token so the entry is attributed to your agent id. Report progress as you pass milestones; q top shows it for in-progress tasks. An artifact with content stores that text (for example a Markdown or HTML report) in the database.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "claim_token": {"type": "string"},
+                    "message": {"type": "string"},
+                    "progress": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Percent complete"},
+                    "artifacts": ARTIFACTS_SCHEMA
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_artifact",
+            "Fetch one artifact by id with its stored content.",
+            json!({
+                "type": "object",
+                "required": ["artifact_id"],
+                "properties": {
+                    "artifact_id": {"type": "integer"}
                 },
                 "additionalProperties": false
             }),
@@ -1170,7 +1251,7 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
     if human_tools {
         tools.push(tool(
             "queue_ready",
-            "Move an inbox or blocked task to ready so agents may claim it. Confirm the task is well specified first.",
+            "Move a held or blocked task to ready so agents may claim it. Confirm the task is well specified first.",
             json!({
                 "type": "object",
                 "required": ["task_id"],
@@ -1192,7 +1273,29 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
     tools
 }
 
-fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+/// Schema for an `artifacts` array on complete and log.
+const ARTIFACTS_SCHEMA: &str = "__artifacts__";
+
+fn tool(name: &str, description: &str, mut input_schema: Value) -> Value {
+    if let Some(artifacts) = input_schema
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("artifacts"))
+    {
+        if artifacts.as_str() == Some(ARTIFACTS_SCHEMA) {
+            *artifacts = json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "value"],
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "value": {"type": "string"},
+                        "content": {"type": "string", "description": "Text to store in the database, such as a report body"}
+                    }
+                }
+            });
+        }
+    }
     json!({
         "name": name,
         "description": description,
@@ -1294,9 +1397,116 @@ mod tests {
             "queue_complete",
             "queue_release",
             "queue_delete",
+            "queue_log",
+            "queue_artifact",
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }
+    }
+
+    #[test]
+    fn queue_log_and_queue_artifact_round_trip() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let captured = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "log me"}}),
+        );
+        // Captures are ready by default, so the task is claimable at once.
+        let id = tool_body(&captured)["id"].as_i64().unwrap();
+        let claimed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-7"}}),
+        );
+        let token = tool_body(&claimed)["claim"]["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let logged = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_log", "arguments": {
+                "task_id": id,
+                "claim_token": token.clone(),
+                "message": "Thinking: start with the parser",
+                "artifacts": [{"kind": "report", "value": "notes.md", "content": "# Notes\n"}]
+            }}),
+        );
+        assert_eq!(logged["result"]["isError"], false, "{logged}");
+        let detail = tool_body(&logged);
+        assert!(detail.get("progress").is_none());
+        let note = detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["event_type"] == "task_note")
+            .unwrap();
+        assert_eq!(note["actor_id"], "bot-7");
+        let artifact_id = detail["artifacts"][0]["id"].as_i64().unwrap();
+        assert_eq!(detail["artifacts"][0]["content_bytes"], 8);
+
+        let fetched = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_artifact", "arguments": {"artifact_id": artifact_id}}),
+        );
+        assert_eq!(tool_body(&fetched)["content"], "# Notes\n");
+        let progressed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            8,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "claim_token": token, "progress": 40}}),
+        );
+        assert_eq!(tool_body(&progressed)["progress"], 40, "{progressed}");
+        let too_much = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            9,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "progress": 101}}),
+        );
+        assert_eq!(too_much["error"]["code"], -32602, "{too_much}");
+
+        let empty = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_log", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(empty["error"]["code"], -32602, "{empty}");
+        assert!(empty["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("message, a progress percent, or at least one artifact"));
+
+        let unknown_key = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "note": "x"}}),
+        );
+        assert_eq!(unknown_key["error"]["code"], -32602);
     }
 
     fn tool_body(response: &Value) -> Value {
@@ -1344,7 +1554,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reason"));
-        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
+        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
 
         let deleted = call(
             &mut session,
@@ -1356,7 +1566,7 @@ mod tests {
         assert_eq!(deleted["result"]["isError"], false);
         let body = tool_body(&deleted);
         assert_eq!(body["task_id"], id);
-        assert_eq!(body["status"], "inbox");
+        assert_eq!(body["status"], "ready");
         assert!(body.get("reason").is_none());
         assert_eq!(body["active_claim_cleared"], false);
         assert!(matches!(queue.get(id), Err(QueueError::NotFound(_))));
@@ -1381,6 +1591,7 @@ mod tests {
                 policy: None,
                 actor: Actor::agent("mcp"),
                 context_source: None,
+                hold: true,
             })
             .unwrap();
         queue
@@ -1733,7 +1944,7 @@ mod tests {
             &queue,
             "tools/call",
             3,
-            json!({"name": "queue_capture", "arguments": {"title": "Chat triage", "capture_path": "/tmp"}}),
+            json!({"name": "queue_capture", "arguments": {"title": "Chat triage", "hold": true, "capture_path": std::env::temp_dir()}}),
         );
         let id = tool_body(&captured)["id"].as_i64().unwrap();
         let denied = call(
@@ -1857,5 +2068,76 @@ mod tests {
             .unwrap();
         assert_eq!(anywhere["result"]["isError"], false, "{anywhere}");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn capture_is_ready_by_default_and_hold_keeps_it_held() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let open = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "open work"}}),
+        ));
+        assert_eq!(open["status"], "ready");
+        let held = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "held work", "hold": true}}),
+        ));
+        assert_eq!(held["status"], "held");
+
+        let claim = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot"}}),
+        ));
+        assert_eq!(claim["task"]["id"], open["id"]);
+        let none = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-2"}}),
+        ));
+        assert_eq!(none["found"], false);
+
+        // Filtering by held returns only the held task.
+        let listed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_list", "arguments": {"status": "held"}}),
+        ));
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], held["id"]);
+        assert_eq!(tasks[0]["status"], "held");
+
+        let tools = call(&mut session, &queue, "tools/list", 7, json!({}));
+        let capture_tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "queue_capture")
+            .unwrap();
+        assert_eq!(
+            capture_tool["inputSchema"]["properties"]["hold"]["type"],
+            "boolean"
+        );
     }
 }

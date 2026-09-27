@@ -16,7 +16,9 @@ fn norm_token(value: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    Inbox,
+    /// Captured but deliberately kept out of the claimable pool until a
+    /// human releases it with `ready`.
+    Held,
     Ready,
     Claimed,
     InProgress,
@@ -29,7 +31,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Inbox => "inbox",
+            Self::Held => "held",
             Self::Ready => "ready",
             Self::Claimed => "claimed",
             Self::InProgress => "in_progress",
@@ -42,7 +44,7 @@ impl TaskStatus {
 
     pub fn parse(value: &str) -> Result<Self, QueueError> {
         match norm_token(value).as_str() {
-            "inbox" => Ok(Self::Inbox),
+            "held" => Ok(Self::Held),
             "ready" => Ok(Self::Ready),
             "claimed" => Ok(Self::Claimed),
             "in_progress" => Ok(Self::InProgress),
@@ -51,7 +53,7 @@ impl TaskStatus {
             "done" => Ok(Self::Done),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             other => Err(QueueError::InvalidInput(format!(
-                "unknown status '{other}' (expected inbox, ready, claimed, in_progress, review, blocked, done, cancelled)"
+                "unknown status '{other}' (expected held, ready, claimed, in_progress, review, blocked, done, cancelled)"
             ))),
         }
     }
@@ -285,6 +287,10 @@ pub struct Task {
     pub kind: TaskKind,
     pub priority: i32,
     pub risk: RiskLevel,
+    /// Percent complete, 0 to 100, as last reported by the working agent.
+    /// Set to 100 on completion and cleared on reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,6 +328,12 @@ pub struct TaskSummary {
     pub kind: TaskKind,
     pub priority: i32,
     pub risk: RiskLevel,
+    /// Percent complete as last reported. See [`Task::progress`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    /// Value of the newest `pr` artifact, usually the pull request URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,15 +408,70 @@ pub struct Artifact {
     pub task_id: i64,
     pub kind: String,
     pub value: String,
+    /// Bytes of content stored in the database, when the artifact was
+    /// published inline (for example a Markdown or HTML report). `None` when
+    /// the artifact is only a reference such as a URL or path. Fetch the
+    /// text with [`crate::QueueService::artifact`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bytes: Option<u64>,
     #[serde(with = "ts")]
     pub created_at: OffsetDateTime,
+}
+
+/// One artifact with its stored content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactContent {
+    #[serde(flatten)]
+    pub artifact: Artifact,
+    /// Stored text. `None` for reference-only artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactInput {
     pub kind: String,
     pub value: String,
+    /// Text to store in the database alongside the reference, such as the
+    /// body of a report. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
+
+impl ArtifactInput {
+    pub fn reference(kind: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            value: value.into(),
+            content: None,
+        }
+    }
+}
+
+/// Append to a task's log: a timestamped note, a progress report,
+/// artifacts, or any mix.
+///
+/// With `claim_token`, the token must match the task's active claim and the
+/// entry is attributed to that claim's agent. Without a token the entry is
+/// attributed to `actor`. At least one of `message`, `progress`, and
+/// `artifacts` is required. `progress` is a percent, 0 to 100, stored on the
+/// task so lists can show how far along in-progress work is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRequest {
+    pub task_id: i64,
+    #[serde(default)]
+    pub claim_token: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub progress: Option<u8>,
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactInput>,
+    pub actor: Actor,
+}
+
+/// Event type written by [`crate::QueueService::log`] for a note.
+pub const NOTE_EVENT: &str = "task_note";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -470,7 +537,7 @@ impl ClaimOutcome {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusCounts {
-    pub inbox: i64,
+    pub held: i64,
     pub ready: i64,
     pub claimed: i64,
     pub in_progress: i64,
@@ -522,6 +589,10 @@ pub struct CaptureRequest {
     pub policy: Option<ProjectPolicy>,
     pub actor: Actor,
     pub context_source: Option<String>,
+    /// Create the task as `held` instead of `ready`, so it stays out of the
+    /// claimable pool until a human runs `ready`. Defaults to false.
+    #[serde(default)]
+    pub hold: bool,
 }
 
 /// Filters for [`crate::QueueService::list`].
@@ -681,6 +752,13 @@ pub struct BlockRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRequest {
+    pub task_id: i64,
+    pub actor: Actor,
+}
+
+/// Move a ready or blocked task back to `held` so it is no longer claimable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldRequest {
     pub task_id: i64,
     pub actor: Actor,
 }
@@ -851,6 +929,7 @@ mod tests {
             kind: TaskKind::Benchmark,
             priority: 10,
             risk: RiskLevel::Low,
+            progress: None,
             project: Some("profiler-core".into()),
             repo: Some("github.com/acme/profiler-core".into()),
             capture_path: "/tmp/profiler-core/crates/trace".into(),

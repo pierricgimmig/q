@@ -2,8 +2,9 @@
 
 use q_core::{
     Actor, ActorKind, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest, TreeQuery,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest,
+    TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -94,6 +95,20 @@ pub fn dispatch(
             let mut request: RecoverRequest = parse(body)?;
             stamp(&mut request.actor, principal);
             reply(queue.recover_stale(request))
+        }
+        "hold" => {
+            let mut request: HoldRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.hold(request))
+        }
+        "log" => {
+            let mut request: LogRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.log(request))
+        }
+        "artifact" => {
+            let IdBody { id } = parse(body)?;
+            reply(queue.artifact(id))
         }
         "events" => {
             let IdBody { id } = parse(body)?;
@@ -231,6 +246,15 @@ mod tests {
                 &self,
                 _: RecoverRequest,
             ) -> Result<Vec<q_core::RecoveryRecord>, QueueError> {
+                unreachable!()
+            }
+            fn hold(&self, _: HoldRequest) -> Result<q_core::Task, QueueError> {
+                unreachable!()
+            }
+            fn log(&self, _: LogRequest) -> Result<q_core::TaskDetail, QueueError> {
+                unreachable!()
+            }
+            fn artifact(&self, _: i64) -> Result<q_core::ArtifactContent, QueueError> {
                 unreachable!()
             }
             fn events(&self, _: i64) -> Result<Vec<q_core::Event>, QueueError> {

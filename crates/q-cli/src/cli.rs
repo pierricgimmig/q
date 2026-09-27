@@ -47,10 +47,12 @@ fn is_command(word: &str) -> bool {
         "add"
             | "ls"
             | "list"
+            | "top"
             | "show"
             | "tree"
             | "edit"
             | "ready"
+            | "hold"
             | "block"
             | "cancel"
             | "delete"
@@ -63,6 +65,8 @@ fn is_command(word: &str) -> bool {
             | "recover-stale"
             | "events"
             | "reopen"
+            | "log"
+            | "artifact"
             | "project"
             | "feature"
             | "mcp"
@@ -82,6 +86,12 @@ fn is_bool_flag(arg: &str) -> bool {
         arg,
         "--json"
             | "-j"
+            | "--hold"
+            | "-w"
+            | "--wait"
+            | "--edit"
+            | "-e"
+            | "--once"
             | "--yes"
             | "--force"
             | "--all"
@@ -127,9 +137,12 @@ fn is_value_flag(arg: &str) -> bool {
             | "--agent-pool"
             | "--depends-on"
             | "--limit"
+            | "--interval"
             | "--body-file"
             | "--to"
             | "--artifact"
+            | "--attach"
+            | "--progress"
             | "--target"
             | "--capability"
             | "--capabilities"
@@ -206,7 +219,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Capture a task into the inbox.
+    /// Capture a task. It is ready for agents at once unless --hold is set.
     Add {
         /// Title words. Quoted text is the usual form: q "Fix the bug".
         #[arg(required = true, num_args = 1.., value_name = "TITLE")]
@@ -220,12 +233,18 @@ pub enum Commands {
         /// low, medium, high, or external_action. Default low.
         #[arg(long, value_name = "RISK")]
         risk: Option<String>,
-        /// Markdown body. Missing sections warn on ready; they do not block it.
+        /// Markdown body. Any shape is accepted; no sections are required.
         #[arg(long)]
         body: Option<String>,
         /// Read the body from a file instead of --body.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// Open $VISUAL or $EDITOR on the body before capture.
+        ///
+        /// Starts from --body or --body-file when given, otherwise from a
+        /// template of suggested sections.
+        #[arg(short = 'e', long)]
+        edit: bool,
         /// Required capability. Repeatable. Comma-separated values are split.
         #[arg(long = "capability")]
         capability: Vec<String>,
@@ -238,13 +257,19 @@ pub enum Commands {
         /// Feature id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Keep the task held, out of the claimable pool, until `q ready ID`.
+        ///
+        /// Use this for work that needs a human look before an agent may
+        /// start it. `-w` and `--wait` are aliases.
+        #[arg(short = 'w', long, visible_alias = "wait")]
+        hold: bool,
     },
     /// List tasks. Done and cancelled are hidden unless --all or --status is set.
     #[command(visible_alias = "list")]
     Ls {
         /// Show only this status. Includes done or cancelled when that status is named.
         ///
-        /// Statuses: inbox, ready, claimed, in_progress, review, blocked, done, cancelled.
+        /// Statuses: held, ready, claimed, in_progress, review, blocked, done, cancelled.
         #[arg(long, value_name = "STATUS")]
         status: Option<String>,
         /// implementation, research, review, benchmark, documentation, or other.
@@ -259,6 +284,30 @@ pub enum Commands {
         /// Show only tasks in this feature. Id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+    },
+    /// Watch the queue. Redraws counts, the task table, and recent changes; press q to quit.
+    Top {
+        /// Seconds between refreshes.
+        #[arg(short = 'i', long, default_value_t = 2.0, value_name = "SECONDS")]
+        interval: f64,
+        /// Show only this status. Includes done or cancelled when that status is named.
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+        /// implementation, research, review, benchmark, documentation, or other.
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+        /// Maximum rows in the table.
+        #[arg(short = 'n', long, default_value_t = 30)]
+        limit: u32,
+        /// Include done and cancelled tasks in the table. Ignored when --status is set.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Show only tasks in this feature. Id or unique title.
+        #[arg(long, value_name = "ID|TITLE")]
+        feature: Option<String>,
+        /// Draw one frame and exit instead of refreshing.
+        #[arg(long)]
+        once: bool,
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show {
@@ -295,6 +344,9 @@ pub enum Commands {
         /// Read a replacement body from a file.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// Open $VISUAL or $EDITOR on the body, even when other flags are set.
+        #[arg(short = 'e', long)]
+        edit: bool,
         /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
@@ -329,8 +381,17 @@ pub enum Commands {
         #[arg(long)]
         clear_feature: bool,
     },
-    /// Move a task to ready so agents may claim it.
+    /// Move one or more tasks to ready so agents may claim them. Releases held work.
+    ///
+    /// Ids are processed in order. A failure on one id is reported and the
+    /// rest still run; the exit status is non-zero if any id failed.
     Ready {
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
+    },
+    /// Move a ready or blocked task back to held so agents cannot claim it.
+    Hold {
         /// Task id.
         id: i64,
     },
@@ -342,20 +403,25 @@ pub enum Commands {
         #[arg(long)]
         claim_token: Option<String>,
     },
-    /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
+    /// Cancel tasks that are held, ready, or blocked. The rows and their history stay.
+    ///
+    /// Ids are processed in order; one failure does not stop the rest.
     #[command(visible_alias = "canceled")]
     Cancel {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
     },
-    /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
+    /// Hard-delete tasks and their claims, events, artifacts, and dependency rows.
     ///
     /// Unlike cancel, nothing remains in the queue database. Events cascade with
     /// the task and are not retained. An unexpired claim requires --force.
+    /// Ids are processed in order; one failure does not stop the rest.
     #[command(visible_alias = "rm")]
     Delete {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
         /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
         #[arg(long)]
         force: bool,
@@ -422,6 +488,10 @@ pub enum Commands {
         /// Repeatable kind=value artifact, for example --artifact pr=https://...
         #[arg(long = "artifact")]
         artifact: Vec<String>,
+        /// Store a file's text in the database as an artifact. Repeatable.
+        /// KIND=PATH or PATH (kind defaults to report).
+        #[arg(long = "attach", value_name = "[KIND=]PATH")]
+        attach: Vec<PathBuf>,
     },
     /// Return claimed work to ready.
     Release {
@@ -445,9 +515,41 @@ pub enum Commands {
         /// Task id.
         id: i64,
     },
-    /// Reopen done work to ready, or cancelled work to inbox.
+    /// Reopen done work to ready, or cancelled work to held.
+    ///
+    /// Ids are processed in order; one failure does not stop the rest.
     Reopen {
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
+    },
+    /// Append a note or artifacts to a task's log, or print the log.
+    ///
+    /// With a message or --artifact/--attach, append an entry. With neither,
+    /// print every event for the task, oldest first: time, event, who, detail.
+    Log {
         /// Task id.
+        id: i64,
+        /// Note text, such as a thinking step or progress update.
+        #[arg(value_name = "MESSAGE")]
+        message: Option<String>,
+        /// Token printed by `q claim`. Attributes the entry to that agent.
+        #[arg(long)]
+        claim_token: Option<String>,
+        /// Percent complete, 0 to 100. Shown in the PROG column of q ls and q top.
+        #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        progress: Option<u8>,
+        /// Repeatable kind=value artifact, for example --artifact pr=https://...
+        #[arg(long = "artifact")]
+        artifact: Vec<String>,
+        /// Store a file's text in the database as an artifact. Repeatable.
+        /// KIND=PATH or PATH (kind defaults to report).
+        #[arg(long = "attach", value_name = "[KIND=]PATH")]
+        attach: Vec<PathBuf>,
+    },
+    /// Print an artifact's stored content. Ids are shown by `q show`.
+    Artifact {
+        /// Artifact id.
         id: i64,
     },
     /// Named groups of tasks that may span repos.
@@ -627,9 +729,19 @@ mod tests {
             "/tmp/q.db".into(),
             "ls".into(),
             "--status".into(),
-            "inbox".into(),
+            "held".into(),
         ]);
-        assert_eq!(args, vec!["--db", "/tmp/q.db", "ls", "--status", "inbox"]);
+        assert_eq!(args, vec!["--db", "/tmp/q.db", "ls", "--status", "held"]);
+    }
+
+    #[test]
+    fn hold_flag_does_not_hide_the_bare_title() {
+        let args = preprocess(vec!["--hold".into(), "Risky migration".into()]);
+        assert_eq!(args, vec!["add", "--hold", "Risky migration"]);
+        let args = preprocess(vec!["-w".into(), "Risky migration".into()]);
+        assert_eq!(args, vec!["add", "-w", "Risky migration"]);
+        let args = preprocess(vec!["hold".into(), "12".into()]);
+        assert_eq!(args, vec!["hold", "12"]);
     }
 
     #[test]
@@ -706,6 +818,28 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["q", "--color", "rainbow", "ls"]).is_err());
 
+        let top =
+            Cli::try_parse_from(["q", "top", "-i", "0.5", "-n", "5", "-a", "--once"]).unwrap();
+        match top.command {
+            Commands::Top {
+                interval,
+                limit,
+                all,
+                once,
+                ..
+            } => {
+                assert_eq!(interval, 0.5);
+                assert_eq!(limit, 5);
+                assert!(all);
+                assert!(once);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            preprocess(vec!["top".into(), "--interval".into(), "1".into()]),
+            vec!["top", "--interval", "1"]
+        );
+
         let done = Cli::try_parse_from(["q", "done", "4", "--summary", "ok"]).unwrap();
         match done.command {
             Commands::Complete { id, summary, .. } => {
@@ -716,8 +850,8 @@ mod tests {
         }
         let removed = Cli::try_parse_from(["q", "rm", "9", "--force"]).unwrap();
         match removed.command {
-            Commands::Delete { id, force } => {
-                assert_eq!(id, 9);
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![9]);
                 assert!(force);
             }
             other => panic!("unexpected {other:?}"),
@@ -726,10 +860,66 @@ mod tests {
             Cli::try_parse_from(["q", "recover"]).unwrap().command,
             Commands::RecoverStale { .. }
         ));
-        assert!(matches!(
-            Cli::try_parse_from(["q", "canceled", "3"]).unwrap().command,
-            Commands::Cancel { id: 3 }
-        ));
+        match Cli::try_parse_from(["q", "canceled", "3"]).unwrap().command {
+            Commands::Cancel { ids } => assert_eq!(ids, vec![3]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_commands_accept_one_or_more_ids() {
+        match Cli::try_parse_from(["q", "ready", "11", "12", "13"])
+            .unwrap()
+            .command
+        {
+            Commands::Ready { ids } => assert_eq!(ids, vec![11, 12, 13]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "ready", "11"]).unwrap().command {
+            Commands::Ready { ids } => assert_eq!(ids, vec![11]),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["q", "ready"]).is_err());
+        assert!(Cli::try_parse_from(["q", "ready", "11", "twelve"]).is_err());
+
+        match Cli::try_parse_from(["q", "cancel", "4", "5"])
+            .unwrap()
+            .command
+        {
+            Commands::Cancel { ids } => assert_eq!(ids, vec![4, 5]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "reopen", "6", "7"])
+            .unwrap()
+            .command
+        {
+            Commands::Reopen { ids } => assert_eq!(ids, vec![6, 7]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "delete", "8", "9", "--force"])
+            .unwrap()
+            .command
+        {
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![8, 9]);
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "delete", "--force", "8", "9"])
+            .unwrap()
+            .command
+        {
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![8, 9]);
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            preprocess(vec!["ready".into(), "11".into(), "12".into(), "13".into()]),
+            vec!["ready", "11", "12", "13"]
+        );
     }
 
     #[test]

@@ -304,7 +304,7 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
         &http,
         &url,
         Some(&access),
-        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "queue_capture", "arguments": {"title": "From chat", "capture_path": std::env::temp_dir()}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "queue_capture", "arguments": {"title": "From chat", "hold": true, "capture_path": std::env::temp_dir()}}}),
     );
     let task_id = tool_text(&captured)["id"].as_i64().unwrap();
     let (_, readied) = mcp(
@@ -472,7 +472,7 @@ fn foreign_browser_origins_cannot_mutate_a_local_queue() {
         None,
         json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"queue_status"}}),
     );
-    assert_eq!(tool_text(&status)["counts"]["inbox"], 0);
+    assert_eq!(tool_text(&status)["counts"]["held"], 0);
     // A same-origin browser request still works.
     assert_eq!(
         http.post(&format!("{}/mcp", server.url))

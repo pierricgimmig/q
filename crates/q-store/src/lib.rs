@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
-    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
-    Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
+    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, Actor, Artifact,
+    ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
     ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
     DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
-    Feature, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus,
-    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus,
-    TaskSummary, TaskTree, TreeQuery, TreeTask,
+    Feature, HeartbeatRequest, HoldRequest, ListFilter, LogRequest, ProjectPolicy, QueueError,
+    QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord,
+    ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail,
+    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -34,7 +34,7 @@ SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_captur
 tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.capture_path, \
 tasks.repo_relative_path, tasks.git_root, tasks.git_head, tasks.agent_pool, \
 tasks.required_capabilities_json, tasks.blocked_reason, tasks.created_at, tasks.updated_at, \
-tasks.feature_id, features.title \
+tasks.feature_id, features.title, tasks.progress \
 FROM tasks \
 LEFT JOIN features ON features.id = tasks.feature_id";
 
@@ -216,6 +216,7 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         kind: parse_kind(6, &kind)?,
         priority: row.get(7)?,
         risk: parse_risk(8, &risk)?,
+        progress: progress_from(row.get::<_, Option<i64>>(22)?),
         project: row.get(9)?,
         repo: row.get(10)?,
         capture_path: row.get(11)?,
@@ -231,6 +232,26 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: parse_time(18, &created_at)?,
         updated_at: parse_time(19, &updated_at)?,
     })
+}
+
+/// A stored percent, clamped to 0..=100.
+fn progress_from(value: Option<i64>) -> Option<u8> {
+    value.map(|percent| percent.clamp(0, 100) as u8)
+}
+
+/// Store a progress percent (or clear it) and bump `updated_at`.
+fn set_progress(
+    conn: &Connection,
+    id: i64,
+    progress: Option<u8>,
+    now: &str,
+) -> Result<(), QueueError> {
+    conn.execute(
+        "UPDATE tasks SET progress = ?, updated_at = ? WHERE id = ?",
+        params![progress.map(i64::from), now, id],
+    )
+    .db()?;
+    Ok(())
 }
 
 fn parse_uuid(idx: usize, value: &str) -> rusqlite::Result<Uuid> {
@@ -766,29 +787,57 @@ fn detail_for(conn: &Connection, id: i64) -> Result<TaskDetail, QueueError> {
     })
 }
 
+const ARTIFACT_SELECT: &str =
+    "SELECT id, task_id, kind, value, LENGTH(CAST(content AS BLOB)), created_at FROM artifacts";
+
+fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+    let content_bytes: Option<i64> = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    Ok(Artifact {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        kind: row.get(2)?,
+        value: row.get(3)?,
+        content_bytes: content_bytes.map(|bytes| bytes.max(0) as u64),
+        created_at: parse_time(5, &created_at)?,
+    })
+}
+
 fn load_artifacts(conn: &Connection, task_id: i64) -> Result<Vec<Artifact>, QueueError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, task_id, kind, value, created_at FROM artifacts WHERE task_id = ? ORDER BY id ASC",
-        )
+        .prepare(&format!(
+            "{ARTIFACT_SELECT} WHERE task_id = ? ORDER BY id ASC"
+        ))
         .db()?;
-    let rows = stmt
-        .query_map(params![task_id], |row| {
-            let created_at: String = row.get(4)?;
-            Ok(Artifact {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                kind: row.get(2)?,
-                value: row.get(3)?,
-                created_at: parse_time(4, &created_at)?,
-            })
-        })
-        .db()?;
+    let rows = stmt.query_map(params![task_id], map_artifact).db()?;
     let mut artifacts = Vec::new();
     for row in rows {
         artifacts.push(row.db()?);
     }
     Ok(artifacts)
+}
+
+fn load_artifact_content(
+    conn: &Connection,
+    artifact_id: i64,
+) -> Result<ArtifactContent, QueueError> {
+    let artifact = conn
+        .query_row(
+            &format!("{ARTIFACT_SELECT} WHERE id = ?"),
+            params![artifact_id],
+            map_artifact,
+        )
+        .optional()
+        .db()?
+        .ok_or_else(|| QueueError::InvalidInput(format!("artifact {artifact_id} not found")))?;
+    let content: Option<String> = conn
+        .query_row(
+            "SELECT content FROM artifacts WHERE id = ?",
+            params![artifact_id],
+            |row| row.get(0),
+        )
+        .db()?;
+    Ok(ArtifactContent { artifact, content })
 }
 
 fn load_events(
@@ -851,7 +900,7 @@ fn insert_artifact(
     artifact: &ArtifactInput,
     actor: &Actor,
     now: &str,
-) -> Result<(), QueueError> {
+) -> Result<i64, QueueError> {
     let kind = artifact.kind.trim();
     let value = artifact.value.trim();
     if kind.is_empty() || value.is_empty() {
@@ -869,19 +918,17 @@ fn insert_artifact(
         ));
     }
     conn.execute(
-        "INSERT INTO artifacts (task_id, kind, value, created_at) VALUES (?, ?, ?, ?)",
-        params![task_id, kind, value, now],
+        "INSERT INTO artifacts (task_id, kind, value, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        params![task_id, kind, value, artifact.content, now],
     )
     .db()?;
-    insert_event(
-        conn,
-        Some(task_id),
-        "artifact_added",
-        actor,
-        json!({"kind": kind, "value": value}),
-        now,
-    )?;
-    Ok(())
+    let artifact_id = conn.last_insert_rowid();
+    let mut payload = json!({"kind": kind, "value": value, "artifact_id": artifact_id});
+    if let Some(content) = &artifact.content {
+        payload["content_bytes"] = json!(content.len());
+    }
+    insert_event(conn, Some(task_id), "artifact_added", actor, payload, now)?;
+    Ok(artifact_id)
 }
 
 fn count_for_task(conn: &Connection, sql: &str, task_id: i64) -> Result<i64, QueueError> {
@@ -1038,18 +1085,25 @@ impl QueueService for Queue {
         };
         let feature_id = optional_feature_id(&tx, request.feature.as_deref())?;
         let public_id = Uuid::now_v7().to_string();
+        // Captured work is claimable right away unless the caller holds it.
+        let status = if request.hold {
+            TaskStatus::Held
+        } else {
+            TaskStatus::Ready
+        };
         tx.execute(
             "INSERT INTO tasks (
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             params![
                 public_id,
                 title,
                 body,
                 original_capture,
+                status.as_str(),
                 request.kind.as_str(),
                 request.priority,
                 request.risk.as_str(),
@@ -1079,7 +1133,7 @@ impl QueueService for Queue {
             &request.actor,
             json!({
                 "title": title,
-                "status": "inbox",
+                "status": status.as_str(),
                 "kind": request.kind.as_str(),
                 "risk": request.risk.as_str(),
                 "project": project,
@@ -1114,7 +1168,10 @@ impl QueueService for Queue {
             .prepare(
                 "SELECT tasks.id, tasks.public_id, tasks.title, tasks.status, tasks.kind, \
                  tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.agent_pool, \
-                 tasks.created_at, tasks.updated_at, tasks.feature_id, features.title \
+                 tasks.created_at, tasks.updated_at, tasks.feature_id, features.title, \
+                 tasks.progress, \
+                 (SELECT value FROM artifacts WHERE artifacts.task_id = tasks.id \
+                    AND artifacts.kind = 'pr' ORDER BY artifacts.id DESC LIMIT 1) \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
                  WHERE ((?1 IS NOT NULL AND tasks.status = ?1) \
@@ -1171,6 +1228,8 @@ impl QueueService for Queue {
                         kind: parse_kind(4, &kind)?,
                         priority: row.get(5)?,
                         risk: parse_risk(6, &risk)?,
+                        progress: progress_from(row.get::<_, Option<i64>>(14)?),
+                        pr_url: row.get(15)?,
                         project: row.get(7)?,
                         repo: row.get(8)?,
                         agent_pool: row.get(9)?,
@@ -1347,15 +1406,14 @@ impl QueueService for Queue {
         let (_, now) = now_parts();
         let task = load_task_in(&tx, request.task_id)?;
         ensure_transition(task.status, TaskStatus::Ready)?;
-        let risk_note = if task.risk >= RiskLevel::High {
-            Some(format!(
+        let warnings: Vec<String> = if task.risk >= RiskLevel::High {
+            vec![format!(
                 "risk is {}; default claims will not select this task",
                 task.risk
-            ))
+            )]
         } else {
-            None
+            Vec::new()
         };
-        let warnings = readiness_warnings(task.body.as_deref(), risk_note);
         set_status(&tx, task.id, task.status, TaskStatus::Ready, &now)?;
         tx.execute(
             "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
@@ -1377,6 +1435,32 @@ impl QueueService for Queue {
         tx.commit().db()?;
         let task = self.with_conn(|conn| load_task(conn, request.task_id))?;
         Ok(ReadyOutcome { task, warnings })
+    }
+
+    fn hold(&self, request: HoldRequest) -> Result<Task, QueueError> {
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        ensure_transition(task.status, TaskStatus::Held)?;
+        set_status(&tx, task.id, task.status, TaskStatus::Held, &now)?;
+        tx.execute(
+            "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
+            params![task.id],
+        )
+        .db()?;
+        insert_event(
+            &tx,
+            Some(task.id),
+            "task_held",
+            &request.actor,
+            json!({"from": task.status.as_str(), "to": "held"}),
+            &now,
+        )?;
+        tx.commit().db()?;
+        self.with_conn(|conn| load_task(conn, request.task_id))
     }
 
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError> {
@@ -1732,10 +1816,16 @@ impl QueueService for Queue {
             ensure_transition(status, target)?;
             set_status(&tx, task.id, status, target, &now)?;
             retire_claim(&tx, claim.id, &now)?;
+            if target == TaskStatus::Done {
+                set_progress(&tx, task.id, Some(100), &now)?;
+            }
             Actor::agent(claim.agent_id)
         } else if task.status == TaskStatus::Review {
             ensure_transition(task.status, target)?;
             set_status(&tx, task.id, task.status, target, &now)?;
+            if target == TaskStatus::Done {
+                set_progress(&tx, task.id, Some(100), &now)?;
+            }
             request.actor.clone()
         } else {
             return Err(QueueError::InvalidTransition {
@@ -1751,10 +1841,7 @@ impl QueueService for Queue {
             insert_artifact(
                 &tx,
                 task.id,
-                &ArtifactInput {
-                    kind: "summary".into(),
-                    value: summary.clone(),
-                },
+                &ArtifactInput::reference("summary", summary.clone()),
                 &actor,
                 &now,
             )?;
@@ -1809,6 +1896,70 @@ impl QueueService for Queue {
         Ok(recovered)
     }
 
+    fn log(&self, request: LogRequest) -> Result<TaskDetail, QueueError> {
+        let message = request
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if let Some(percent) = request.progress {
+            if percent > 100 {
+                return Err(QueueError::InvalidInput(
+                    "progress is a percent from 0 to 100".into(),
+                ));
+            }
+        }
+        if message.is_none() && request.progress.is_none() && request.artifacts.is_empty() {
+            return Err(QueueError::InvalidInput(
+                "log needs a message, a progress percent, or at least one artifact".into(),
+            ));
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        let actor = match request.claim_token.as_deref().map(str::trim) {
+            Some(token) if !token.is_empty() => {
+                let claim = require_active_claim(&tx, task.id, token, &now)?;
+                Actor::agent(claim.agent_id)
+            }
+            _ => request.actor.clone(),
+        };
+        let mut artifact_ids = Vec::new();
+        for artifact in &request.artifacts {
+            artifact_ids.push(insert_artifact(&tx, task.id, artifact, &actor, &now)?);
+        }
+        if let Some(percent) = request.progress {
+            set_progress(&tx, task.id, Some(percent), &now)?;
+        }
+        if message.is_some() || request.progress.is_some() {
+            let mut payload = json!({"artifact_ids": artifact_ids});
+            if let Some(message) = message {
+                payload["message"] = json!(message);
+            }
+            if let Some(percent) = request.progress {
+                payload["progress"] = json!(percent);
+            }
+            insert_event(
+                &tx,
+                Some(task.id),
+                q_core::NOTE_EVENT,
+                &actor,
+                payload,
+                &now,
+            )?;
+        }
+        tx.commit().db()?;
+        self.get(request.task_id)
+    }
+
+    fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError> {
+        let conn = open_connection(&self.path)?;
+        load_artifact_content(&conn, artifact_id)
+    }
+
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError> {
         let conn = open_connection(&self.path)?;
         ensure_exists(&conn, task_id)?;
@@ -1830,7 +1981,7 @@ impl QueueService for Queue {
         for row in rows {
             let (status, count) = row.db()?;
             match TaskStatus::parse(&status)? {
-                TaskStatus::Inbox => counts.inbox = count,
+                TaskStatus::Held => counts.held = count,
                 TaskStatus::Ready => counts.ready = count,
                 TaskStatus::Claimed => counts.claimed = count,
                 TaskStatus::InProgress => counts.in_progress = count,
@@ -1875,7 +2026,7 @@ impl QueueService for Queue {
         let task = load_task_in(&tx, id)?;
         let to = match task.status {
             TaskStatus::Done => TaskStatus::Ready,
-            TaskStatus::Cancelled => TaskStatus::Inbox,
+            TaskStatus::Cancelled => TaskStatus::Held,
             other => {
                 return Err(QueueError::InvalidInput(format!(
                     "only done or cancelled tasks can be reopened (status is {other})"
@@ -1884,7 +2035,8 @@ impl QueueService for Queue {
         };
         ensure_transition(task.status, to)?;
         set_status(&tx, task.id, task.status, to, &now)?;
-        if to == TaskStatus::Inbox {
+        set_progress(&tx, task.id, None, &now)?;
+        if to == TaskStatus::Held {
             tx.execute(
                 "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
                 params![id],

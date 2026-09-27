@@ -19,6 +19,7 @@ pub const METHODS: &[&str] = &[
     "get",
     "edit",
     "mark_ready",
+    "hold",
     "block",
     "cancel",
     "delete",
@@ -28,6 +29,8 @@ pub const METHODS: &[&str] = &[
     "complete",
     "release",
     "recover_stale",
+    "log",
+    "artifact",
     "events",
     "status",
     "reopen",
@@ -48,7 +51,7 @@ pub struct HealthBody {
     pub version: String,
 }
 
-/// Body for `/v1/get`, `/v1/events`, `/v1/get_feature`, `/v1/delete_feature`.
+/// Body for `/v1/get`, `/v1/events`, `/v1/artifact`, `/v1/get_feature`, `/v1/delete_feature`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdBody {
     pub id: i64,
@@ -182,7 +185,7 @@ mod tests {
             QueueError::NotFound(7),
             QueueError::FeatureNotFound("auth".into()),
             QueueError::InvalidTransition {
-                from: TaskStatus::Inbox,
+                from: TaskStatus::Held,
                 to: TaskStatus::Done,
             },
             QueueError::TokenMismatch,
