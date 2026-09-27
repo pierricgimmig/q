@@ -417,20 +417,24 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Ready { id } => {
-            let outcome = queue.mark_ready(ReadyRequest {
-                task_id: id,
-                actor: human_actor(),
-            })?;
-            for warning in &outcome.warnings {
-                eprintln!("{} {warning}", ui.err.warning_label());
-            }
-            let task = &outcome.task;
-            emit(ui, &outcome, || {
+        Commands::Ready { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                let outcome = queue.mark_ready(ReadyRequest {
+                    task_id: id,
+                    actor: human_actor(),
+                })?;
+                for warning in &outcome.warnings {
+                    eprintln!("{} {warning}", ui.err.warning_label());
+                }
+                Ok(outcome)
+            },
+            |outcome| {
+                let task = &outcome.task;
                 confirm(ui, "ready", task.id, task.status.as_str(), &task.title);
-            });
-            Ok(())
-        }
+            },
+        ),
         Commands::Block { id, claim_token } => {
             let task = queue.block(BlockRequest {
                 task_id: id,
@@ -442,23 +446,28 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Cancel { id } => {
-            let task = queue.cancel(CancelRequest {
-                task_id: id,
-                actor: human_actor(),
-            })?;
-            emit(ui, &task, || {
-                confirm(ui, "cancelled", task.id, task.status.as_str(), &task.title);
-            });
-            Ok(())
-        }
-        Commands::Delete { id, force } => {
-            let outcome = queue.delete(DeleteRequest {
-                task_id: id,
-                force,
-                actor: human_actor(),
-            })?;
-            emit(ui, &outcome, || {
+        Commands::Cancel { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                Ok(queue.cancel(CancelRequest {
+                    task_id: id,
+                    actor: human_actor(),
+                })?)
+            },
+            |task| confirm(ui, "cancelled", task.id, task.status.as_str(), &task.title),
+        ),
+        Commands::Delete { ids, force } => for_each_task(
+            ui,
+            &ids,
+            |id| {
+                Ok(queue.delete(DeleteRequest {
+                    task_id: id,
+                    force,
+                    actor: human_actor(),
+                })?)
+            },
+            |outcome| {
                 confirm(
                     ui,
                     "deleted",
@@ -479,9 +488,8 @@ fn dispatch(
                         outcome.dependencies_removed
                     ))
                 );
-            });
-            Ok(())
-        }
+            },
+        ),
         Commands::Claim {
             agent,
             capability,
@@ -664,13 +672,12 @@ fn dispatch(
             });
             Ok(())
         }
-        Commands::Reopen { id } => {
-            let task = queue.reopen(id, human_actor())?;
-            emit(ui, &task, || {
-                confirm(ui, "reopened", task.id, task.status.as_str(), &task.title);
-            });
-            Ok(())
-        }
+        Commands::Reopen { ids } => for_each_task(
+            ui,
+            &ids,
+            |id| Ok(queue.reopen(id, human_actor())?),
+            |task| confirm(ui, "reopened", task.id, task.status.as_str(), &task.title),
+        ),
         Commands::Log {
             id,
             message,
@@ -1001,10 +1008,87 @@ fn edit_in_editor(current: &str) -> Result<Option<String>, CliError> {
 
 fn emit(ui: &Ui, value: &impl serde::Serialize, human: impl FnOnce()) {
     if ui.json {
-        serde_json::to_writer_pretty(io::stdout(), value).expect("write json");
-        println!();
+        print_json(value);
     } else {
         human();
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) {
+    serde_json::to_writer_pretty(io::stdout(), value).expect("write json");
+    println!();
+}
+
+/// One failed id in a multi-id command, as reported under `errors` in `--json`.
+#[derive(serde::Serialize)]
+struct TaskError {
+    id: i64,
+    error: String,
+}
+
+/// Machine output for a lifecycle command given more than one id.
+#[derive(serde::Serialize)]
+struct BatchOutcome<T: serde::Serialize> {
+    results: Vec<T>,
+    errors: Vec<TaskError>,
+}
+
+/// Apply a lifecycle command to each id in order.
+///
+/// With exactly one id the behavior is unchanged: the outcome document is
+/// printed (or the human confirmation), and an error propagates as before.
+/// With several ids, each failure is reported for that id and the rest still
+/// run. Human output prints one confirmation or error line per id as it
+/// happens; `--json` prints a single `{"results":[...],"errors":[...]}`
+/// document where each result has the single-id shape. The command exits
+/// non-zero if any id failed.
+fn for_each_task<T: serde::Serialize>(
+    ui: &Ui,
+    ids: &[i64],
+    mut act: impl FnMut(i64) -> Result<T, CliError>,
+    human: impl Fn(&T),
+) -> Result<(), CliError> {
+    let single = ids.len() == 1;
+    let mut results = Vec::with_capacity(ids.len());
+    let mut errors = Vec::new();
+    for &id in ids {
+        match act(id) {
+            Ok(outcome) => {
+                if !ui.json {
+                    human(&outcome);
+                }
+                results.push(outcome);
+            }
+            Err(error) if single => return Err(error),
+            Err(error) => {
+                if !ui.json {
+                    eprintln!(
+                        "{} {} {error}",
+                        ui.err.error_label(),
+                        ui.err.dim(&format!("#{id}"))
+                    );
+                }
+                errors.push(TaskError {
+                    id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    let failed = errors.len();
+    if ui.json {
+        match results.as_slice() {
+            [only] if single => print_json(only),
+            _ => print_json(&BatchOutcome { results, errors }),
+        }
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(CliError::message(format!(
+            "{failed} of {} tasks failed",
+            ids.len()
+        )))
     }
 }
 

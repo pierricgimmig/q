@@ -11,11 +11,12 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 
 - Capture creates an **inbox** task. Inbox work is never claimable.
 - After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
-- A human must run `q ready ID` before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
+- A human must run `q ready ID` (or several at once: `q ready 11 12 13`) before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
 - `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason. Claim tokens are still required for claimed work.
+- `q ready`, `q cancel`, `q reopen`, and `q delete` accept one or more ids, processed in order. One failing id is reported and the rest still run; the exit status is non-zero if any failed. With `--json`, one id prints the usual single-task document and several ids print `{"results":[...],"errors":[{"id":..,"error":..}]}`.
 - Default claim risk is `medium`. `high` and `external_action` are excluded unless the claim sets `--max-risk` or MCP `maximum_risk`. `external_action` also needs the project flag `allow_external_actions`, which defaults to false.
 - If the claim sets an agent pool, the task must have that exact pool. Omit the pool to leave pool filtering unrestricted.
 - Required capabilities must be a subset of the worker capabilities. Dependencies must be `done`. Empty repo, project, and kind filters mean unrestricted.
@@ -48,6 +49,7 @@ q log 184
 q artifact 7
 q release 184 --claim-token TOKEN
 q block 184 --claim-token TOKEN
+q ready 11 12 13
 q cancel 184
 q delete 184
 q feature create "Cross-repo rollout" --body "Ship the queue across services"

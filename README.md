@@ -139,9 +139,12 @@ q edit 184 --body-file task.md
 q edit 184
 q edit 184 --priority 2 -e
 q ready 184
+q ready 11 12 13
 q block 184
 q cancel 184
+q cancel 11 12 13
 q delete 184
+q reopen 184
 ```
 
 `q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
@@ -158,6 +161,8 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
 ```
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits.
+
+`q ready`, `q cancel`, `q reopen`, and `q delete` take one or more ids: `q ready 11 12 13`. Ids are processed in order, each one in its own transaction. A failure on one id (not found, wrong status, active claim) is reported for that id and the remaining ids still run; the command exits non-zero at the end if any id failed. Human output prints the usual confirmation or error line per id as it happens. With `--json` and exactly one id the output is the same document as before, so existing callers do not change. With `--json` and several ids the output is a single `{"results":[...],"errors":[{"id":13,"error":"..."}]}` document, where each entry in `results` has the single-id shape (`{"task":...,"warnings":[...]}` for ready, the task for cancel and reopen, and the delete outcome for delete).
 
 `q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
 
