@@ -1,42 +1,23 @@
-const RECOMMENDED: &[(&str, &str)] = &[
-    ("Goal", "goal"),
-    ("Repository / target", "repository"),
-    ("Scope", "scope"),
-    ("Deliverable", "deliverable"),
-    ("Acceptance criteria", "acceptance"),
-    ("Constraints / do not do", "constraint"),
-    ("Dependencies", "dependenc"),
+const TEMPLATE_SECTIONS: &[&str] = &[
+    "Goal",
+    "Repository / target",
+    "Scope",
+    "Deliverable",
+    "Acceptance criteria",
+    "Constraints / do not do",
+    "Dependencies",
 ];
 
-/// A Markdown skeleton with one empty heading per recommended section.
+/// A Markdown skeleton with one empty heading per template section. Used to
+/// seed the editor for `q add --edit`; none of the sections are required.
 pub fn body_template() -> String {
     let mut out = String::new();
-    for (label, _) in RECOMMENDED {
+    for label in TEMPLATE_SECTIONS {
         out.push_str("## ");
         out.push_str(label);
         out.push_str("\n\n");
     }
     out
-}
-
-pub fn missing_recommended_sections(body: Option<&str>) -> Vec<String> {
-    let headings = headings(body.unwrap_or(""));
-    RECOMMENDED
-        .iter()
-        .filter(|(_, needle)| !headings.iter().any(|heading| heading.contains(needle)))
-        .map(|(label, _)| (*label).to_string())
-        .collect()
-}
-
-pub fn readiness_warnings(body: Option<&str>, risk_note: Option<String>) -> Vec<String> {
-    let mut warnings = missing_recommended_sections(body)
-        .into_iter()
-        .map(|section| format!("missing recommended section: {section}"))
-        .collect::<Vec<_>>();
-    if let Some(note) = risk_note {
-        warnings.push(note);
-    }
-    warnings
 }
 
 pub fn acceptance_criteria(body: Option<&str>) -> Vec<String> {
@@ -65,12 +46,6 @@ pub fn acceptance_criteria(body: Option<&str>) -> Vec<String> {
         }
     }
     items
-}
-
-fn headings(body: &str) -> Vec<String> {
-    body.lines()
-        .filter_map(|line| heading_text(line.trim()))
-        .collect()
 }
 
 fn heading_text(trimmed: &str) -> Option<String> {
@@ -133,8 +108,7 @@ A markdown report
 "#;
 
     #[test]
-    fn full_body_has_no_missing_sections_and_parses_criteria() {
-        assert!(missing_recommended_sections(Some(FULL)).is_empty());
+    fn full_body_parses_criteria() {
         assert_eq!(
             acceptance_criteria(Some(FULL)),
             vec![
@@ -145,30 +119,16 @@ A markdown report
     }
 
     #[test]
-    fn sparse_body_lists_missing_sections() {
-        let missing = missing_recommended_sections(Some("just an idea"));
-        assert!(missing.iter().any(|item| item == "Goal"));
-        assert!(missing.iter().any(|item| item == "Acceptance criteria"));
-        assert!(missing_recommended_sections(None)
-            .iter()
-            .any(|item| item == "Goal"));
+    fn sparse_body_has_no_criteria() {
+        assert!(acceptance_criteria(Some("just an idea")).is_empty());
+        assert!(acceptance_criteria(None).is_empty());
     }
 
     #[test]
-    fn optional_sections_are_still_listed_when_other_headings_are_present() {
-        let body = r#"
-## Goal
-G
-## Scope
-S
-## Deliverable
-D
-## Acceptance criteria
-- one
-"#;
-        let missing = missing_recommended_sections(Some(body));
-        assert!(!missing.iter().any(|item| item == "Goal"));
-        assert!(missing.iter().any(|item| item.contains("Constraints")));
-        assert!(missing.iter().any(|item| item.contains("Dependencies")));
+    fn body_template_has_one_heading_per_section() {
+        let template = body_template();
+        for label in TEMPLATE_SECTIONS {
+            assert!(template.contains(&format!("## {label}\n\n")), "{label}");
+        }
     }
 }

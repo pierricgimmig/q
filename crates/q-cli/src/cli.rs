@@ -225,7 +225,7 @@ pub enum Commands {
         /// low, medium, high, or external_action. Default low.
         #[arg(long, value_name = "RISK")]
         risk: Option<String>,
-        /// Markdown body. Missing sections warn on ready; they do not block it.
+        /// Markdown body. Any shape is accepted; no sections are required.
         #[arg(long)]
         body: Option<String>,
         /// Read the body from a file instead of --body.
@@ -234,7 +234,7 @@ pub enum Commands {
         /// Open $VISUAL or $EDITOR on the body before capture.
         ///
         /// Starts from --body or --body-file when given, otherwise from a
-        /// template with the recommended sections.
+        /// template of suggested sections.
         #[arg(short = 'e', long)]
         edit: bool,
         /// Required capability. Repeatable. Comma-separated values are split.

@@ -87,7 +87,7 @@ q -e "Write the parser"
 
 Without `--json`, capture prints a blank line and then exactly one confirmation line: `captured #184 [inbox] Benchmark trace encoding variants`. The title is collapsed to one line and, like `q ls`, truncated with an ellipsis after 64 characters. `--json` prints the full task instead.
 
-`--body` and `--body-file` set the Markdown body at capture. `-e` (`--edit`) opens `$VISUAL` or `$EDITOR` on it first, seeded with that text or, when neither is given, with a template of the recommended sections (Goal, Repository / target, Scope, Deliverable, Acceptance criteria, Constraints / do not do, Dependencies). A body left blank is stored as no body. `--edit` is an error when no editor is set.
+`--body` and `--body-file` set the Markdown body at capture. `-e` (`--edit`) opens `$VISUAL` or `$EDITOR` on it first, seeded with that text or, when neither is given, with a template of suggested sections (Goal, Repository / target, Scope, Deliverable, Acceptance criteria, Constraints / do not do, Dependencies). None of them are required. A body left blank is stored as no body. `--edit` is an error when no editor is set.
 
 Discovery precedence:
 
@@ -157,7 +157,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
  1  inbox   (none)   (none)     0  2d ago   Unassigned capture
 ```
 
-`q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
+`q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits.
 
 `q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
 

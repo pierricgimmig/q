@@ -19,9 +19,7 @@ pub use service::QueueService;
 pub use timeutil::{format_timestamp, parse_timestamp};
 pub use transition::{ensure_transition, transition_allowed};
 pub use tree::{build_feature_forest, build_task_tree, TreeTask};
-pub use validate::{
-    acceptance_criteria, body_template, missing_recommended_sections, readiness_warnings,
-};
+pub use validate::{acceptance_criteria, body_template};
 
 pub const DEFAULT_LEASE_MINUTES: u64 = 45;
 pub const MIN_LEASE_MINUTES: u64 = 1;
