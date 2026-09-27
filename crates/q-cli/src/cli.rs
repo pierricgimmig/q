@@ -271,7 +271,7 @@ pub enum Commands {
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
     },
-    /// Watch the queue. Redraws counts, the task table, and recent changes until Ctrl-C.
+    /// Watch the queue. Redraws counts, the task table, and recent changes; press q to quit.
     Top {
         /// Seconds between refreshes.
         #[arg(short = 'i', long, default_value_t = 2.0, value_name = "SECONDS")]
