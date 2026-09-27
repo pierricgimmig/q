@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use q_core::{
-    Actor, ActorKind, CaptureRequest, ClaimRequest, CompleteRequest, HeartbeatRequest, ListFilter,
-    QueueError, QueueService, ReadyRequest, RiskLevel, StartRequest, TaskKind, TaskStatus,
+    Actor, ActorKind, ArtifactInput, CaptureRequest, ClaimRequest, CompleteRequest,
+    HeartbeatRequest, ListFilter, LogRequest, QueueError, QueueService, ReadyRequest, RiskLevel,
+    StartRequest, TaskKind, TaskStatus,
 };
 use q_http::{serve_on, AuthConfig, RemoteQueue};
 use q_store::Queue;
@@ -165,6 +166,35 @@ fn full_claim_lifecycle_over_http() {
         })
         .unwrap();
     assert_eq!(detail.task.status, TaskStatus::InProgress);
+
+    // Mid-task notes and inline artifacts go through the same authority.
+    let logged = queue
+        .log(LogRequest {
+            task_id: task.id,
+            claim_token: Some(lease.token.clone()),
+            message: Some("Encoder read; varint path looks slow".into()),
+            artifacts: vec![ArtifactInput {
+                kind: "report".into(),
+                value: "notes.md".into(),
+                content: Some("# Notes\n\nvarint\n".into()),
+            }],
+            actor: Actor::human(None),
+        })
+        .unwrap();
+    let note = logged
+        .events
+        .iter()
+        .find(|event| event.event_type == q_core::NOTE_EVENT)
+        .expect("note event");
+    assert_eq!(note.actor_id.as_deref(), Some("agent-1"));
+    let stored = logged
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "report")
+        .unwrap();
+    assert_eq!(stored.content_bytes, Some(16));
+    let fetched = queue.artifact(stored.id).unwrap();
+    assert_eq!(fetched.content.as_deref(), Some("# Notes\n\nvarint\n"));
 
     let done = queue
         .complete(CompleteRequest {

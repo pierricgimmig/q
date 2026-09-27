@@ -64,6 +64,8 @@ fn is_command(word: &str) -> bool {
             | "recover-stale"
             | "events"
             | "reopen"
+            | "log"
+            | "artifact"
             | "project"
             | "feature"
             | "mcp"
@@ -132,6 +134,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--body-file"
             | "--to"
             | "--artifact"
+            | "--attach"
             | "--target"
             | "--capability"
             | "--capabilities"
@@ -457,6 +460,10 @@ pub enum Commands {
         /// Repeatable kind=value artifact, for example --artifact pr=https://...
         #[arg(long = "artifact")]
         artifact: Vec<String>,
+        /// Store a file's text in the database as an artifact. Repeatable.
+        /// KIND=PATH or PATH (kind defaults to report).
+        #[arg(long = "attach", value_name = "[KIND=]PATH")]
+        attach: Vec<PathBuf>,
     },
     /// Return claimed work to ready.
     Release {
@@ -483,6 +490,32 @@ pub enum Commands {
     /// Reopen done work to ready, or cancelled work to inbox.
     Reopen {
         /// Task id.
+        id: i64,
+    },
+    /// Append a note or artifacts to a task's log, or print the log.
+    ///
+    /// With a message or --artifact/--attach, append an entry. With neither,
+    /// print every event for the task, oldest first: time, event, who, detail.
+    Log {
+        /// Task id.
+        id: i64,
+        /// Note text, such as a thinking step or progress update.
+        #[arg(value_name = "MESSAGE")]
+        message: Option<String>,
+        /// Token printed by `q claim`. Attributes the entry to that agent.
+        #[arg(long)]
+        claim_token: Option<String>,
+        /// Repeatable kind=value artifact, for example --artifact pr=https://...
+        #[arg(long = "artifact")]
+        artifact: Vec<String>,
+        /// Store a file's text in the database as an artifact. Repeatable.
+        /// KIND=PATH or PATH (kind defaults to report).
+        #[arg(long = "attach", value_name = "[KIND=]PATH")]
+        attach: Vec<PathBuf>,
+    },
+    /// Print an artifact's stored content. Ids are shown by `q show`.
+    Artifact {
+        /// Artifact id.
         id: i64,
     },
     /// Named groups of tasks that may span repos.

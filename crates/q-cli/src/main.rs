@@ -13,9 +13,9 @@ use clap::Parser;
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
     CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
-    EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, QueueError, QueueService,
-    ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
-    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
+    EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
+    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition,
+    StartRequest, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
 };
 use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
@@ -583,15 +583,13 @@ fn dispatch(
             summary,
             status,
             artifact,
+            attach,
         } => {
             let target = match status {
                 Some(status) => Some(TaskStatus::parse(&status)?),
                 None => None,
             };
-            let mut artifacts = Vec::new();
-            for item in artifact {
-                artifacts.push(parse_artifact(&item)?);
-            }
+            let artifacts = collect_artifacts(artifact, attach)?;
             let detail = queue.complete(CompleteRequest {
                 task_id: id,
                 claim_token,
@@ -670,6 +668,61 @@ fn dispatch(
             let task = queue.reopen(id, human_actor())?;
             emit(ui, &task, || {
                 confirm(ui, "reopened", task.id, task.status.as_str(), &task.title);
+            });
+            Ok(())
+        }
+        Commands::Log {
+            id,
+            message,
+            claim_token,
+            artifact,
+            attach,
+        } => {
+            let artifacts = collect_artifacts(artifact, attach)?;
+            let message = message.filter(|text| !text.trim().is_empty());
+            if message.is_none() && artifacts.is_empty() {
+                let events = queue.events(id)?;
+                emit(ui, &serde_json::json!({"events": events}), || {
+                    print_events(&events, ui.out, "");
+                });
+                return Ok(());
+            }
+            let added = artifacts.len();
+            let detail = queue.log(LogRequest {
+                task_id: id,
+                claim_token,
+                message,
+                artifacts,
+                actor: human_actor(),
+            })?;
+            emit(ui, &detail, || {
+                let last = detail.events.last();
+                println!(
+                    "logged {} {}",
+                    ui.out.dim(&format!("#{id}")),
+                    match last {
+                        Some(event) => describe_event(event, ui.out),
+                        None => format!("{added} artifact(s)"),
+                    }
+                );
+            });
+            Ok(())
+        }
+        Commands::Artifact { id } => {
+            let artifact = queue.artifact(id)?;
+            emit(ui, &artifact, || match &artifact.content {
+                Some(content) => {
+                    print!("{content}");
+                    if !content.ends_with('\n') {
+                        println!();
+                    }
+                }
+                None => println!(
+                    "{}: {} {}",
+                    artifact.artifact.kind,
+                    artifact.artifact.value,
+                    ui.out.dim("(reference only, no stored content)")
+                ),
             });
             Ok(())
         }
@@ -874,9 +927,41 @@ fn parse_artifact(value: &str) -> Result<ArtifactInput, CliError> {
     if kind.is_empty() || artifact_value.is_empty() {
         return Err(CliError::message("artifact kind and value are required"));
     }
+    Ok(ArtifactInput::reference(kind, artifact_value))
+}
+
+/// `--artifact kind=value` references plus `--attach [kind=]path` files whose
+/// text is stored in the database.
+fn collect_artifacts(
+    references: Vec<String>,
+    attachments: Vec<PathBuf>,
+) -> Result<Vec<ArtifactInput>, CliError> {
+    let mut artifacts = Vec::new();
+    for item in references {
+        artifacts.push(parse_artifact(&item)?);
+    }
+    for item in attachments {
+        artifacts.push(read_attachment(&item)?);
+    }
+    Ok(artifacts)
+}
+
+const ATTACH_DEFAULT_KIND: &str = "report";
+
+fn read_attachment(spec: &Path) -> Result<ArtifactInput, CliError> {
+    let text = spec.to_string_lossy();
+    let (kind, path) = match text.split_once('=') {
+        Some((kind, path)) if !kind.trim().is_empty() && !kind.contains(['/', '\\']) => {
+            (kind.trim().to_string(), PathBuf::from(path.trim()))
+        }
+        _ => (ATTACH_DEFAULT_KIND.to_string(), spec.to_path_buf()),
+    };
+    let content = fs::read_to_string(&path)
+        .map_err(|err| CliError::message(format!("read {}: {err}", path.display())))?;
     Ok(ArtifactInput {
-        kind: kind.to_string(),
-        value: artifact_value.to_string(),
+        kind,
+        value: path.display().to_string(),
+        content: Some(content),
     })
 }
 
@@ -1238,16 +1323,85 @@ fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
     }
 }
 
+/// The task log: one line per event with time, event, who, and detail.
+/// Columns are padded so the log reads as a table.
 fn print_events(events: &[q_core::Event], paint: Paint, indent: &str) {
+    let type_width = events
+        .iter()
+        .map(|event| event.event_type.len())
+        .max()
+        .unwrap_or(0);
+    let who_width = events
+        .iter()
+        .map(|event| event_actor(event).len())
+        .max()
+        .unwrap_or(0);
     for event in events {
+        let who = event_actor(event);
+        let detail = event_detail(event, paint);
         println!(
-            "{indent}{} {} {} {}",
-            paint.dim(&format!("#{}", event.id)),
-            event.event_type,
-            paint.dim(&event.actor_type),
+            "{indent}{}  {}{}  {}{}  {}",
             paint.dim(&format_timestamp(event.created_at)),
+            paint.bold(&event.event_type),
+            " ".repeat(type_width - event.event_type.len()),
+            paint.dim(&who),
+            " ".repeat(who_width - who.len()),
+            detail,
         );
     }
+}
+
+/// `agent:claude-01`, `human:pierric`, or `system:q`.
+fn event_actor(event: &q_core::Event) -> String {
+    match event.actor_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => format!("{}:{id}", event.actor_type),
+        None => event.actor_type.clone(),
+    }
+}
+
+/// What the event did: a status move, a note, an artifact, or a branch.
+fn event_detail(event: &q_core::Event, paint: Paint) -> String {
+    let payload = &event.payload;
+    let field = |key: &str| payload.get(key).and_then(|value| value.as_str());
+    let mut parts = Vec::new();
+    if let (Some(from), Some(to)) = (field("from"), field("to")) {
+        parts.push(format!(
+            "{} {} {}",
+            paint.status(from),
+            paint.dim("->"),
+            paint.status(to)
+        ));
+    }
+    if let Some(message) = field("message") {
+        parts.push(message.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    if let (Some(kind), Some(value)) = (field("kind"), field("value")) {
+        let id = payload
+            .get("artifact_id")
+            .and_then(|value| value.as_i64())
+            .map(|id| paint.dim(&format!(" (artifact {id})")))
+            .unwrap_or_default();
+        parts.push(format!("{kind}: {value}{id}"));
+    }
+    if let Some(summary) = field("summary") {
+        if !summary.is_empty() {
+            parts.push(summary.to_string());
+        }
+    }
+    if let Some(branch) = field("branch") {
+        parts.push(format!("branch {branch}"));
+    }
+    if let Some(agent) = field("agent_id") {
+        if event.actor_id.as_deref() != Some(agent) {
+            parts.push(format!("agent {agent}"));
+        }
+    }
+    parts.join("  ")
+}
+
+/// Short form used in confirmations: `event detail`.
+fn describe_event(event: &q_core::Event, paint: Paint) -> String {
+    format!("{} {}", event.event_type, event_detail(event, paint))
 }
 
 const TITLE_MAX_CHARS: usize = 64;
@@ -1682,7 +1836,19 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
     if !detail.artifacts.is_empty() {
         println!("\n{}", paint.bold("artifacts:"));
         for artifact in &detail.artifacts {
-            println!("- {}: {}", artifact.kind, artifact.value);
+            let stored = match artifact.content_bytes {
+                Some(bytes) => paint.dim(&format!(
+                    "  ({bytes} bytes stored, q artifact {})",
+                    artifact.id
+                )),
+                None => String::new(),
+            };
+            println!(
+                "- {} {}: {}{stored}",
+                paint.dim(&format!("#{}", artifact.id)),
+                artifact.kind,
+                artifact.value
+            );
         }
     }
     if !detail.events.is_empty() {

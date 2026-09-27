@@ -13,13 +13,13 @@ use std::time::Duration;
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
     format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, readiness_warnings,
-    Actor, Artifact, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
-    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
-    DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
-    Feature, HeartbeatRequest, ListFilter, ProjectPolicy, QueueError, QueueService, QueueStatus,
-    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus,
-    TaskSummary, TaskTree, TreeQuery, TreeTask,
+    Actor, Artifact, ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
+    Claim, ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest,
+    CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
+    EditRequest, Event, Feature, HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy,
+    QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
+    RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task,
+    TaskDetail, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -766,29 +766,57 @@ fn detail_for(conn: &Connection, id: i64) -> Result<TaskDetail, QueueError> {
     })
 }
 
+const ARTIFACT_SELECT: &str =
+    "SELECT id, task_id, kind, value, LENGTH(CAST(content AS BLOB)), created_at FROM artifacts";
+
+fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+    let content_bytes: Option<i64> = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    Ok(Artifact {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        kind: row.get(2)?,
+        value: row.get(3)?,
+        content_bytes: content_bytes.map(|bytes| bytes.max(0) as u64),
+        created_at: parse_time(5, &created_at)?,
+    })
+}
+
 fn load_artifacts(conn: &Connection, task_id: i64) -> Result<Vec<Artifact>, QueueError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, task_id, kind, value, created_at FROM artifacts WHERE task_id = ? ORDER BY id ASC",
-        )
+        .prepare(&format!(
+            "{ARTIFACT_SELECT} WHERE task_id = ? ORDER BY id ASC"
+        ))
         .db()?;
-    let rows = stmt
-        .query_map(params![task_id], |row| {
-            let created_at: String = row.get(4)?;
-            Ok(Artifact {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                kind: row.get(2)?,
-                value: row.get(3)?,
-                created_at: parse_time(4, &created_at)?,
-            })
-        })
-        .db()?;
+    let rows = stmt.query_map(params![task_id], map_artifact).db()?;
     let mut artifacts = Vec::new();
     for row in rows {
         artifacts.push(row.db()?);
     }
     Ok(artifacts)
+}
+
+fn load_artifact_content(
+    conn: &Connection,
+    artifact_id: i64,
+) -> Result<ArtifactContent, QueueError> {
+    let artifact = conn
+        .query_row(
+            &format!("{ARTIFACT_SELECT} WHERE id = ?"),
+            params![artifact_id],
+            map_artifact,
+        )
+        .optional()
+        .db()?
+        .ok_or_else(|| QueueError::InvalidInput(format!("artifact {artifact_id} not found")))?;
+    let content: Option<String> = conn
+        .query_row(
+            "SELECT content FROM artifacts WHERE id = ?",
+            params![artifact_id],
+            |row| row.get(0),
+        )
+        .db()?;
+    Ok(ArtifactContent { artifact, content })
 }
 
 fn load_events(
@@ -851,7 +879,7 @@ fn insert_artifact(
     artifact: &ArtifactInput,
     actor: &Actor,
     now: &str,
-) -> Result<(), QueueError> {
+) -> Result<i64, QueueError> {
     let kind = artifact.kind.trim();
     let value = artifact.value.trim();
     if kind.is_empty() || value.is_empty() {
@@ -869,19 +897,17 @@ fn insert_artifact(
         ));
     }
     conn.execute(
-        "INSERT INTO artifacts (task_id, kind, value, created_at) VALUES (?, ?, ?, ?)",
-        params![task_id, kind, value, now],
+        "INSERT INTO artifacts (task_id, kind, value, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        params![task_id, kind, value, artifact.content, now],
     )
     .db()?;
-    insert_event(
-        conn,
-        Some(task_id),
-        "artifact_added",
-        actor,
-        json!({"kind": kind, "value": value}),
-        now,
-    )?;
-    Ok(())
+    let artifact_id = conn.last_insert_rowid();
+    let mut payload = json!({"kind": kind, "value": value, "artifact_id": artifact_id});
+    if let Some(content) = &artifact.content {
+        payload["content_bytes"] = json!(content.len());
+    }
+    insert_event(conn, Some(task_id), "artifact_added", actor, payload, now)?;
+    Ok(artifact_id)
 }
 
 fn count_for_task(conn: &Connection, sql: &str, task_id: i64) -> Result<i64, QueueError> {
@@ -1751,10 +1777,7 @@ impl QueueService for Queue {
             insert_artifact(
                 &tx,
                 task.id,
-                &ArtifactInput {
-                    kind: "summary".into(),
-                    value: summary.clone(),
-                },
+                &ArtifactInput::reference("summary", summary.clone()),
                 &actor,
                 &now,
             )?;
@@ -1807,6 +1830,53 @@ impl QueueService for Queue {
         let recovered = recover_expired(&tx, &now, request.to, &request.actor)?;
         tx.commit().db()?;
         Ok(recovered)
+    }
+
+    fn log(&self, request: LogRequest) -> Result<TaskDetail, QueueError> {
+        let message = request
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if message.is_none() && request.artifacts.is_empty() {
+            return Err(QueueError::InvalidInput(
+                "log needs a message or at least one artifact".into(),
+            ));
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        let actor = match request.claim_token.as_deref().map(str::trim) {
+            Some(token) if !token.is_empty() => {
+                let claim = require_active_claim(&tx, task.id, token, &now)?;
+                Actor::agent(claim.agent_id)
+            }
+            _ => request.actor.clone(),
+        };
+        let mut artifact_ids = Vec::new();
+        for artifact in &request.artifacts {
+            artifact_ids.push(insert_artifact(&tx, task.id, artifact, &actor, &now)?);
+        }
+        if let Some(message) = message {
+            insert_event(
+                &tx,
+                Some(task.id),
+                q_core::NOTE_EVENT,
+                &actor,
+                json!({"message": message, "artifact_ids": artifact_ids}),
+                &now,
+            )?;
+        }
+        tx.commit().db()?;
+        self.get(request.task_id)
+    }
+
+    fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError> {
+        let conn = open_connection(&self.path)?;
+        load_artifact_content(&conn, artifact_id)
     }
 
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError> {

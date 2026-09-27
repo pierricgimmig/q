@@ -1,9 +1,9 @@
 use crate::model::{
-    BlockRequest, CancelRequest, CaptureRequest, ClaimOutcome, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
-    EditRequest, Event, Feature, HeartbeatRequest, ListFilter, QueueStatus, ReadyOutcome,
-    ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail,
-    TaskSummary, TaskTree, TreeQuery,
+    ArtifactContent, BlockRequest, CancelRequest, CaptureRequest, ClaimOutcome, ClaimRequest,
+    CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest,
+    EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter, LogRequest,
+    QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest,
+    StartRequest, Task, TaskDetail, TaskSummary, TaskTree, TreeQuery,
 };
 use crate::QueueError;
 
@@ -41,6 +41,15 @@ pub trait QueueService: Send + Sync {
     fn complete(&self, request: CompleteRequest) -> Result<TaskDetail, QueueError>;
     fn release(&self, request: ReleaseRequest) -> Result<Task, QueueError>;
     fn recover_stale(&self, request: RecoverRequest) -> Result<Vec<RecoveryRecord>, QueueError>;
+    /// Append a note and/or artifacts to a task's log. See [`LogRequest`].
+    ///
+    /// A note is a `task_note` event whose payload carries the message. Each
+    /// artifact is stored (with its content when given) and recorded as an
+    /// `artifact_added` event. Allowed in any status.
+    fn log(&self, request: LogRequest) -> Result<TaskDetail, QueueError>;
+    /// Fetch one artifact with its stored content.
+    fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError>;
+    /// Every event for a task, oldest first. This is the task's log.
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError>;
     fn status(&self) -> Result<QueueStatus, QueueError>;
     fn reopen(&self, id: i64, actor: crate::model::Actor) -> Result<Task, QueueError>;
