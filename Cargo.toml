@@ -19,7 +19,7 @@ publish = false
 
 [workspace.dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "form", "query"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 q-core = { path = "crates/q-core" }
 q-dispatch = { path = "crates/q-dispatch" }
 q-mcp = { path = "crates/q-mcp" }

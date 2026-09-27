@@ -2538,6 +2538,149 @@ fn workers_spawn_fails_outside_herdr() {
 }
 
 #[test]
+fn exec_runs_the_command_and_logs_exec_and_exit_notes() {
+    let root = temp_root("exec");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let id = add_task(db_arg, "Run the build", "alpha", None, None);
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot-3"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+    let id_arg = id.to_string();
+    // The child is this binary, so the test needs no shell.
+    let q = env!("CARGO_BIN_EXE_q");
+
+    // Explicit id and token: the child's stdout passes through, exit 0.
+    let output = run(bin().args([
+        "--db",
+        db_arg,
+        "exec",
+        &id_arg,
+        "--claim-token",
+        &token,
+        "--",
+        q,
+        "--version",
+    ]));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("q "),
+        "child stdout passes through"
+    );
+
+    // Id and token from the environment, a non-zero exit is passed on, and
+    // the child's stderr passes through. `exec` is not rewritten as `add`.
+    let output = bin()
+        .env("Q_TASK_ID", &id_arg)
+        .env("Q_CLAIM_TOKEN", &token)
+        .args([
+            "--db", db_arg, "exec", "--thread", "check", "--", q, "--db", db_arg, "show", "999999",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("999999"),
+        "child stderr passes through: {stderr}"
+    );
+    assert!(!stderr.contains("could not log"), "{stderr}");
+
+    // A program that does not exist is exit 127 and still logged.
+    let output = bin()
+        .env("Q_TASK_ID", &id_arg)
+        .env("Q_CLAIM_TOKEN", &token)
+        .args([
+            "--db",
+            db_arg,
+            "exec",
+            "--",
+            "q-no-such-program-xyz",
+            "--flag",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot run q-no-such-program-xyz"));
+
+    // A wrong token warns and runs the command anyway.
+    let output = bin()
+        .args([
+            "--db",
+            db_arg,
+            "exec",
+            &id_arg,
+            "--claim-token",
+            "nope",
+            "--",
+            q,
+            "--version",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not log"));
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("q "));
+
+    // `q log` takes the same defaults.
+    let noted = run(bin()
+        .env("Q_TASK_ID", &id_arg)
+        .env("Q_CLAIM_TOKEN", &token)
+        .args(["--db", db_arg, "log", "wrapping up"]));
+    assert!(String::from_utf8_lossy(&noted.stdout).contains("task_note wrapping up"));
+
+    let events = run(bin().args(["--db", db_arg, "--json", "events", &id_arg]));
+    let events: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let notes: Vec<(String, String)> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event_type"] == "task_note")
+        .map(|event| {
+            (
+                event["actor_id"].as_str().unwrap().to_string(),
+                event["payload"]["message"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(notes.len(), 7, "{notes:#?}");
+    assert!(
+        notes.iter().all(|(actor, _)| actor == "bot-3"),
+        "{notes:#?}"
+    );
+    assert_eq!(notes[0].1, format!("@exec {q} --version"));
+    let exit = &notes[1].1;
+    assert!(
+        exit.starts_with("@exit 0 (") && exit.ends_with(&format!(") {q} --version")),
+        "{exit}"
+    );
+    assert!(
+        notes[2].1.starts_with(&format!("[check] @exec {q} --db ")),
+        "{}",
+        notes[2].1
+    );
+    assert!(
+        notes[3].1.starts_with("[check] @exit 1 ("),
+        "{}",
+        notes[3].1
+    );
+    assert_eq!(notes[4].1, "@exec q-no-such-program-xyz --flag");
+    assert!(
+        notes[5].1.starts_with("@exit 127 (")
+            && notes[5].1.ends_with(" q-no-such-program-xyz --flag"),
+        "{}",
+        notes[5].1
+    );
+    assert_eq!(notes[6].1, "wrapping up");
+
+    // The log prints the notes as written.
+    let log = run(bin().args(["--db", db_arg, "log", &id_arg]));
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert!(log.contains("@exec q-no-such-program-xyz --flag"), "{log}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn orbit_is_a_command_and_fails_fast_without_a_service() {
     let root = temp_root("orbit");
     let db = root.join("queue.db");

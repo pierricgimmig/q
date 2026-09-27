@@ -246,6 +246,25 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             let (queue, backend) = open_service(&cli)?;
             run_orbit(queue, &backend, &url, options, &ui).await
         }
+        Commands::Exec {
+            id,
+            claim_token,
+            thread,
+            command,
+        } => {
+            let (id, claim_token, thread, command) =
+                (*id, claim_token.clone(), thread.clone(), command.clone());
+            if let Some(name) = thread.as_deref() {
+                if name.is_empty() || name.contains(char::is_whitespace) {
+                    return Err(CliError::message("--thread needs a name without spaces"));
+                }
+            }
+            let (queue, _) = open_service(&cli)?;
+            let code = run_exec(queue.as_ref(), id, claim_token, thread, &command, &ui).await?;
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            std::process::exit(code);
+        }
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
@@ -275,6 +294,146 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 &ui,
             )
         }
+    }
+}
+
+/// Exit code reported when the command could not be started.
+const EXEC_NOT_FOUND: i32 = 127;
+
+/// `q exec`: run a command with the log entries `@exec <command>` before it
+/// and `@exit <code> (<duration>) <command>` after it, so the bridge draws
+/// the process as a scope under the agent's thread. Returns the exit code to
+/// pass on. A failure to log is a warning, never a reason to skip the command.
+async fn run_exec(
+    queue: &dyn QueueService,
+    id: i64,
+    claim_token: Option<String>,
+    thread: Option<String>,
+    command: &[String],
+    ui: &Ui,
+) -> Result<i32, CliError> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(CliError::message("exec needs a command"));
+    };
+    let command_line = shell_join(command);
+    let prefix = thread
+        .as_deref()
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+    let note = |message: String| {
+        let result = queue.log(LogRequest {
+            task_id: id,
+            claim_token: claim_token.clone(),
+            message: Some(message),
+            progress: None,
+            artifacts: Vec::new(),
+            actor: human_actor(),
+        });
+        if let Err(error) = result {
+            eprintln!(
+                "{} could not log to task #{id}: {error}",
+                ui.err.warning_label()
+            );
+        }
+    };
+
+    note(format!(
+        "{prefix}{} {command_line}",
+        q_orbit::mapper::EXEC_MARKER
+    ));
+    let started = std::time::Instant::now();
+    let spawned = Command::new(program).args(args).spawn();
+    let (code, failure) = match spawned {
+        Ok(mut child) => {
+            let wait = tokio::task::spawn_blocking(move || child.wait());
+            tokio::pin!(wait);
+            let status = loop {
+                tokio::select! {
+                    joined = &mut wait => break joined.map_err(io::Error::other).and_then(|r| r),
+                    _ = tokio::signal::ctrl_c() => {
+                        // The child got the same signal; keep waiting so its
+                        // exit is logged.
+                    }
+                }
+            };
+            match status {
+                Ok(status) => (exit_code(status), None),
+                Err(error) => (1, Some(format!("waiting for {program}: {error}"))),
+            }
+        }
+        Err(error) => (
+            EXEC_NOT_FOUND,
+            Some(format!("cannot run {program}: {error}")),
+        ),
+    };
+    note(format!(
+        "{prefix}{} {code} ({}) {command_line}",
+        q_orbit::mapper::EXIT_MARKER,
+        format_elapsed(started.elapsed())
+    ));
+    if let Some(failure) = failure {
+        eprintln!("{} {failure}", ui.err.error_label());
+    }
+    Ok(code)
+}
+
+/// The process's exit code; a signal death is 128 + the signal, as in a shell.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+/// `48ms`, `1.2s`, `42.0s`, `3m07s`, `1h02m`: one token, for the `@exit` note.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 1 {
+        format!("{}ms", elapsed.as_millis())
+    } else if secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// One line for a command and its arguments, quoting what a shell would
+/// need quoted, so the note reads back as the command that ran.
+fn shell_join(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '@' | ',' | '+' | '%')
+        });
+    if plain {
+        arg.to_string()
+    } else if !arg.contains('\'') {
+        format!("'{arg}'")
+    } else {
+        format!(
+            "\"{}\"",
+            arg.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`")
+        )
     }
 }
 
@@ -1188,7 +1347,8 @@ fn dispatch(
         | Commands::Token { .. }
         | Commands::Skill { .. }
         | Commands::Workers { .. }
-        | Commands::Orbit { .. } => {
+        | Commands::Orbit { .. }
+        | Commands::Exec { .. } => {
             unreachable!("handled before queue open")
         }
     }
@@ -3210,10 +3370,10 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_line, display_project, format_list_title, heartbeat_cells, is_top_quit_key,
-        orbit_options, parse_age, render_task_rows, render_task_rows_painted,
-        render_task_rows_with_layout, render_tree, render_tree_with, screen_frame, truncate_chars,
-        TaskListRow, TITLE_MAX_CHARS,
+        capture_line, display_project, format_elapsed, format_list_title, heartbeat_cells,
+        is_top_quit_key, orbit_options, parse_age, render_task_rows, render_task_rows_painted,
+        render_task_rows_with_layout, render_tree, render_tree_with, screen_frame, shell_join,
+        truncate_chars, TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3281,6 +3441,36 @@ mod tests {
         let raw = screen_frame("a\nb\n", true);
         assert!(raw.contains("a\x1b[K\r\nb\x1b[K\r\n"), "{raw:?}");
         assert!(!raw.contains("\n\n"), "{raw:?}");
+    }
+
+    #[test]
+    fn exec_notes_quote_the_command_and_keep_the_duration_one_token() {
+        let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            shell_join(&words(&["cargo", "build", "--locked"])),
+            "cargo build --locked"
+        );
+        assert_eq!(
+            shell_join(&words(&["git", "commit", "-m", "Fix the parser", "--", ""])),
+            "git commit -m 'Fix the parser' -- ''"
+        );
+        assert_eq!(
+            shell_join(&words(&["sh", "-c", "echo it's $HOME"])),
+            "sh -c \"echo it's \\$HOME\""
+        );
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(format_elapsed(ms(48)), "48ms");
+        assert_eq!(format_elapsed(ms(1_240)), "1.2s");
+        assert_eq!(format_elapsed(ms(59_960)), "60.0s");
+        assert_eq!(format_elapsed(ms(187_000)), "3m07s");
+        assert_eq!(format_elapsed(ms(3_720_000)), "1h02m");
+        for text in [
+            format_elapsed(ms(48)),
+            format_elapsed(ms(187_000)),
+            format_elapsed(ms(3_720_000)),
+        ] {
+            assert!(!text.contains(' '), "{text}");
+        }
     }
 
     #[test]
