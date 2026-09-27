@@ -547,6 +547,7 @@ fn dispatch(
                         "lease_expires_at: {}",
                         ui.out.dim(&format_timestamp(claim.lease_expires_at))
                     );
+                    print_progress_hint(ui, task.task.id, &claim.token);
                 } else {
                     println!("no eligible ready tasks");
                 }
@@ -585,7 +586,7 @@ fn dispatch(
         } => {
             let detail = queue.start(StartRequest {
                 task_id: id,
-                claim_token,
+                claim_token: claim_token.clone(),
                 branch,
                 worktree_path: worktree,
                 actor: human_actor(),
@@ -598,6 +599,7 @@ fn dispatch(
                     detail.task.status.as_str(),
                     &detail.task.title,
                 );
+                print_progress_hint(ui, detail.task.id, &claim_token);
             });
             Ok(())
         }
@@ -1108,6 +1110,17 @@ fn for_each_task<T: serde::Serialize>(
             ids.len()
         )))
     }
+}
+
+/// Printed after a claim or start so an agent sees how to keep `PROG`
+/// current without reading the skill. The command is ready to paste.
+fn print_progress_hint(ui: &Ui, id: i64, token: &str) {
+    println!(
+        "{}",
+        ui.out.dim(&format!(
+            "report progress: q log {id} --progress <0-100> --claim-token {token}"
+        ))
+    );
 }
 
 fn confirm(ui: &Ui, verb: &str, id: i64, status: &str, title: &str) {

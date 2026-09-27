@@ -1679,3 +1679,42 @@ fn pr_artifacts_show_as_a_link_in_the_table() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn claim_and_start_print_the_progress_command() {
+    let root = temp_root("progress-hint");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let id = add_task(db_arg, "Nudge me", "alpha", None, None);
+    let claimed = run(bin().args(["--db", db_arg, "claim", "--agent", "bot"]));
+    let claimed = String::from_utf8(claimed.stdout).unwrap();
+    let token = claimed
+        .lines()
+        .find_map(|line| line.strip_prefix("token: "))
+        .expect(&claimed)
+        .to_string();
+    let hint = format!("report progress: q log {id} --progress <0-100> --claim-token {token}");
+    assert!(claimed.contains(&hint), "{claimed}");
+    let started = run(bin().args([
+        "--db",
+        db_arg,
+        "start",
+        &id.to_string(),
+        "--claim-token",
+        &token,
+    ]));
+    let started = String::from_utf8(started.stdout).unwrap();
+    assert!(started.contains(&hint), "{started}");
+    // JSON output stays a single document.
+    let json = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "heartbeat",
+        &id.to_string(),
+        "--claim-token",
+        &token,
+    ]));
+    assert!(serde_json::from_slice::<Value>(&json.stdout).is_ok());
+    let _ = fs::remove_dir_all(root);
+}
