@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anstyle::Style;
 use clap::Parser;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
     CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
@@ -164,12 +165,14 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 limit: TOP_FETCH_LIMIT,
                 include_terminal: true,
             };
+            let screen = io::stdout().is_terminal() && !once;
             let options = TopOptions {
                 interval: std::time::Duration::from_secs_f64(interval),
                 show_terminal: all || filter.status.is_some(),
                 limit: limit.max(1) as usize,
                 once,
-                screen: io::stdout().is_terminal() && !once,
+                screen,
+                keys: screen && io::stdin().is_terminal(),
             };
             let (queue, backend) = open_service(&cli)?;
             run_top(queue.as_ref(), &backend, &filter, &options, &ui).await
@@ -1189,6 +1192,9 @@ struct TopOptions {
     once: bool,
     /// Redraw in place with ANSI clears. Off when stdout is not a terminal.
     screen: bool,
+    /// Put the terminal in raw mode so typed keys are not echoed and `q`
+    /// quits. Off when stdin or stdout is not a terminal; Ctrl-C quits then.
+    keys: bool,
 }
 
 /// One line in the recent-changes list, with the time it was noticed.
@@ -1227,13 +1233,13 @@ async fn run_top(
     let mut previous: Option<std::collections::HashMap<i64, TaskSummary>> = None;
     let mut changes: std::collections::VecDeque<TopChange> = std::collections::VecDeque::new();
     let mut stdout = io::stdout();
-    if options.screen {
-        // Hide the cursor while frames redraw. The last frame stays in the
-        // terminal after Ctrl-C so the final state is still readable.
-        print!("\x1b[?25l");
-    }
-    let result = loop {
-        let frame = match top_frame(
+    // The guard restores the terminal when it drops: on quit, on error, and
+    // while unwinding from a panic. The last frame stays on screen so the
+    // final state is still readable.
+    let _terminal = TopTerminal::enter(options)?;
+    let mut keys = options.keys.then(spawn_key_reader);
+    loop {
+        let frame = top_frame(
             queue,
             backend,
             filter,
@@ -1241,31 +1247,145 @@ async fn run_top(
             ui.out,
             &mut previous,
             &mut changes,
-        ) {
-            Ok(frame) => frame,
-            Err(err) => break Err(err),
-        };
-        if options.screen {
+        )?;
+        if options.keys {
+            // Raw mode turns off output post-processing, so a bare newline
+            // no longer returns the carriage.
+            print!("\x1b[H\x1b[2J{}", raw_line_endings(&frame));
+        } else if options.screen {
             print!("\x1b[H\x1b[2J{frame}");
         } else {
             print!("{frame}");
         }
-        if let Err(err) = stdout.flush() {
-            break Err(err.into());
-        }
+        stdout.flush()?;
         if options.once {
-            break Ok(());
+            return Ok(());
         }
-        tokio::select! {
-            _ = tokio::time::sleep(options.interval) => {}
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+        // A key that is not a quit key must not postpone the next redraw, so
+        // the deadline is fixed once per frame.
+        let deadline = tokio::time::Instant::now() + options.interval;
+        let quit = loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break false,
+                _ = tokio::signal::ctrl_c() => break true,
+                key = next_key(&mut keys) => {
+                    if is_top_quit_key(&key) {
+                        break true;
+                    }
+                }
+            }
+        };
+        if quit {
+            return Ok(());
         }
-    };
-    if options.screen {
-        print!("\x1b[?25h");
-        let _ = stdout.flush();
     }
-    result
+}
+
+/// Terminal state `q top` changes for the duration of the run: the hidden
+/// cursor on a screen, and raw mode when keys are read. Dropping it puts
+/// both back, so an error or a panic never leaves the shell without echo.
+struct TopTerminal {
+    screen: bool,
+    raw: bool,
+}
+
+impl TopTerminal {
+    fn enter(options: &TopOptions) -> Result<Self, CliError> {
+        let mut terminal = Self {
+            screen: false,
+            raw: false,
+        };
+        if options.screen {
+            print!("\x1b[?25l");
+            terminal.screen = true;
+        }
+        if options.keys {
+            // Set before the mode change so a failure still drops back
+            // through disable_raw_mode, which is harmless when nothing changed.
+            terminal.raw = true;
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|err| CliError::message(format!("cannot read keys: {err}")))?;
+        }
+        Ok(terminal)
+    }
+}
+
+impl Drop for TopTerminal {
+    fn drop(&mut self) {
+        if self.raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        if self.screen {
+            print!("\x1b[?25h");
+        }
+        let _ = io::stdout().flush();
+    }
+}
+
+/// Forward key presses from the terminal to the redraw loop. Reads run on
+/// their own thread because crossterm blocks; the thread stops within one
+/// poll interval of the receiver going away.
+fn spawn_key_reader() -> tokio::sync::mpsc::UnboundedReceiver<KeyEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while !tx.is_closed() {
+            match crossterm::event::poll(std::time::Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    // Windows reports releases and repeats too; act on presses.
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        if tx.send(key).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// The next key press, or a future that never resolves when keys are not
+/// being read, so `select!` can always include it.
+async fn next_key(keys: &mut Option<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>>) -> KeyEvent {
+    match keys {
+        Some(rx) => match rx.recv().await {
+            Some(key) => key,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// `q` (either case), Esc, and Ctrl-C leave `q top`, like `top` itself.
+/// In raw mode Ctrl-C arrives as a key, not a signal.
+fn is_top_quit_key(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyCode::Char('c') | KeyCode::Char('C') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Esc => true,
+        _ => false,
+    }
+}
+
+/// Turn `\n` into `\r\n` for a raw-mode terminal without doubling a
+/// carriage return that is already there.
+fn raw_line_endings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
+    let mut previous = None;
+    for ch in text.chars() {
+        if ch == '\n' && previous != Some('\r') {
+            out.push('\r');
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
 }
 
 /// Fetch the queue, record what changed since the last frame, and render.
@@ -1310,7 +1430,11 @@ fn top_frame(
         backend.describe(paint),
         paint.dim(&format_timestamp(now)),
         paint.dim(&format!("{:.1}s", options.interval.as_secs_f64())),
-        paint.dim("Ctrl-C quits"),
+        paint.dim(if options.keys {
+            "q quits"
+        } else {
+            "Ctrl-C quits"
+        }),
     ));
     out.push_str(&format!("{}\n\n", render_top_counts(&status, paint)));
     if visible.is_empty() {
@@ -2072,11 +2196,12 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_line, display_project, format_list_title, render_task_rows,
-        render_task_rows_painted, render_tree, render_tree_with, truncate_chars, TaskListRow,
-        TITLE_MAX_CHARS,
+        capture_line, display_project, format_list_title, is_top_quit_key, raw_line_endings,
+        render_task_rows, render_task_rows_painted, render_tree, render_tree_with, truncate_chars,
+        TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use q_core::{TaskStatus, TaskTree, TreeFeature, TreeNode};
 
     #[test]
@@ -2102,6 +2227,38 @@ mod tests {
         assert!(line.ends_with('…'), "{line}");
         let title = line.trim_start_matches("captured #7 [inbox] ");
         assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn top_quits_on_q_esc_and_ctrl_c_only() {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(is_top_quit_key(&plain(KeyCode::Char('q'))));
+        assert!(is_top_quit_key(&KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(is_top_quit_key(&plain(KeyCode::Esc)));
+        assert!(is_top_quit_key(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+
+        assert!(!is_top_quit_key(&plain(KeyCode::Char('c'))));
+        assert!(!is_top_quit_key(&plain(KeyCode::Char('a'))));
+        assert!(!is_top_quit_key(&plain(KeyCode::Enter)));
+        assert!(!is_top_quit_key(&plain(KeyCode::Char(' '))));
+        assert!(
+            !is_top_quit_key(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            "Ctrl-Q is not a quit key"
+        );
+    }
+
+    #[test]
+    fn raw_line_endings_add_carriage_returns_once() {
+        assert_eq!(raw_line_endings("a\nb\n"), "a\r\nb\r\n");
+        assert_eq!(raw_line_endings("a\r\nb"), "a\r\nb");
+        assert_eq!(raw_line_endings("\n\n"), "\r\n\r\n");
+        assert_eq!(raw_line_endings("no newline"), "no newline");
     }
 
     #[test]
