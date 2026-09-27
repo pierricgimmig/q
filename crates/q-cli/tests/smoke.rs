@@ -1179,9 +1179,43 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
         .read_to_string(&mut text)
         .unwrap();
     let last = text.rsplit("q top database: ").next().unwrap();
-    assert!(last.contains("added [inbox] New arrival"), "{last}");
-    assert!(last.contains("[claimed] -> [done] Finish me"), "{last}");
-    assert!(last.contains("deleted Drop me"), "{last}");
+    let change_lines: Vec<&str> = last
+        .split("recent changes\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(change_lines.len(), 3, "{last}");
+    assert!(
+        change_lines
+            .iter()
+            .any(|line| line.contains("#3  new      -> inbox    New arrival")),
+        "{last}"
+    );
+    assert!(
+        change_lines
+            .iter()
+            .any(|line| line.contains("#1  claimed  -> done     Finish me")),
+        "{last}"
+    );
+    assert!(
+        change_lines
+            .iter()
+            .any(|line| line.contains("#2  inbox    -> deleted  Drop me")),
+        "{last}"
+    );
+    let title_columns: std::collections::HashSet<usize> = change_lines
+        .iter()
+        .map(|line| {
+            let title = ["New arrival", "Finish me", "Drop me"]
+                .into_iter()
+                .find(|title| line.contains(title))
+                .unwrap();
+            line.find(title).unwrap()
+        })
+        .collect();
+    assert_eq!(title_columns.len(), 1, "titles share a column: {last}");
     let table = last.split("recent changes").next().unwrap();
     assert!(
         !table.contains("Finish me"),
