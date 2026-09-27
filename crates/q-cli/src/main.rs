@@ -547,7 +547,7 @@ fn dispatch(
                         "lease_expires_at: {}",
                         ui.out.dim(&format_timestamp(claim.lease_expires_at))
                     );
-                    print_progress_hint(ui, task.task.id, &claim.token);
+                    print_progress_hint(ui, backend, task.task.id, Some(&claim.token));
                 } else {
                     println!("no eligible ready tasks");
                 }
@@ -586,7 +586,7 @@ fn dispatch(
         } => {
             let detail = queue.start(StartRequest {
                 task_id: id,
-                claim_token: claim_token.clone(),
+                claim_token,
                 branch,
                 worktree_path: worktree,
                 actor: human_actor(),
@@ -599,7 +599,7 @@ fn dispatch(
                     detail.task.status.as_str(),
                     &detail.task.title,
                 );
-                print_progress_hint(ui, detail.task.id, &claim_token);
+                print_progress_hint(ui, backend, detail.task.id, None);
             });
             Ok(())
         }
@@ -1113,12 +1113,23 @@ fn for_each_task<T: serde::Serialize>(
 }
 
 /// Printed after a claim or start so an agent sees how to keep `PROG`
-/// current without reading the skill. The command is ready to paste.
-fn print_progress_hint(ui: &Ui, id: i64, token: &str) {
+/// current without reading the skill. The command carries the same `--db`
+/// or `--server` the caller used, so it targets the same queue. The token
+/// is spelled out only on claim, where it is printed anyway; start refers to
+/// it so the secret is not echoed a second time.
+fn print_progress_hint(ui: &Ui, backend: &Backend, id: i64, token: Option<&str>) {
+    let scope = match backend {
+        Backend::Local(path) if *path != default_db_path() => {
+            format!("--db {} ", path.display())
+        }
+        Backend::Local(_) => String::new(),
+        Backend::Remote(url) => format!("--server {url} "),
+    };
+    let token = token.unwrap_or("<token from q claim>");
     println!(
         "{}",
         ui.out.dim(&format!(
-            "report progress: q log {id} --progress <0-100> --claim-token {token}"
+            "report progress: q {scope}log {id} --progress <0-100> --claim-token {token}"
         ))
     );
 }

@@ -1693,7 +1693,11 @@ fn claim_and_start_print_the_progress_command() {
         .find_map(|line| line.strip_prefix("token: "))
         .expect(&claimed)
         .to_string();
-    let hint = format!("report progress: q log {id} --progress <0-100> --claim-token {token}");
+    // The hint targets the same queue (--db here) and spells the token out
+    // only on claim, where the token line is printed anyway.
+    let hint = format!(
+        "report progress: q --db {db_arg} log {id} --progress <0-100> --claim-token {token}"
+    );
     assert!(claimed.contains(&hint), "{claimed}");
     let started = run(bin().args([
         "--db",
@@ -1704,17 +1708,33 @@ fn claim_and_start_print_the_progress_command() {
         &token,
     ]));
     let started = String::from_utf8(started.stdout).unwrap();
-    assert!(started.contains(&hint), "{started}");
-    // JSON output stays a single document.
-    let json = run(bin().args([
+    assert!(
+        started.contains(&format!(
+            "report progress: q --db {db_arg} log {id} --progress <0-100> --claim-token <token from q claim>"
+        )),
+        "{started}"
+    );
+    assert!(
+        !started.contains(&token),
+        "start must not echo the token: {started}"
+    );
+
+    // --json claim and start stay single JSON documents with no hint line.
+    let second = add_task(db_arg, "Nudge me too", "alpha", None, None);
+    let json_claim = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot-2"]));
+    let claim: Value = serde_json::from_slice(&json_claim.stdout).expect("claim json only");
+    assert_eq!(claim["task"]["id"], second);
+    let second_token = claim["claim"]["token"].as_str().unwrap().to_string();
+    let json_start = run(bin().args([
         "--db",
         db_arg,
         "--json",
-        "heartbeat",
-        &id.to_string(),
+        "start",
+        &second.to_string(),
         "--claim-token",
-        &token,
+        &second_token,
     ]));
-    assert!(serde_json::from_slice::<Value>(&json.stdout).is_ok());
+    let started: Value = serde_json::from_slice(&json_start.stdout).expect("start json only");
+    assert_eq!(started["status"], "in_progress");
     let _ = fs::remove_dir_all(root);
 }
