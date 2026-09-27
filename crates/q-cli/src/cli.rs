@@ -135,6 +135,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--to"
             | "--artifact"
             | "--attach"
+            | "--progress"
             | "--target"
             | "--capability"
             | "--capabilities"
@@ -517,6 +518,9 @@ pub enum Commands {
         /// Token printed by `q claim`. Attributes the entry to that agent.
         #[arg(long)]
         claim_token: Option<String>,
+        /// Percent complete, 0 to 100. Shown in the PROG column of q ls and q top.
+        #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        progress: Option<u8>,
         /// Repeatable kind=value artifact, for example --artifact pr=https://...
         #[arg(long = "artifact")]
         artifact: Vec<String>,

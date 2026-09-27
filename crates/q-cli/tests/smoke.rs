@@ -1197,7 +1197,7 @@ fn top_once_prints_counts_table_and_changes() {
     assert!(text.contains("inbox 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
     assert!(
-        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  UPDATED   TITLE"),
+        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED   TITLE"),
         "{text}"
     );
     assert!(text.contains("Watch me"), "{text}");
@@ -1252,6 +1252,17 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
     run(bin().args([
         "--db",
         db_arg,
+        "log",
+        &first.to_string(),
+        "--claim-token",
+        &token,
+        "--progress",
+        "60",
+    ]));
+    std::thread::sleep(Duration::from_millis(300));
+    run(bin().args([
+        "--db",
+        db_arg,
         "complete",
         &first.to_string(),
         "--claim-token",
@@ -1283,23 +1294,29 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
         .lines()
         .filter(|line| !line.is_empty())
         .collect();
-    assert_eq!(change_lines.len(), 3, "{last}");
+    assert_eq!(change_lines.len(), 4, "{last}");
     assert!(
         change_lines
             .iter()
-            .any(|line| line.contains("#3  new      -> inbox    New arrival")),
+            .any(|line| line.contains("#1  claimed  -> claimed 60%  Finish me")),
         "{last}"
     );
     assert!(
         change_lines
             .iter()
-            .any(|line| line.contains("#1  claimed  -> done     Finish me")),
+            .any(|line| line.contains("#3  new      -> inbox        New arrival")),
         "{last}"
     );
     assert!(
         change_lines
             .iter()
-            .any(|line| line.contains("#2  inbox    -> deleted  Drop me")),
+            .any(|line| line.contains("#1  claimed  -> done         Finish me")),
+        "{last}"
+    );
+    assert!(
+        change_lines
+            .iter()
+            .any(|line| line.contains("#2  inbox    -> deleted      Drop me")),
         "{last}"
     );
     let title_columns: std::collections::HashSet<usize> = change_lines
@@ -1384,6 +1401,34 @@ fn log_and_artifact_commands_keep_a_per_task_log() {
         .env("USER", "reviewer")
         .args(["--db", db_arg, "log", &id_arg, "looks right"]));
 
+    // Progress is a percent stored on the task and shown in the tables.
+    let progressed = run(bin().args([
+        "--db",
+        db_arg,
+        "log",
+        &id_arg,
+        "--progress",
+        "40",
+        "--claim-token",
+        &token,
+    ]));
+    assert!(String::from_utf8(progressed.stdout)
+        .unwrap()
+        .contains("task_note progress 40%"));
+    let rejected = bin()
+        .args(["--db", db_arg, "log", &id_arg, "--progress", "101"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let listed = run(bin().args(["--db", db_arg, "ls"]));
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("PRI  PROG  UPDATED"), "{listed}");
+    assert!(listed.contains("  40%  "), "{listed}");
+    let shown_progress = run(bin().args(["--db", db_arg, "show", &id_arg]));
+    assert!(String::from_utf8(shown_progress.stdout)
+        .unwrap()
+        .contains("progress: 40%"));
+
     let log = run(bin().args(["--db", db_arg, "log", &id_arg]));
     let log = String::from_utf8(log.stdout).unwrap();
     let lines: Vec<&str> = log.lines().collect();
@@ -1411,6 +1456,12 @@ fn log_and_artifact_commands_keep_a_per_task_log() {
         lines.iter().any(|line| line.contains("task_note")
             && line.contains("human:reviewer")
             && line.contains("looks right")),
+        "{log}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("task_note")
+            && line.contains("agent:bot-9")
+            && line.contains("progress 40%")),
         "{log}"
     );
     let detail_columns: std::collections::HashSet<usize> = lines

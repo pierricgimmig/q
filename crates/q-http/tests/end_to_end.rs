@@ -173,6 +173,7 @@ fn full_claim_lifecycle_over_http() {
             task_id: task.id,
             claim_token: Some(lease.token.clone()),
             message: Some("Encoder read; varint path looks slow".into()),
+            progress: Some(25),
             artifacts: vec![ArtifactInput {
                 kind: "report".into(),
                 value: "notes.md".into(),
@@ -187,6 +188,7 @@ fn full_claim_lifecycle_over_http() {
         .find(|event| event.event_type == q_core::NOTE_EVENT)
         .expect("note event");
     assert_eq!(note.actor_id.as_deref(), Some("agent-1"));
+    assert_eq!(logged.task.progress, Some(25));
     let stored = logged
         .artifacts
         .iter()
@@ -207,6 +209,7 @@ fn full_claim_lifecycle_over_http() {
         })
         .unwrap();
     assert_eq!(done.task.status, TaskStatus::Done);
+    assert_eq!(done.task.progress, Some(100), "completion is 100%");
 
     let missing = queue.get(9999).unwrap_err();
     assert!(matches!(missing, QueueError::NotFound(9999)), "{missing}");

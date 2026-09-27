@@ -508,12 +508,29 @@ fn artifact_inputs(args: &Map<String, Value>) -> Result<Vec<ArtifactInput>, Tool
 fn queue_log(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
     expect_keys(
         args,
-        &["task_id", "id", "claim_token", "message", "artifacts"],
+        &[
+            "task_id",
+            "id",
+            "claim_token",
+            "message",
+            "progress",
+            "artifacts",
+        ],
     )?;
+    let progress = match optional_u64(args, "progress")? {
+        Some(percent) if percent <= 100 => Some(percent as u8),
+        Some(_) => {
+            return Err(ToolFailure::Invalid(
+                "progress is a percent from 0 to 100".into(),
+            ))
+        }
+        None => None,
+    };
     let detail = queue.log(LogRequest {
         task_id: required_task_id(args)?,
         claim_token: optional_string(args, "claim_token")?,
         message: optional_string(args, "message")?,
+        progress,
         artifacts: artifact_inputs(args)?,
         actor: Actor::agent("mcp"),
     })?;
@@ -910,7 +927,7 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "queue_log",
-            "Append to a task's log: a timestamped note (thinking steps, progress), artifacts, or both. Pass the claim token so the entry is attributed to your agent id. An artifact with content stores that text (for example a Markdown or HTML report) in the database.",
+            "Append to a task's log: a timestamped note (thinking steps, findings), a progress percent, artifacts, or any mix. Pass the claim token so the entry is attributed to your agent id. Report progress as you pass milestones; q top shows it for in-progress tasks. An artifact with content stores that text (for example a Markdown or HTML report) in the database.",
             json!({
                 "type": "object",
                 "required": ["task_id"],
@@ -918,6 +935,7 @@ fn tool_definitions() -> Vec<Value> {
                     "task_id": {"type": "integer"},
                     "claim_token": {"type": "string"},
                     "message": {"type": "string"},
+                    "progress": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Percent complete"},
                     "artifacts": ARTIFACTS_SCHEMA
                 },
                 "additionalProperties": false
@@ -1139,13 +1157,14 @@ mod tests {
             4,
             json!({"name": "queue_log", "arguments": {
                 "task_id": id,
-                "claim_token": token,
+                "claim_token": token.clone(),
                 "message": "Thinking: start with the parser",
                 "artifacts": [{"kind": "report", "value": "notes.md", "content": "# Notes\n"}]
             }}),
         );
         assert_eq!(logged["result"]["isError"], false, "{logged}");
         let detail = tool_body(&logged);
+        assert!(detail.get("progress").is_none());
         let note = detail["events"]
             .as_array()
             .unwrap()
@@ -1164,6 +1183,22 @@ mod tests {
             json!({"name": "queue_artifact", "arguments": {"artifact_id": artifact_id}}),
         );
         assert_eq!(tool_body(&fetched)["content"], "# Notes\n");
+        let progressed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            8,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "claim_token": token, "progress": 40}}),
+        );
+        assert_eq!(tool_body(&progressed)["progress"], 40, "{progressed}");
+        let too_much = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            9,
+            json!({"name": "queue_log", "arguments": {"task_id": id, "progress": 101}}),
+        );
+        assert_eq!(too_much["error"]["code"], -32602, "{too_much}");
 
         let empty = call(
             &mut session,
@@ -1176,7 +1211,7 @@ mod tests {
         assert!(empty["error"]["data"]["error"]
             .as_str()
             .unwrap()
-            .contains("message or at least one artifact"));
+            .contains("message, a progress percent, or at least one artifact"));
 
         let unknown_key = call(
             &mut session,

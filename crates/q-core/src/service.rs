@@ -43,9 +43,10 @@ pub trait QueueService: Send + Sync {
     fn recover_stale(&self, request: RecoverRequest) -> Result<Vec<RecoveryRecord>, QueueError>;
     /// Append a note and/or artifacts to a task's log. See [`LogRequest`].
     ///
-    /// A note is a `task_note` event whose payload carries the message. Each
-    /// artifact is stored (with its content when given) and recorded as an
-    /// `artifact_added` event. Allowed in any status.
+    /// A note is a `task_note` event whose payload carries the message and
+    /// the progress percent when given; progress is also stored on the task.
+    /// Each artifact is stored (with its content when given) and recorded as
+    /// an `artifact_added` event. Allowed in any status; never changes it.
     fn log(&self, request: LogRequest) -> Result<TaskDetail, QueueError>;
     /// Fetch one artifact with its stored content.
     fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError>;

@@ -685,12 +685,13 @@ fn dispatch(
             id,
             message,
             claim_token,
+            progress,
             artifact,
             attach,
         } => {
             let artifacts = collect_artifacts(artifact, attach)?;
             let message = message.filter(|text| !text.trim().is_empty());
-            if message.is_none() && artifacts.is_empty() {
+            if message.is_none() && progress.is_none() && artifacts.is_empty() {
                 let events = queue.events(id)?;
                 emit(ui, &serde_json::json!({"events": events}), || {
                     print_events(&events, ui.out, "");
@@ -702,6 +703,7 @@ fn dispatch(
                 task_id: id,
                 claim_token,
                 message,
+                progress,
                 artifacts,
                 actor: human_actor(),
             })?;
@@ -1205,6 +1207,8 @@ struct TopChange {
     from: Option<TaskStatus>,
     /// Status after the change. `None` when the task was deleted.
     to: Option<TaskStatus>,
+    /// Progress after the change, shown next to a non-terminal status.
+    progress: Option<u8>,
     title: String,
 }
 
@@ -1216,10 +1220,16 @@ impl TopChange {
         self.from.map(TaskStatus::as_str).unwrap_or(TOP_CHANGE_NEW)
     }
 
-    fn after_label(&self) -> &str {
-        self.to
-            .map(TaskStatus::as_str)
-            .unwrap_or(TOP_CHANGE_DELETED)
+    fn after_label(&self) -> String {
+        match (self.to, self.progress) {
+            (None, _) => TOP_CHANGE_DELETED.to_string(),
+            (Some(status), Some(percent))
+                if !matches!(status, TaskStatus::Done | TaskStatus::Cancelled) =>
+            {
+                format!("{} {percent}%", status.as_str())
+            }
+            (Some(status), _) => status.as_str().to_string(),
+        }
     }
 }
 
@@ -1473,6 +1483,7 @@ fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Pa
         let id = format!("#{}", change.id);
         let from = change.before_label();
         let to = change.after_label();
+        let to = to.as_str();
         out.push_str(&format!(
             "  {}  {}{}  {}{}  {} {}{}  {}\n",
             paint.dim(&format_clock(change.at)),
@@ -1547,7 +1558,9 @@ fn top_changes(
     for task in order {
         let from = match before.get(&task.id) {
             None => None,
-            Some(old) if old.status != task.status => Some(old.status),
+            Some(old) if old.status != task.status || old.progress != task.progress => {
+                Some(old.status)
+            }
             Some(_) => continue,
         };
         changes.push(TopChange {
@@ -1555,6 +1568,7 @@ fn top_changes(
             id: task.id,
             from,
             to: Some(task.status),
+            progress: task.progress,
             title: format_list_title(&task.title),
         });
     }
@@ -1569,6 +1583,7 @@ fn top_changes(
             id: task.id,
             from: Some(task.status),
             to: None,
+            progress: None,
             title: format_list_title(&task.title),
         });
     }
@@ -1658,6 +1673,9 @@ fn event_detail(event: &q_core::Event, paint: Paint) -> String {
             paint.status(to)
         ));
     }
+    if let Some(percent) = payload.get("progress").and_then(|value| value.as_u64()) {
+        parts.push(format!("progress {percent}%"));
+    }
     if let Some(message) = field("message") {
         parts.push(message.split_whitespace().collect::<Vec<_>>().join(" "));
     }
@@ -1699,6 +1717,8 @@ struct TaskListRow {
     feature: String,
     project: String,
     priority: String,
+    /// Percent complete as `40%`, or blank.
+    progress: String,
     updated: String,
     title: String,
 }
@@ -1724,9 +1744,16 @@ fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
         feature: display_project(task.feature.as_deref()),
         project: display_project(task.project.as_deref()),
         priority: task.priority.to_string(),
+        progress: format_progress(task.progress),
         updated: style::format_relative(task.updated_at, now),
         title: format_list_title(&task.title),
     }
+}
+
+fn format_progress(progress: Option<u8>) -> String {
+    progress
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_default()
 }
 
 fn display_project(project: Option<&str>) -> String {
@@ -1758,19 +1785,20 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
 
 fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
     let headers = [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "TITLE",
     ];
-    let align_right = [true, false, false, false, true, false, false];
+    let align_right = [true, false, false, false, true, true, false, false];
     let widths = [
         column_width("ID", rows.iter().map(|row| row.id.as_str())),
         column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
         column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
         column_width("PROJECT", rows.iter().map(|row| row.project.as_str())),
         column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
+        column_width("PROG", rows.iter().map(|row| row.progress.as_str())),
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
         column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
     ];
-    let header_styles = [style::dim_style(); 7];
+    let header_styles = [style::dim_style(); 8];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
         &headers,
@@ -1786,6 +1814,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
             style::dim_style(),
             style::dim_style(),
             style::dim_style(),
+            style::status_style(&row.status),
             style::dim_style(),
             style::bold_style(),
         ];
@@ -1796,6 +1825,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
                 row.feature.as_str(),
                 row.project.as_str(),
                 row.priority.as_str(),
+                row.progress.as_str(),
                 row.updated.as_str(),
                 row.title.as_str(),
             ],
@@ -2047,6 +2077,9 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
             task.kind, task.risk, task.priority
         ),
     );
+    if let Some(percent) = task.progress {
+        meta(paint, &format!("progress: {percent}%"));
+    }
     meta(
         paint,
         &format!("project: {}", task.project.as_deref().unwrap_or("-")),
@@ -2289,6 +2322,7 @@ mod tests {
                 feature: "rollout".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "2026-09-22T20:00:00Z".into(),
                 title: "Short".into(),
             },
@@ -2298,6 +2332,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "10".into(),
+                progress: "".into(),
                 updated: "2026-09-22T19:00:00Z".into(),
                 title: format_list_title(&long),
             },
@@ -2337,6 +2372,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "3m ago".into(),
                 title: "Keep the inbox item".into(),
             },
@@ -2346,6 +2382,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "beta".into(),
                 priority: "1".into(),
+                progress: "".into(),
                 updated: "1h ago".into(),
                 title: "Compare encodings".into(),
             },
@@ -2355,6 +2392,7 @@ mod tests {
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "0".into(),
+                progress: "".into(),
                 updated: "2d ago".into(),
                 title: "Unassigned capture".into(),
             },
@@ -2368,10 +2406,10 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
- 4  inbox   (none)   alpha      0  3m ago   Keep the inbox item
- 2  ready   (none)   beta       1  1h ago   Compare encodings
- 1  inbox   (none)   (none)     0  2d ago   Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
+ 4  inbox   (none)   alpha      0        3m ago   Keep the inbox item
+ 2  ready   (none)   beta       1        1h ago   Compare encodings
+ 1  inbox   (none)   (none)     0        2d ago   Unassigned capture"
         );
     }
 
@@ -2383,6 +2421,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
             feature: "(none)".into(),
             project: "beta".into(),
             priority: "1".into(),
+            progress: "".into(),
             updated: "3m ago".into(),
             title: "Compare encodings".into(),
         }];

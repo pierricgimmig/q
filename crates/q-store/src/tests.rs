@@ -1696,6 +1696,7 @@ fn log_appends_attributed_notes_and_stored_artifacts() {
         .log(LogRequest {
             task_id: id,
             claim_token: Some("nope".into()),
+            progress: None,
             message: Some("hello".into()),
             artifacts: vec![],
             actor: actor(),
@@ -1707,6 +1708,7 @@ fn log_appends_attributed_notes_and_stored_artifacts() {
         .log(LogRequest {
             task_id: id,
             claim_token: Some(token.clone()),
+            progress: None,
             message: Some("   ".into()),
             artifacts: vec![],
             actor: actor(),
@@ -1718,6 +1720,7 @@ fn log_appends_attributed_notes_and_stored_artifacts() {
         .log(LogRequest {
             task_id: id,
             claim_token: Some(token.clone()),
+            progress: None,
             message: Some("  Reading the encoder  ".into()),
             artifacts: vec![
                 ArtifactInput::reference("pr", "https://example.com/pr/1"),
@@ -1770,6 +1773,7 @@ fn log_appends_attributed_notes_and_stored_artifacts() {
         .log(LogRequest {
             task_id: id,
             claim_token: None,
+            progress: None,
             message: Some("reviewer: looks right".into()),
             artifacts: vec![],
             actor: Actor::human(Some("pierric".into())),
@@ -1839,6 +1843,7 @@ fn migration_v3_adds_artifact_content_and_keeps_legacy_rows() {
         .log(LogRequest {
             task_id: 1,
             claim_token: None,
+            progress: None,
             message: None,
             artifacts: vec![ArtifactInput {
                 kind: "report".into(),
@@ -1901,6 +1906,7 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
         .log(LogRequest {
             task_id: id,
             claim_token: None,
+            progress: None,
             message: Some("still works".into()),
             artifacts: vec![ArtifactInput {
                 kind: "report".into(),
@@ -1918,4 +1924,65 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
         })
         .unwrap();
     assert_eq!(version, 5, "foreign version rows are left alone");
+}
+
+#[test]
+fn progress_is_reported_by_log_set_on_completion_and_cleared_on_reopen() {
+    let (queue, _path) = queue();
+    let id = capture(&queue, "measure me");
+    assert_eq!(queue.get(id).unwrap().task.progress, None);
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-p").claim.unwrap().token;
+
+    let err = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: None,
+            progress: Some(101),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, QueueError::InvalidInput(_)), "{err}");
+
+    let detail = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: None,
+            progress: Some(40),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(detail.task.progress, Some(40));
+    assert_eq!(detail.task.status, TaskStatus::Claimed);
+    let note = detail.events.last().unwrap();
+    assert_eq!(note.event_type, q_core::NOTE_EVENT);
+    assert_eq!(note.payload["progress"], 40);
+    assert_eq!(note.actor_id.as_deref(), Some("agent-p"));
+    let listed = queue
+        .list(ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == id)
+        .unwrap();
+    assert_eq!(listed.progress, Some(40));
+
+    queue
+        .complete(CompleteRequest {
+            task_id: id,
+            claim_token: Some(token),
+            summary: "done".into(),
+            target: Some(TaskStatus::Done),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(queue.get(id).unwrap().task.progress, Some(100));
+
+    let reopened = queue.reopen(id, actor()).unwrap();
+    assert_eq!(reopened.status, TaskStatus::Ready);
+    assert_eq!(reopened.progress, None);
 }
