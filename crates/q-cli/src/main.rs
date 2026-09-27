@@ -1733,6 +1733,8 @@ struct TaskListRow {
     /// Percent complete as `40%`, or blank.
     progress: String,
     updated: String,
+    /// Newest `pr` artifact value. Shown as a clickable `PR` on a terminal.
+    pr_url: Option<String>,
     title: String,
 }
 
@@ -1759,7 +1761,18 @@ fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
         priority: task.priority.to_string(),
         progress: format_progress(task.progress),
         updated: style::format_relative(task.updated_at, now),
+        pr_url: task.pr_url.clone(),
         title: format_list_title(&task.title),
+    }
+}
+
+const PR_LABEL: &str = "PR";
+
+/// What the PR column shows: `PR` on a terminal (linked), the URL when piped.
+fn pr_cell(row: &TaskListRow, paint: Paint) -> &str {
+    match &row.pr_url {
+        Some(url) => paint.link_text(PR_LABEL, url),
+        None => "",
     }
 }
 
@@ -1798,9 +1811,9 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
 
 fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
     let headers = [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "TITLE",
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TITLE",
     ];
-    let align_right = [true, false, false, false, true, true, false, false];
+    let align_right = [true, false, false, false, true, true, false, false, false];
     let widths = [
         column_width("ID", rows.iter().map(|row| row.id.as_str())),
         column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
@@ -1809,13 +1822,16 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
         column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
         column_width("PROG", rows.iter().map(|row| row.progress.as_str())),
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
+        column_width("PR", rows.iter().map(|row| pr_cell(row, paint))),
         column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
     ];
-    let header_styles = [style::dim_style(); 8];
+    let header_styles = [style::dim_style(); 9];
+    let no_links = [None; 9];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
         &headers,
         &header_styles,
+        &no_links,
         &widths,
         &align_right,
         paint,
@@ -1829,8 +1845,11 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
             style::dim_style(),
             style::status_style(&row.status),
             style::dim_style(),
+            Style::new(),
             style::bold_style(),
         ];
+        let mut links = [None; 9];
+        links[7] = row.pr_url.as_deref();
         lines.push(format_task_line(
             &[
                 row.id.as_str(),
@@ -1840,9 +1859,11 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
                 row.priority.as_str(),
                 row.progress.as_str(),
                 row.updated.as_str(),
+                pr_cell(row, paint),
                 row.title.as_str(),
             ],
             &styles,
+            &links,
             &widths,
             &align_right,
             paint,
@@ -1859,9 +1880,12 @@ fn column_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usiz
         .unwrap_or(0)
 }
 
+/// One table line. A cell with a link is wrapped as a hyperlink instead of
+/// styled; its visible text is still `cells[index]`, so padding is unchanged.
 fn format_task_line(
     cells: &[&str],
     styles: &[Style],
+    links: &[Option<&str>],
     widths: &[usize],
     align_right: &[bool],
     paint: Paint,
@@ -1873,7 +1897,10 @@ fn format_task_line(
         }
         let width = widths[index];
         let pad = width.saturating_sub(cell.chars().count());
-        let painted = paint.paint(styles[index], cell);
+        let painted = match links.get(index).copied().flatten() {
+            Some(url) => paint.link(cell, url),
+            None => paint.paint(styles[index], cell),
+        };
         if align_right[index] {
             line.push_str(&" ".repeat(pad));
             line.push_str(&painted);
@@ -1911,7 +1938,14 @@ fn print_feature_list(features: &[q_core::Feature], paint: Paint) {
     let header_styles = [style::dim_style(); 4];
     println!(
         "{}",
-        format_task_line(&headers, &header_styles, &widths, &align_right, paint)
+        format_task_line(
+            &headers,
+            &header_styles,
+            &[None; 4],
+            &widths,
+            &align_right,
+            paint
+        )
     );
     let styles = [
         style::dim_style(),
@@ -1930,6 +1964,7 @@ fn print_feature_list(features: &[q_core::Feature], paint: Paint) {
                     row.title.as_str(),
                 ],
                 &styles,
+                &[None; 4],
                 &widths,
                 &align_right,
                 paint,
@@ -2175,11 +2210,15 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
                 )),
                 None => String::new(),
             };
+            let value = if artifact.kind == "pr" || artifact.value.starts_with("http") {
+                paint.link(&artifact.value, &artifact.value)
+            } else {
+                artifact.value.clone()
+            };
             println!(
-                "- {} {}: {}{stored}",
+                "- {} {}: {value}{stored}",
                 paint.dim(&format!("#{}", artifact.id)),
                 artifact.kind,
-                artifact.value
             );
         }
     }
@@ -2337,6 +2376,7 @@ mod tests {
                 priority: "0".into(),
                 progress: "".into(),
                 updated: "2026-09-22T20:00:00Z".into(),
+                pr_url: None,
                 title: "Short".into(),
             },
             TaskListRow {
@@ -2347,6 +2387,7 @@ mod tests {
                 priority: "10".into(),
                 progress: "".into(),
                 updated: "2026-09-22T19:00:00Z".into(),
+                pr_url: None,
                 title: format_list_title(&long),
             },
         ];
@@ -2387,6 +2428,7 @@ mod tests {
                 priority: "0".into(),
                 progress: "".into(),
                 updated: "3m ago".into(),
+                pr_url: None,
                 title: "Keep the held item".into(),
             },
             TaskListRow {
@@ -2397,6 +2439,7 @@ mod tests {
                 priority: "1".into(),
                 progress: "".into(),
                 updated: "1h ago".into(),
+                pr_url: None,
                 title: "Compare encodings".into(),
             },
             TaskListRow {
@@ -2407,6 +2450,7 @@ mod tests {
                 priority: "0".into(),
                 progress: "".into(),
                 updated: "2d ago".into(),
+                pr_url: None,
                 title: "Unassigned capture".into(),
             },
         ];
@@ -2419,11 +2463,46 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
- 4  held    (none)   alpha      0        3m ago   Keep the held item
- 2  ready   (none)   beta       1        1h ago   Compare encodings
- 1  held    (none)   (none)     0        2d ago   Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
+ 4  held    (none)   alpha      0        3m ago       Keep the held item
+ 2  ready   (none)   beta       1        1h ago       Compare encodings
+ 1  held    (none)   (none)     0        2d ago       Unassigned capture"
         );
+    }
+
+    #[test]
+    fn pr_column_links_on_a_terminal_and_prints_the_url_when_plain() {
+        let mut row = TaskListRow {
+            id: "9".into(),
+            status: "done".into(),
+            feature: "(none)".into(),
+            project: "alpha".into(),
+            priority: "0".into(),
+            progress: "100%".into(),
+            updated: "1h ago".into(),
+            pr_url: Some("https://example.com/pr/9".into()),
+            title: "Shipped".into(),
+        };
+        let plain = render_task_rows(std::slice::from_ref(&row));
+        assert!(
+            plain.contains("UPDATED  PR                        TITLE"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("1h ago   https://example.com/pr/9  Shipped"),
+            "{plain}"
+        );
+        let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color());
+        assert!(
+            color.contains("\x1b]8;;https://example.com/pr/9\x1b\\"),
+            "{color:?}"
+        );
+        let visible = anstream::adapter::strip_str(&color).to_string();
+        assert!(visible.contains("UPDATED  PR  TITLE"), "{visible}");
+        assert!(visible.contains("1h ago   PR  Shipped"), "{visible}");
+        row.pr_url = None;
+        let none = render_task_rows(std::slice::from_ref(&row));
+        assert!(none.contains("1h ago       Shipped"), "{none}");
     }
 
     #[test]
@@ -2436,6 +2515,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
             priority: "1".into(),
             progress: "".into(),
             updated: "3m ago".into(),
+            pr_url: None,
             title: "Compare encodings".into(),
         }];
         let plain = render_task_rows(&rows);

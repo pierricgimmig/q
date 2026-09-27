@@ -2106,3 +2106,46 @@ fn progress_is_reported_by_log_set_on_completion_and_cleared_on_reopen() {
     assert_eq!(reopened.status, TaskStatus::Ready);
     assert_eq!(reopened.progress, None);
 }
+
+#[test]
+fn list_carries_the_newest_pr_artifact() {
+    let (queue, _path) = queue();
+    let id = capture(&queue, "ship it");
+    let other = capture(&queue, "no pr yet");
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-pr").claim.unwrap().token;
+    queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: None,
+            progress: None,
+            artifacts: vec![ArtifactInput::reference("pr", "https://example.com/pr/1")],
+            actor: actor(),
+        })
+        .unwrap();
+    queue
+        .complete(CompleteRequest {
+            task_id: id,
+            claim_token: Some(token),
+            summary: "done".into(),
+            target: Some(TaskStatus::Done),
+            artifacts: vec![ArtifactInput::reference("pr", "https://example.com/pr/2")],
+            actor: actor(),
+        })
+        .unwrap();
+    let rows = queue
+        .list(ListFilter {
+            include_terminal: true,
+            ..ListFilter::default()
+        })
+        .unwrap();
+    let shipped = rows.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(
+        shipped.pr_url.as_deref(),
+        Some("https://example.com/pr/2"),
+        "newest wins"
+    );
+    let open = rows.iter().find(|task| task.id == other).unwrap();
+    assert_eq!(open.pr_url, None);
+}

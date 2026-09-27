@@ -331,6 +331,9 @@ pub struct TaskSummary {
     /// Percent complete as last reported. See [`Task::progress`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
+    /// Value of the newest `pr` artifact, usually the pull request URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

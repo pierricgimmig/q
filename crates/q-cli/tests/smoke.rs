@@ -1212,7 +1212,7 @@ fn top_once_prints_counts_table_and_changes() {
     assert!(text.contains("held 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
     assert!(
-        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED   TITLE"),
+        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED   PR  TITLE"),
         "{text}"
     );
     assert!(text.contains("Watch me"), "{text}");
@@ -1613,6 +1613,69 @@ fn hold_keeps_work_out_of_the_pool_until_ready() {
     let reopened = run(bin().args(["--db", db_arg, "--json", "reopen", "1"]));
     let reopened: Value = serde_json::from_slice(&reopened.stdout).unwrap();
     assert_eq!(reopened["status"], "held");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn pr_artifacts_show_as_a_link_in_the_table() {
+    let root = temp_root("pr-link");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let shipped = add_task(db_arg, "Shipped work", "alpha", None, None);
+    let pending = add_task(db_arg, "Pending work", "alpha", None, None);
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let claimed_id = claim["task"]["id"].as_i64().unwrap();
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+    let url = "https://github.com/acme/q/pull/9";
+    run(bin().args([
+        "--db",
+        db_arg,
+        "complete",
+        &claimed_id.to_string(),
+        "--claim-token",
+        &token,
+        "--summary",
+        "shipped",
+        "--artifact",
+        &format!("pr={url}"),
+    ]));
+    let other = if claimed_id == shipped {
+        pending
+    } else {
+        shipped
+    };
+
+    let json = run(bin().args(["--db", db_arg, "--json", "ls", "--all"]));
+    let listed: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let tasks = listed["tasks"].as_array().unwrap();
+    let done = tasks.iter().find(|t| t["id"] == claimed_id).unwrap();
+    assert_eq!(done["pr_url"], url);
+    let open = tasks.iter().find(|t| t["id"] == other).unwrap();
+    assert!(open.get("pr_url").is_none());
+
+    // Piped output keeps the address; a terminal gets a clickable PR label.
+    let plain = run(bin().args(["--db", db_arg, "ls", "--all"]));
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("UPDATED   PR"), "{plain}");
+    assert!(plain.contains(url), "{plain}");
+    let color = run(bin().args(["--db", db_arg, "--color", "always", "ls", "--all"]));
+    let color = String::from_utf8(color.stdout).unwrap();
+    assert!(color.contains(&format!("\x1b]8;;{url}\x1b\\")), "{color:?}");
+    let top = run(bin().args(["--db", db_arg, "--color", "always", "top", "--once", "-a"]));
+    let top = String::from_utf8(top.stdout).unwrap();
+    assert!(top.contains(&format!("\x1b]8;;{url}")), "{top:?}");
+    let shown = run(bin().args([
+        "--db",
+        db_arg,
+        "--color",
+        "always",
+        "show",
+        &claimed_id.to_string(),
+    ]));
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains(&format!("\x1b]8;;{url}")), "{shown:?}");
 
     let _ = fs::remove_dir_all(root);
 }

@@ -1169,7 +1169,9 @@ impl QueueService for Queue {
                 "SELECT tasks.id, tasks.public_id, tasks.title, tasks.status, tasks.kind, \
                  tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.agent_pool, \
                  tasks.created_at, tasks.updated_at, tasks.feature_id, features.title, \
-                 tasks.progress \
+                 tasks.progress, \
+                 (SELECT value FROM artifacts WHERE artifacts.task_id = tasks.id \
+                    AND artifacts.kind = 'pr' ORDER BY artifacts.id DESC LIMIT 1) \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
                  WHERE ((?1 IS NOT NULL AND tasks.status = ?1) \
@@ -1227,6 +1229,7 @@ impl QueueService for Queue {
                         priority: row.get(5)?,
                         risk: parse_risk(6, &risk)?,
                         progress: progress_from(row.get::<_, Option<i64>>(14)?),
+                        pr_url: row.get(15)?,
                         project: row.get(7)?,
                         repo: row.get(8)?,
                         agent_pool: row.get(9)?,
