@@ -1,6 +1,7 @@
 mod cli;
 mod skill;
 mod style;
+mod term;
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -136,8 +137,11 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             all,
             feature,
             once,
+            rows,
+            cols,
         } => {
             let (interval, limit, all, once) = (*interval, *limit, *all, *once);
+            let (rows, cols) = (*rows, *cols);
             let (status, kind, feature) = (status.clone(), kind.clone(), feature.clone());
             if ui.json {
                 return Err(CliError::message(
@@ -170,6 +174,8 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 limit: limit.max(1) as usize,
                 once,
                 screen: io::stdout().is_terminal() && !once,
+                rows,
+                cols,
             };
             let (queue, backend) = open_service(&cli)?;
             run_top(queue.as_ref(), &backend, &filter, &options, &ui).await
@@ -1089,6 +1095,87 @@ struct TopOptions {
     once: bool,
     /// Redraw in place with ANSI clears. Off when stdout is not a terminal.
     screen: bool,
+    /// Explicit frame height. Otherwise the terminal height, if any.
+    rows: Option<usize>,
+    /// Explicit line width. Otherwise the terminal width, if any.
+    cols: Option<usize>,
+}
+
+impl TopOptions {
+    /// Size to fit the frame to. Explicit flags win; then the terminal;
+    /// `None` on either axis means do not fit that axis.
+    fn fit(&self) -> (Option<usize>, Option<usize>) {
+        let measured = if self.rows.is_none() || self.cols.is_none() {
+            term::size()
+        } else {
+            None
+        };
+        (
+            self.cols.or(measured.map(|(cols, _)| cols)),
+            self.rows.or(measured.map(|(_, rows)| rows)),
+        )
+    }
+}
+
+/// Visible width of a line: escape codes do not count.
+fn visible_width(line: &str) -> usize {
+    anstream::adapter::strip_str(line)
+        .to_string()
+        .chars()
+        .count()
+}
+
+/// Terminal rows a line occupies once wrapped at `cols`.
+fn wrapped_rows(line: &str, cols: Option<usize>) -> usize {
+    match cols {
+        Some(cols) if cols > 0 => visible_width(line).max(1).div_ceil(cols),
+        _ => 1,
+    }
+}
+
+/// How many table rows and change rows fit. The table has priority: it
+/// takes what it needs up to `-n`, and the changes list gets what is left.
+/// The changes section is dropped entirely when fewer than one line of it
+/// would fit.
+struct TopLayout {
+    table_rows: usize,
+    /// Tasks not shown because the frame is full. Rendered as one more line.
+    hidden_tasks: usize,
+    /// `None` hides the section, `Some(n)` shows up to `n` change lines.
+    change_rows: Option<usize>,
+}
+
+fn top_layout(rows: Option<usize>, head_rows: usize, tasks: usize, changes: usize) -> TopLayout {
+    let Some(rows) = rows else {
+        return TopLayout {
+            table_rows: tasks,
+            hidden_tasks: 0,
+            change_rows: Some(changes.max(1)),
+        };
+    };
+    // The cursor sits on the row after the last line, so keep one row free.
+    // Fixed lines: the head, a blank line, and the table header.
+    let budget = rows.saturating_sub(1 + head_rows + 1 + 1);
+    let (table_rows, hidden_tasks) = if tasks <= budget {
+        (tasks, 0)
+    } else {
+        // Reserve a line for "N more".
+        let shown = budget.saturating_sub(1);
+        (shown, tasks - shown)
+    };
+    let used = table_rows + usize::from(hidden_tasks > 0);
+    let left = budget.saturating_sub(used);
+    // The section needs a blank line, its title, and at least one line.
+    let change_rows = if left >= 3 {
+        Some((left - 2).min(changes.max(1)))
+    } else {
+        None
+    };
+    TopLayout {
+        table_rows,
+        hidden_tasks,
+        change_rows,
+    }
 }
 
 /// One line in the recent-changes list, with the time it was noticed.
@@ -1203,32 +1290,90 @@ fn top_frame(
         .cloned()
         .collect();
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{} {}  {}  every {}  {}\n",
+    let (cols, rows) = options.fit();
+    let header = format!(
+        "{} {}  {}  every {}  {}",
         paint.bold("q top"),
         backend.describe(paint),
         paint.dim(&format_timestamp(now)),
         paint.dim(&format!("{:.1}s", options.interval.as_secs_f64())),
         paint.dim("Ctrl-C quits"),
-    ));
-    out.push_str(&format!("{}\n\n", render_top_counts(&status, paint)));
+    );
+    let counts = render_top_counts(&status, paint, cols);
+    let head_rows = wrapped_rows(&header, cols)
+        + counts
+            .lines()
+            .map(|line| wrapped_rows(line, cols))
+            .sum::<usize>();
+    let layout = top_layout(rows, head_rows, visible.len(), changes.len());
+
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&counts);
+    out.push_str("\n\n");
     if visible.is_empty() {
         out.push_str("no tasks\n");
     } else {
-        out.push_str(&render_task_table(&visible, paint));
+        out.push_str(&render_task_table_fitted(
+            &visible[..layout.table_rows],
+            paint,
+            cols,
+        ));
         out.push('\n');
+        if layout.hidden_tasks > 0 {
+            out.push_str(&paint.dim(&format!(
+                "{} more; pass -n or a taller terminal",
+                layout.hidden_tasks
+            )));
+            out.push('\n');
+        }
     }
-    out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
-    if changes.is_empty() {
-        out.push_str(&format!("  {}\n", paint.dim("none yet")));
+    if let Some(change_rows) = layout.change_rows {
+        out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
+        if changes.is_empty() {
+            out.push_str(&format!("  {}\n", paint.dim("none yet")));
+        }
+        out.push_str(&render_top_changes(changes, change_rows, paint, cols));
     }
-    out.push_str(&render_top_changes(changes, paint));
     Ok(out)
 }
 
-/// Newest first, in aligned columns: time, id, from, to, title.
-fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Paint) -> String {
+/// Fewest columns a title may be cut to before the row is left to wrap.
+const MIN_TITLE_COLS: usize = 12;
+
+/// The `q ls` table, with titles cut so each row fits in `cols`.
+fn render_task_table_fitted(tasks: &[TaskSummary], paint: Paint, cols: Option<usize>) -> String {
+    let now = OffsetDateTime::now_utc();
+    let mut rows: Vec<TaskListRow> = tasks.iter().map(|task| task_list_row(task, now)).collect();
+    if let Some(cols) = cols {
+        let fixed = [
+            column_width("ID", rows.iter().map(|row| row.id.as_str())),
+            column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
+            column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
+            column_width("PROJECT", rows.iter().map(|row| row.project.as_str())),
+            column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
+            column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
+        ]
+        .iter()
+        .sum::<usize>()
+            + 2 * 6;
+        let title_cols = cols.saturating_sub(fixed).max(MIN_TITLE_COLS);
+        for row in &mut rows {
+            row.title = truncate_chars(&row.title, title_cols);
+        }
+    }
+    render_task_rows_painted(&rows, paint)
+}
+
+/// Newest first, in aligned columns: time, id, from, to, title. At most
+/// `max_rows` lines; titles are cut so each line fits in `cols`.
+fn render_top_changes(
+    changes: &std::collections::VecDeque<TopChange>,
+    max_rows: usize,
+    paint: Paint,
+    cols: Option<usize>,
+) -> String {
     let id_width = changes
         .iter()
         .map(|change| change.id.to_string().len() + 1)
@@ -1244,11 +1389,18 @@ fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Pa
         .map(|change| change.after_label().len())
         .max()
         .unwrap_or(0);
+    // "  HH:MM:SS  #id  from  -> to  " before the title.
+    let prefix = 2 + 8 + 2 + id_width + 2 + from_width + 2 + 2 + 1 + to_width + 2;
+    let title_cols = cols.map(|cols| cols.saturating_sub(prefix).max(MIN_TITLE_COLS));
     let mut out = String::new();
-    for change in changes.iter().rev() {
+    for change in changes.iter().rev().take(max_rows) {
         let id = format!("#{}", change.id);
         let from = change.before_label();
         let to = change.after_label();
+        let title = match title_cols {
+            Some(width) => truncate_chars(&change.title, width),
+            None => change.title.clone(),
+        };
         out.push_str(&format!(
             "  {}  {}{}  {}{}  {} {}{}  {}\n",
             paint.dim(&format_clock(change.at)),
@@ -1259,7 +1411,7 @@ fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Pa
             paint.dim("->"),
             paint_top_status(to, paint),
             " ".repeat(to_width - to.len()),
-            paint.bold(&change.title),
+            paint.bold(&title),
         ));
     }
     out
@@ -1275,7 +1427,9 @@ fn paint_top_status(label: &str, paint: Paint) -> String {
     }
 }
 
-fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
+/// Status counts and claim health on one line, or on two when `cols` is
+/// too narrow for one.
+fn render_top_counts(status: &q_core::QueueStatus, paint: Paint, cols: Option<usize>) -> String {
     let counts = &status.counts;
     let mut parts = Vec::new();
     for (label, count) in [
@@ -1302,13 +1456,13 @@ fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
     } else {
         format!("{} expired", status.expired_claims)
     };
-    format!(
-        "{}  {}  claims {} active, {}",
-        parts.join("  "),
-        paint.dim("|"),
-        status.active_claims,
-        expired
-    )
+    let statuses = parts.join("  ");
+    let claims = format!("claims {} active, {}", status.active_claims, expired);
+    let one_line = format!("{statuses}  {}  {claims}", paint.dim("|"));
+    match cols {
+        Some(cols) if visible_width(&one_line) > cols => format!("{statuses}\n{claims}"),
+        _ => one_line,
+    }
 }
 
 /// Describe additions, status moves, and deletions between two fetches.
@@ -1971,6 +2125,43 @@ impl From<std::io::Error> for CliError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn top_layout_gives_the_table_priority() {
+        use super::top_layout;
+        // No height known: everything shows.
+        let free = top_layout(None, 2, 40, 10);
+        assert_eq!((free.table_rows, free.hidden_tasks), (40, 0));
+        assert_eq!(free.change_rows, Some(10));
+
+        // 24 rows, 2 head rows: budget is 24 - 1 - 2 - 1 - 1 = 19.
+        let roomy = top_layout(Some(24), 2, 5, 10);
+        assert_eq!((roomy.table_rows, roomy.hidden_tasks), (5, 0));
+        assert_eq!(roomy.change_rows, Some(10));
+
+        let tight = top_layout(Some(24), 2, 15, 10);
+        assert_eq!((tight.table_rows, tight.hidden_tasks), (15, 0));
+        assert_eq!(
+            tight.change_rows,
+            Some(2),
+            "19 - 15 = 4 left, minus blank and title"
+        );
+
+        let full = top_layout(Some(24), 2, 30, 10);
+        assert_eq!(
+            (full.table_rows, full.hidden_tasks),
+            (18, 12),
+            "one line for the count"
+        );
+        assert_eq!(full.change_rows, None);
+
+        let empty_changes = top_layout(Some(24), 2, 5, 0);
+        assert_eq!(empty_changes.change_rows, Some(1), "room for 'none yet'");
+
+        let tiny = top_layout(Some(4), 2, 5, 3);
+        assert_eq!((tiny.table_rows, tiny.hidden_tasks), (0, 5));
+        assert_eq!(tiny.change_rows, None);
+    }
+
     use super::{
         display_project, format_list_title, render_task_rows, render_task_rows_painted,
         render_tree, render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
