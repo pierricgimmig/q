@@ -991,3 +991,199 @@ fn color_flags_leave_json_and_piped_auto_plain() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn add_edit_opens_editor_on_template_or_seed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_root("editor");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let seen = root.join("seen.md");
+    let editor = root.join("editor.sh");
+    fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\ncp \"$1\" '{}'\nprintf '\\n## Notes\\n\\n- from editor\\n' >> \"$1\"\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor_arg = editor.to_str().unwrap();
+
+    // Bare title plus -e goes through the add shorthand and seeds the template.
+    let added = run(bin().env("VISUAL", editor_arg).env_remove("EDITOR").args([
+        "--db",
+        db_arg,
+        "--json",
+        "-e",
+        "Write the parser",
+    ]));
+    let task: Value = serde_json::from_slice(&added.stdout).unwrap();
+    let body = task["body"].as_str().unwrap();
+    assert!(body.starts_with("## Goal\n"), "template seed, got {body:?}");
+    assert!(body.contains("## Acceptance criteria\n"));
+    assert!(
+        body.ends_with("## Notes\n\n- from editor"),
+        "stored bodies are trimmed"
+    );
+    let opened = fs::read_to_string(&seen).unwrap();
+    assert_eq!(opened, q_core::body_template());
+
+    // --body seeds the editor instead of the template.
+    let seeded = run(bin().env("EDITOR", editor_arg).args([
+        "--db",
+        db_arg,
+        "--json",
+        "add",
+        "--edit",
+        "--body",
+        "## Goal\n\nShip it\n",
+        "Seeded capture",
+    ]));
+    let task: Value = serde_json::from_slice(&seeded.stdout).unwrap();
+    assert_eq!(
+        task["body"],
+        "## Goal\n\nShip it\n\n## Notes\n\n- from editor"
+    );
+    let id = task["id"].as_i64().unwrap();
+
+    // q edit -e opens the current body even when other flags are set.
+    let edited = run(bin().env("EDITOR", editor_arg).args([
+        "--db",
+        db_arg,
+        "--json",
+        "edit",
+        &id.to_string(),
+        "--priority",
+        "3",
+        "-e",
+    ]));
+    let task: Value = serde_json::from_slice(&edited.stdout).unwrap();
+    assert_eq!(task["priority"], 3);
+    assert_eq!(
+        task["body"],
+        "## Goal\n\nShip it\n\n## Notes\n\n- from editor\n## Notes\n\n- from editor"
+    );
+
+    // Without an editor, --edit is an error rather than a silent capture.
+    let output = bin()
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .args(["--db", db_arg, "-e", "No editor"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("$VISUAL or $EDITOR"), "{stderr}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn top_once_prints_counts_table_and_changes() {
+    let root = temp_root("top");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let first = add_task(db_arg, "Watch me", "alpha", None, None);
+    run(bin().args(["--db", db_arg, "ready", &first.to_string()]));
+
+    let frame = run(bin().args(["--db", db_arg, "top", "--once"]));
+    let text = String::from_utf8(frame.stdout).unwrap();
+    assert!(text.starts_with("q top database: "), "{text}");
+    assert!(text.contains("every 2.0s"), "{text}");
+    assert!(text.contains("inbox 0  ready 1  claimed 0"), "{text}");
+    assert!(text.contains("claims 0 active, 0 expired"), "{text}");
+    assert!(
+        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  UPDATED   TITLE"),
+        "{text}"
+    );
+    assert!(text.contains("Watch me"), "{text}");
+    assert!(text.contains("recent changes\n  none yet"), "{text}");
+    assert!(
+        !text.contains("\x1b["),
+        "no escapes without a terminal: {text:?}"
+    );
+
+    let json = bin()
+        .args(["--db", db_arg, "--json", "top", "--once"])
+        .output()
+        .unwrap();
+    assert!(!json.status.success());
+    assert!(String::from_utf8_lossy(&json.stderr).contains("q ls --json"));
+
+    let fast = bin()
+        .args(["--db", db_arg, "top", "--once", "-i", "0"])
+        .output()
+        .unwrap();
+    assert!(!fast.status.success());
+    assert!(String::from_utf8_lossy(&fast.stderr).contains("--interval"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
+    use std::io::Read;
+    use std::time::Duration;
+
+    let root = temp_root("top-loop");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let first = add_task(db_arg, "Finish me", "alpha", None, None);
+    let second = add_task(db_arg, "Drop me", "alpha", None, None);
+    run(bin().args(["--db", db_arg, "ready", &first.to_string()]));
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+
+    let mut top = bin()
+        .args(["--db", db_arg, "top", "-i", "0.1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+
+    add_task(db_arg, "New arrival", "alpha", None, None);
+    run(bin().args([
+        "--db",
+        db_arg,
+        "complete",
+        &first.to_string(),
+        "--claim-token",
+        &token,
+        "--summary",
+        "done",
+    ]));
+    run(bin().args(["--db", db_arg, "delete", &second.to_string()]));
+    std::thread::sleep(Duration::from_millis(400));
+
+    let status = Command::new("kill")
+        .args(["-INT", &top.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let exit = top.wait().unwrap();
+    assert!(exit.success(), "top should exit 0 on Ctrl-C: {exit:?}");
+    let mut text = String::new();
+    top.stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    let last = text.rsplit("q top database: ").next().unwrap();
+    assert!(last.contains("added [inbox] New arrival"), "{last}");
+    assert!(last.contains("[claimed] -> [done] Finish me"), "{last}");
+    assert!(last.contains("deleted Drop me"), "{last}");
+    let table = last.split("recent changes").next().unwrap();
+    assert!(
+        !table.contains("Finish me"),
+        "done task leaves the table: {last}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

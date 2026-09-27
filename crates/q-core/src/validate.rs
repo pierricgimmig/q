@@ -8,6 +8,17 @@ const RECOMMENDED: &[(&str, &str)] = &[
     ("Dependencies", "dependenc"),
 ];
 
+/// A Markdown skeleton with one empty heading per recommended section.
+pub fn body_template() -> String {
+    let mut out = String::new();
+    for (label, _) in RECOMMENDED {
+        out.push_str("## ");
+        out.push_str(label);
+        out.push_str("\n\n");
+    }
+    out
+}
+
 pub fn missing_recommended_sections(body: Option<&str>) -> Vec<String> {
     let headings = headings(body.unwrap_or(""));
     RECOMMENDED

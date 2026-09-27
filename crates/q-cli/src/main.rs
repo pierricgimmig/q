@@ -128,6 +128,52 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             q_mcp::serve(queue, base_dir(directory.as_deref())?).await?;
             Ok(())
         }
+        Commands::Top {
+            interval,
+            status,
+            kind,
+            limit,
+            all,
+            feature,
+            once,
+        } => {
+            let (interval, limit, all, once) = (*interval, *limit, *all, *once);
+            let (status, kind, feature) = (status.clone(), kind.clone(), feature.clone());
+            if ui.json {
+                return Err(CliError::message(
+                    "q top is interactive; use q ls --json or q status --json",
+                ));
+            }
+            if !interval.is_finite() || interval < 0.1 {
+                return Err(CliError::message("--interval must be at least 0.1 seconds"));
+            }
+            let status = match status {
+                Some(status) => Some(TaskStatus::parse(&status)?),
+                None => None,
+            };
+            let kind = match kind {
+                Some(kind) => Some(TaskKind::parse(&kind)?),
+                None => None,
+            };
+            let filter = ListFilter {
+                status,
+                project: project.clone(),
+                repo: repo.clone(),
+                kind,
+                feature,
+                limit: TOP_FETCH_LIMIT,
+                include_terminal: true,
+            };
+            let options = TopOptions {
+                interval: std::time::Duration::from_secs_f64(interval),
+                show_terminal: all || filter.status.is_some(),
+                limit: limit.max(1) as usize,
+                once,
+                screen: io::stdout().is_terminal() && !once,
+            };
+            let (queue, backend) = open_service(&cli)?;
+            run_top(queue.as_ref(), &backend, &filter, &options, &ui).await
+        }
         Commands::Serve { bind, auth } => serve(&cli, bind, auth.as_deref()).await,
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
@@ -213,13 +259,18 @@ fn dispatch(
             risk,
             body,
             body_file,
+            edit,
             capability,
             agent_pool,
             depends_on,
             feature,
         } => {
             let context = resolve_context(directory, repo, project)?;
-            let body = read_body(body, body_file.as_deref())?;
+            let mut body = read_body(body, body_file.as_deref())?;
+            if edit {
+                let seed = body.clone().unwrap_or_else(q_core::body_template);
+                body = require_editor(edit_in_editor(&seed)?)?;
+            }
             let kind = match kind {
                 Some(kind) => TaskKind::parse(&kind)?,
                 None => context.default_kind.unwrap_or(TaskKind::Implementation),
@@ -303,6 +354,7 @@ fn dispatch(
             title,
             body,
             body_file,
+            edit,
             kind,
             priority,
             risk,
@@ -341,7 +393,13 @@ fn dispatch(
             request.clear_agent_pool = clear_agent_pool;
             request.feature = feature;
             request.clear_feature = clear_feature;
-            if !request.has_changes() {
+            if edit {
+                let seed = match request.body.take() {
+                    Some(body) => body,
+                    None => queue.get(id)?.task.body.unwrap_or_default(),
+                };
+                request.body = Some(require_editor(edit_in_editor(&seed)?)?.unwrap_or_default());
+            } else if !request.has_changes() {
                 let current = queue.get(id)?;
                 let edited = edit_in_editor(current.task.body.as_deref().unwrap_or(""))?;
                 match edited {
@@ -618,6 +676,7 @@ fn dispatch(
         Commands::Feature { command } => dispatch_feature(queue, command, ui),
         Commands::Project { .. }
         | Commands::Mcp
+        | Commands::Top { .. }
         | Commands::Serve { .. }
         | Commands::Skill { .. } => {
             unreachable!("handled before queue open")
@@ -821,6 +880,18 @@ fn parse_artifact(value: &str) -> Result<ArtifactInput, CliError> {
     })
 }
 
+/// Turn the editor result into a body. `None` means no editor is configured;
+/// a blank result means no body.
+fn require_editor(edited: Option<String>) -> Result<Option<String>, CliError> {
+    match edited {
+        Some(body) if body.trim().is_empty() => Ok(None),
+        Some(body) => Ok(Some(body)),
+        None => Err(CliError::message(
+            "--edit needs $VISUAL or $EDITOR to be set",
+        )),
+    }
+}
+
 fn edit_in_editor(current: &str) -> Result<Option<String>, CliError> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -919,6 +990,223 @@ fn source_name(source: q_project::ContextSource) -> &'static str {
         q_project::ContextSource::GlobalMapping => "global_mapping",
         q_project::ContextSource::Unassigned => "unassigned",
     }
+}
+
+/// Store maximum. `q top` fetches this many so completions and deletions
+/// beyond the visible rows still show up as changes.
+const TOP_FETCH_LIMIT: u32 = 500;
+const TOP_CHANGE_ROWS: usize = 10;
+
+struct TopOptions {
+    interval: std::time::Duration,
+    show_terminal: bool,
+    limit: usize,
+    once: bool,
+    /// Redraw in place with ANSI clears. Off when stdout is not a terminal.
+    screen: bool,
+}
+
+/// One line in the recent-changes list, with the time it was noticed.
+struct TopChange {
+    at: OffsetDateTime,
+    text: String,
+}
+
+async fn run_top(
+    queue: &dyn QueueService,
+    backend: &Backend,
+    filter: &ListFilter,
+    options: &TopOptions,
+    ui: &Ui,
+) -> Result<(), CliError> {
+    let mut previous: Option<std::collections::HashMap<i64, TaskSummary>> = None;
+    let mut changes: std::collections::VecDeque<TopChange> = std::collections::VecDeque::new();
+    let mut stdout = io::stdout();
+    if options.screen {
+        // Hide the cursor while frames redraw. The last frame stays in the
+        // terminal after Ctrl-C so the final state is still readable.
+        print!("\x1b[?25l");
+    }
+    let result = loop {
+        let frame = match top_frame(
+            queue,
+            backend,
+            filter,
+            options,
+            ui.out,
+            &mut previous,
+            &mut changes,
+        ) {
+            Ok(frame) => frame,
+            Err(err) => break Err(err),
+        };
+        if options.screen {
+            print!("\x1b[H\x1b[2J{frame}");
+        } else {
+            print!("{frame}");
+        }
+        if let Err(err) = stdout.flush() {
+            break Err(err.into());
+        }
+        if options.once {
+            break Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(options.interval) => {}
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+        }
+    };
+    if options.screen {
+        print!("\x1b[?25h");
+        let _ = stdout.flush();
+    }
+    result
+}
+
+/// Fetch the queue, record what changed since the last frame, and render.
+fn top_frame(
+    queue: &dyn QueueService,
+    backend: &Backend,
+    filter: &ListFilter,
+    options: &TopOptions,
+    paint: Paint,
+    previous: &mut Option<std::collections::HashMap<i64, TaskSummary>>,
+    changes: &mut std::collections::VecDeque<TopChange>,
+) -> Result<String, CliError> {
+    let status = queue.status()?;
+    let tasks = queue.list(filter.clone())?;
+    let now = OffsetDateTime::now_utc();
+    let current: std::collections::HashMap<i64, TaskSummary> =
+        tasks.iter().map(|task| (task.id, task.clone())).collect();
+    if let Some(before) = previous.as_ref() {
+        for text in top_changes(before, &current, &tasks, paint) {
+            changes.push_back(TopChange { at: now, text });
+        }
+        while changes.len() > TOP_CHANGE_ROWS {
+            changes.pop_front();
+        }
+    }
+    *previous = Some(current);
+
+    let visible: Vec<TaskSummary> = tasks
+        .iter()
+        .filter(|task| {
+            options.show_terminal
+                || !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
+        })
+        .take(options.limit)
+        .cloned()
+        .collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} {}  {}  every {}  {}\n",
+        paint.bold("q top"),
+        backend.describe(paint),
+        paint.dim(&format_timestamp(now)),
+        paint.dim(&format!("{:.1}s", options.interval.as_secs_f64())),
+        paint.dim("Ctrl-C quits"),
+    ));
+    out.push_str(&format!("{}\n\n", render_top_counts(&status, paint)));
+    if visible.is_empty() {
+        out.push_str("no tasks\n");
+    } else {
+        out.push_str(&render_task_table(&visible, paint));
+        out.push('\n');
+    }
+    out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
+    if changes.is_empty() {
+        out.push_str(&format!("  {}\n", paint.dim("none yet")));
+    }
+    for change in changes.iter().rev() {
+        out.push_str(&format!(
+            "  {}  {}\n",
+            paint.dim(&format_clock(change.at)),
+            change.text
+        ));
+    }
+    Ok(out)
+}
+
+fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
+    let counts = &status.counts;
+    let mut parts = Vec::new();
+    for (label, count) in [
+        ("inbox", counts.inbox),
+        ("ready", counts.ready),
+        ("claimed", counts.claimed),
+        ("in_progress", counts.in_progress),
+        ("review", counts.review),
+        ("blocked", counts.blocked),
+        ("done", counts.done),
+        ("cancelled", counts.cancelled),
+    ] {
+        parts.push(format!(
+            "{} {}",
+            paint.status(label),
+            paint.bold(&count.to_string())
+        ));
+    }
+    let expired = if status.expired_claims > 0 {
+        paint.paint(
+            Style::new().fg_color(Some(anstyle::AnsiColor::Red.into())),
+            &format!("{} expired", status.expired_claims),
+        )
+    } else {
+        format!("{} expired", status.expired_claims)
+    };
+    format!(
+        "{}  {}  claims {} active, {}",
+        parts.join("  "),
+        paint.dim("|"),
+        status.active_claims,
+        expired
+    )
+}
+
+/// Describe additions, status moves, and deletions between two fetches.
+/// Ordered by the current list first, then deletions.
+fn top_changes(
+    before: &std::collections::HashMap<i64, TaskSummary>,
+    after: &std::collections::HashMap<i64, TaskSummary>,
+    order: &[TaskSummary],
+    paint: Paint,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for task in order {
+        let id = paint.dim(&format!("#{}", task.id));
+        let title = paint.bold(&format_list_title(&task.title));
+        match before.get(&task.id) {
+            None => lines.push(format!(
+                "{id} added [{}] {title}",
+                paint.status(task.status.as_str())
+            )),
+            Some(old) if old.status != task.status => lines.push(format!(
+                "{id} [{}] -> [{}] {title}",
+                paint.status(old.status.as_str()),
+                paint.status(task.status.as_str())
+            )),
+            Some(_) => {}
+        }
+    }
+    let mut gone: Vec<&TaskSummary> = before
+        .values()
+        .filter(|task| !after.contains_key(&task.id))
+        .collect();
+    gone.sort_by_key(|task| task.id);
+    for task in gone {
+        lines.push(format!(
+            "{} deleted {}",
+            paint.dim(&format!("#{}", task.id)),
+            paint.bold(&format_list_title(&task.title))
+        ));
+    }
+    lines
+}
+
+fn format_clock(at: OffsetDateTime) -> String {
+    let (h, m, s) = at.to_hms();
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {

@@ -47,6 +47,7 @@ fn is_command(word: &str) -> bool {
         "add"
             | "ls"
             | "list"
+            | "top"
             | "show"
             | "tree"
             | "edit"
@@ -81,6 +82,9 @@ fn is_bool_flag(arg: &str) -> bool {
         arg,
         "--json"
             | "-j"
+            | "--edit"
+            | "-e"
+            | "--once"
             | "--yes"
             | "--force"
             | "--all"
@@ -124,6 +128,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--agent-pool"
             | "--depends-on"
             | "--limit"
+            | "--interval"
             | "--body-file"
             | "--to"
             | "--artifact"
@@ -223,6 +228,12 @@ pub enum Commands {
         /// Read the body from a file instead of --body.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// Open $VISUAL or $EDITOR on the body before capture.
+        ///
+        /// Starts from --body or --body-file when given, otherwise from a
+        /// template with the recommended sections.
+        #[arg(short = 'e', long)]
+        edit: bool,
         /// Required capability. Repeatable. Comma-separated values are split.
         #[arg(long = "capability")]
         capability: Vec<String>,
@@ -256,6 +267,30 @@ pub enum Commands {
         /// Show only tasks in this feature. Id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+    },
+    /// Watch the queue. Redraws counts, the task table, and recent changes until Ctrl-C.
+    Top {
+        /// Seconds between refreshes.
+        #[arg(short = 'i', long, default_value_t = 2.0, value_name = "SECONDS")]
+        interval: f64,
+        /// Show only this status. Includes done or cancelled when that status is named.
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+        /// implementation, research, review, benchmark, documentation, or other.
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+        /// Maximum rows in the table.
+        #[arg(short = 'n', long, default_value_t = 30)]
+        limit: u32,
+        /// Include done and cancelled tasks in the table. Ignored when --status is set.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Show only tasks in this feature. Id or unique title.
+        #[arg(long, value_name = "ID|TITLE")]
+        feature: Option<String>,
+        /// Draw one frame and exit instead of refreshing.
+        #[arg(long)]
+        once: bool,
     },
     /// Show one task, its claim, artifacts, and recent events.
     Show {
@@ -292,6 +327,9 @@ pub enum Commands {
         /// Read a replacement body from a file.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
+        /// Open $VISUAL or $EDITOR on the body, even when other flags are set.
+        #[arg(short = 'e', long)]
+        edit: bool,
         /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
@@ -666,6 +704,28 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(Cli::try_parse_from(["q", "--color", "rainbow", "ls"]).is_err());
+
+        let top =
+            Cli::try_parse_from(["q", "top", "-i", "0.5", "-n", "5", "-a", "--once"]).unwrap();
+        match top.command {
+            Commands::Top {
+                interval,
+                limit,
+                all,
+                once,
+                ..
+            } => {
+                assert_eq!(interval, 0.5);
+                assert_eq!(limit, 5);
+                assert!(all);
+                assert!(once);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            preprocess(vec!["top".into(), "--interval".into(), "1".into()]),
+            vec!["top", "--interval", "1"]
+        );
 
         let done = Cli::try_parse_from(["q", "done", "4", "--summary", "ok"]).unwrap();
         match done.command {
