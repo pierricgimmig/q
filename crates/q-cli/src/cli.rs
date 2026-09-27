@@ -72,6 +72,7 @@ fn is_command(word: &str) -> bool {
             | "mcp"
             | "serve"
             | "token"
+            | "orbit"
             | "skill"
             | "workers"
             | "fail"
@@ -688,6 +689,31 @@ pub enum Commands {
     Workers {
         #[command(subcommand)]
         command: WorkersCommand,
+    },
+    /// Follow queue activity live in the Orbit profiler.
+    ///
+    /// Tails the event log and posts tasks as processes, agents as threads,
+    /// and events as spans to a running Orbit service (POST /api/events).
+    Orbit {
+        /// Orbit service URL. Falls back to $Q_ORBIT_URL, then http://127.0.0.1:44766.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Seconds between polls of the queue.
+        #[arg(short = 'i', long, default_value_t = 2.0, value_name = "SECONDS")]
+        interval: f64,
+        /// Draw this much history at start: a duration such as 1h, 30m, 2d, or all.
+        ///
+        /// Older events still build the state, so open work is drawn from its
+        /// real start. 0 draws nothing from the past.
+        #[arg(long, default_value = "1h", value_name = "AGE")]
+        history: String,
+        /// Seconds between segments of a span that is still open. 0 draws a
+        /// span only when it ends.
+        #[arg(long, default_value_t = 10.0, value_name = "SECONDS")]
+        segment: f64,
+        /// Do one pass (replay, push) and exit.
+        #[arg(long)]
+        once: bool,
     },
     /// Print or install the agent skill for q.
     Skill {

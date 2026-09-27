@@ -18,6 +18,7 @@ crossterm = "0.29.0"
 q-core.workspace = true
 q-http.workspace = true
 q-mcp.workspace = true
+q-orbit.workspace = true
 q-project.workspace = true
 q-store.workspace = true
 serde.workspace = true

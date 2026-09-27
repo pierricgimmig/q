@@ -35,6 +35,7 @@ pub const METHODS: &[&str] = &[
     "log",
     "artifact",
     "events",
+    "events_since",
     "status",
     "reopen",
     "create_feature",
@@ -79,6 +80,13 @@ pub struct EditFeatureBody {
 pub struct ReopenBody {
     pub id: i64,
     pub actor: Actor,
+}
+
+/// Body for `/v1/events_since`: the queue-wide feed after an event id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsSinceBody {
+    pub after_id: i64,
+    pub limit: u32,
 }
 
 /// Body for `/v1/status`, `/v1/list_features`: no arguments.

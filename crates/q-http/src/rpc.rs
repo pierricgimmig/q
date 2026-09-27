@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::auth::{Principal, Role};
 use crate::wire::{
-    EditBody, EditFeatureBody, EmptyBody, ErrorBody, IdBody, ReopenBody, HUMAN_ONLY_METHODS,
+    EditBody, EditFeatureBody, EmptyBody, ErrorBody, EventsSinceBody, IdBody, ReopenBody,
+    HUMAN_ONLY_METHODS,
 };
 
 /// Run one method against the queue. Shared by the HTTP handler and tests.
@@ -128,6 +129,10 @@ pub fn dispatch(
         "events" => {
             let IdBody { id } = parse(body)?;
             reply(queue.events(id))
+        }
+        "events_since" => {
+            let EventsSinceBody { after_id, limit } = parse(body)?;
+            reply(queue.events_since(after_id, limit))
         }
         "status" => {
             let EmptyBody {} = parse(body)?;
@@ -282,6 +287,9 @@ mod tests {
                 unreachable!()
             }
             fn events(&self, _: i64) -> Result<Vec<q_core::Event>, QueueError> {
+                unreachable!()
+            }
+            fn events_since(&self, _: i64, _: u32) -> Result<Vec<q_core::Event>, QueueError> {
                 unreachable!()
             }
             fn status(&self) -> Result<q_core::QueueStatus, QueueError> {

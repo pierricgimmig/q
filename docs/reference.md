@@ -233,6 +233,8 @@ q top --feature "Cross-repo rollout"
 q top --once
 ```
 
+`q orbit` follows the same queue on the [Orbit](https://github.com/pierricgimmig/orbit) profiler's live timeline. It is off unless you run it. `--url` falls back to `Q_ORBIT_URL`, then `http://127.0.0.1:44766`. `--history` (default `1h`; `all`, `30m`, `2d`, or `0`) is how much of the past to draw at start. `--segment` (default 10; `0` draws a span only when it ends) is how often an open span is posted, because Orbit's ring is append-only. `--once` does one pass. A note written as `[name] @begin label` ... `[name] @end` draws a span on a sub-thread. See `docs/orbit-integration.md`.
+
 `q top` redraws the queue counts, the task table, and a list of recent changes every second until you press `q` (Esc and Ctrl-C also quit). Each frame also releases claims whose lease has expired, the same recovery `q claim` and `q serve` use, so a crashed worker does not sit in the table forever. While it runs the terminal is in raw mode, so keys you type are not echoed into the shell, and the mode is restored when it exits, including on an error. `-i` (`--interval`) sets the seconds between refreshes (default 1, minimum 0.1). The `UPDATED` column shows ages to the second there (`12s ago`, `3m 12s ago`), where `q ls` rounds them. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `--tag`, `-a`, and `-n`, default 30 rows). Those filters change which tasks are listed. They do not change the columns, widths, alignment, colors, or completion percent; that layout is the `q top --all` table, so a task still in view looks the same in `q top` and `q top --all`. Beyond the `q ls` columns it adds `FAILS` (blank until the task has failed), `MODEL`, `HOST`, `NOTE` (the latest note, only while a claim is active), `BEAT` (heartbeat age), and `STALE`. `--stale-after SECONDS` (default 120, `0` allowed) marks a worker `stale` when its last heartbeat is at least that old. That flag does not release the claim; the lease does. Recent changes are noticed between refreshes and listed newest first, up to ten, in aligned columns: time, id, the status before, the status after, and the title. A task seen for the first time comes from `new`, and a deleted task goes to `deleted`. The last frame stays on screen after quitting. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes and no key handling, so Ctrl-C quits there. `--json` is not supported; use `q ls --json` or `q status --json`.
 
 ## Dependency tree
@@ -490,10 +492,11 @@ crates/q-project    git discovery and .agentqueue.toml
 crates/q-store      SQLite schema, migrations, and the service implementation
 crates/q-mcp        stdio JSON-RPC adapter
 crates/q-http       q serve (axum) and RemoteQueue, the HTTP client that implements QueueService
+crates/q-orbit      q orbit: maps the event log to Orbit timeline records and posts them
 crates/q-cli        the q binary
 ```
 
-CLI, MCP, and the HTTP transport depend on the service trait. They do not run SQL.
+CLI, MCP, the HTTP transport, and the Orbit bridge depend on the service trait. They do not run SQL.
 
 ## Tests
 

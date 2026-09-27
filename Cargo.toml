@@ -7,6 +7,7 @@ members = [
     "crates/q-store",
     "crates/q-mcp",
     "crates/q-http",
+    "crates/q-orbit",
     "crates/q-cli",
 ]
 
@@ -23,6 +24,7 @@ q-core = { path = "crates/q-core" }
 q-dispatch = { path = "crates/q-dispatch" }
 q-mcp = { path = "crates/q-mcp" }
 q-http = { path = "crates/q-http" }
+q-orbit = { path = "crates/q-orbit" }
 q-project = { path = "crates/q-project" }
 q-store = { path = "crates/q-store" }
 rusqlite = { version = "0.32", features = ["bundled"] }
