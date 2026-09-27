@@ -304,7 +304,7 @@ fn chat_connector_signs_in_with_oauth_and_triages_over_mcp() {
         &http,
         &url,
         Some(&access),
-        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "queue_capture", "arguments": {"title": "From chat", "capture_path": "/tmp"}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "queue_capture", "arguments": {"title": "From chat", "capture_path": std::env::temp_dir()}}}),
     );
     let task_id = tool_text(&captured)["id"].as_i64().unwrap();
     let (_, readied) = mcp(
