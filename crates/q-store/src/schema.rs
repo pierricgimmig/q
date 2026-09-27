@@ -133,6 +133,10 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     if current < 3 {
         apply_v3(&tx, &applied_at)?;
     }
+    // Additive column checks run on every open, independent of the version
+    // row. A database migrated by another branch can already sit above the
+    // version a step is gated on, as `apply_v2` guards `feature_id` too.
+    ensure_artifact_content(&tx)?;
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
@@ -174,6 +178,17 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), Queu
 
 /// v3: artifacts may store their content (a report body) in the database.
 fn apply_v3(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    ensure_artifact_content(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+/// Add `artifacts.content` when it is missing. Safe to call on every open.
+fn ensure_artifact_content(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
     let has_content: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('artifacts') WHERE name = 'content'",
@@ -185,10 +200,5 @@ fn apply_v3(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), Queu
         tx.execute_batch("ALTER TABLE artifacts ADD COLUMN content TEXT;")
             .map_err(|err| QueueError::Database(err.to_string()))?;
     }
-    tx.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
-        params![applied_at],
-    )
-    .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
 }

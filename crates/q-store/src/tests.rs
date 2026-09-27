@@ -1870,3 +1870,51 @@ fn migration_v3_adds_artifact_content_and_keeps_legacy_rows() {
     assert_eq!(version, 3);
     assert_eq!(queue.get(1).unwrap().artifacts.len(), 2);
 }
+
+#[test]
+fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
+    // A database migrated by another branch can carry a higher version number
+    // without this column. The column check must not depend on the version.
+    let path = temp_db();
+    drop(Queue::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE artifacts DROP COLUMN content;
+         INSERT INTO schema_migrations (version, applied_at)
+         VALUES (4, '2026-09-24T00:00:00Z'), (5, '2026-09-24T00:00:00Z');",
+    )
+    .unwrap();
+    let before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('artifacts') WHERE name = 'content'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, 0);
+    drop(conn);
+
+    let queue = Queue::open(&path).unwrap();
+    let id = capture(&queue, "ahead of the migrations");
+    let detail = queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: None,
+            message: Some("still works".into()),
+            artifacts: vec![ArtifactInput {
+                kind: "report".into(),
+                value: "r.md".into(),
+                content: Some("ok".into()),
+            }],
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(detail.artifacts[0].content_bytes, Some(2));
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 5, "foreign version rows are left alone");
+}
