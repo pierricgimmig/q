@@ -1094,7 +1094,27 @@ struct TopOptions {
 /// One line in the recent-changes list, with the time it was noticed.
 struct TopChange {
     at: OffsetDateTime,
-    text: String,
+    id: i64,
+    /// Status before the change. `None` for a task seen for the first time.
+    from: Option<TaskStatus>,
+    /// Status after the change. `None` when the task was deleted.
+    to: Option<TaskStatus>,
+    title: String,
+}
+
+const TOP_CHANGE_NEW: &str = "new";
+const TOP_CHANGE_DELETED: &str = "deleted";
+
+impl TopChange {
+    fn before_label(&self) -> &str {
+        self.from.map(TaskStatus::as_str).unwrap_or(TOP_CHANGE_NEW)
+    }
+
+    fn after_label(&self) -> &str {
+        self.to
+            .map(TaskStatus::as_str)
+            .unwrap_or(TOP_CHANGE_DELETED)
+    }
 }
 
 async fn run_top(
@@ -1164,8 +1184,8 @@ fn top_frame(
     let current: std::collections::HashMap<i64, TaskSummary> =
         tasks.iter().map(|task| (task.id, task.clone())).collect();
     if let Some(before) = previous.as_ref() {
-        for text in top_changes(before, &current, &tasks, paint) {
-            changes.push_back(TopChange { at: now, text });
+        for change in top_changes(before, &current, &tasks, now) {
+            changes.push_back(change);
         }
         while changes.len() > TOP_CHANGE_ROWS {
             changes.pop_front();
@@ -1203,14 +1223,56 @@ fn top_frame(
     if changes.is_empty() {
         out.push_str(&format!("  {}\n", paint.dim("none yet")));
     }
+    out.push_str(&render_top_changes(changes, paint));
+    Ok(out)
+}
+
+/// Newest first, in aligned columns: time, id, from, to, title.
+fn render_top_changes(changes: &std::collections::VecDeque<TopChange>, paint: Paint) -> String {
+    let id_width = changes
+        .iter()
+        .map(|change| change.id.to_string().len() + 1)
+        .max()
+        .unwrap_or(0);
+    let from_width = changes
+        .iter()
+        .map(|change| change.before_label().len())
+        .max()
+        .unwrap_or(0);
+    let to_width = changes
+        .iter()
+        .map(|change| change.after_label().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
     for change in changes.iter().rev() {
+        let id = format!("#{}", change.id);
+        let from = change.before_label();
+        let to = change.after_label();
         out.push_str(&format!(
-            "  {}  {}\n",
+            "  {}  {}{}  {}{}  {} {}{}  {}\n",
             paint.dim(&format_clock(change.at)),
-            change.text
+            " ".repeat(id_width - id.len()),
+            paint.dim(&id),
+            paint_top_status(from, paint),
+            " ".repeat(from_width - from.len()),
+            paint.dim("->"),
+            paint_top_status(to, paint),
+            " ".repeat(to_width - to.len()),
+            paint.bold(&change.title),
         ));
     }
-    Ok(out)
+    out
+}
+
+/// A status name is colored like the table; the `new` and `deleted`
+/// pseudo-states are dim.
+fn paint_top_status(label: &str, paint: Paint) -> String {
+    if label == TOP_CHANGE_NEW || label == TOP_CHANGE_DELETED {
+        paint.dim(label)
+    } else {
+        paint.status(label)
+    }
 }
 
 fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
@@ -1255,24 +1317,22 @@ fn top_changes(
     before: &std::collections::HashMap<i64, TaskSummary>,
     after: &std::collections::HashMap<i64, TaskSummary>,
     order: &[TaskSummary],
-    paint: Paint,
-) -> Vec<String> {
-    let mut lines = Vec::new();
+    now: OffsetDateTime,
+) -> Vec<TopChange> {
+    let mut changes = Vec::new();
     for task in order {
-        let id = paint.dim(&format!("#{}", task.id));
-        let title = paint.bold(&format_list_title(&task.title));
-        match before.get(&task.id) {
-            None => lines.push(format!(
-                "{id} added [{}] {title}",
-                paint.status(task.status.as_str())
-            )),
-            Some(old) if old.status != task.status => lines.push(format!(
-                "{id} [{}] -> [{}] {title}",
-                paint.status(old.status.as_str()),
-                paint.status(task.status.as_str())
-            )),
-            Some(_) => {}
-        }
+        let from = match before.get(&task.id) {
+            None => None,
+            Some(old) if old.status != task.status => Some(old.status),
+            Some(_) => continue,
+        };
+        changes.push(TopChange {
+            at: now,
+            id: task.id,
+            from,
+            to: Some(task.status),
+            title: format_list_title(&task.title),
+        });
     }
     let mut gone: Vec<&TaskSummary> = before
         .values()
@@ -1280,13 +1340,15 @@ fn top_changes(
         .collect();
     gone.sort_by_key(|task| task.id);
     for task in gone {
-        lines.push(format!(
-            "{} deleted {}",
-            paint.dim(&format!("#{}", task.id)),
-            paint.bold(&format_list_title(&task.title))
-        ));
+        changes.push(TopChange {
+            at: now,
+            id: task.id,
+            from: Some(task.status),
+            to: None,
+            title: format_list_title(&task.title),
+        });
     }
-    lines
+    changes
 }
 
 fn format_clock(at: OffsetDateTime) -> String {
