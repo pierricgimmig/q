@@ -1329,6 +1329,35 @@ fn log_and_artifact_commands_keep_a_per_task_log() {
         .unwrap()
         .iter()
         .any(|event| event["event_type"] == "task_note"));
+}
+
+#[test]
+fn capture_confirmation_is_a_blank_line_then_one_truncated_line() {
+    let root = temp_root("capture-confirm");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let long_title = format!("Line one\nline two {}", "z".repeat(80));
+    let captured = run(bin().args(["--db", db_arg, "--color", "never", &long_title]));
+    let text = String::from_utf8(captured.stdout).unwrap();
+    assert!(text.starts_with('\n'), "{text:?}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text:?}");
+    assert_eq!(lines[0], "", "{text:?}");
+    assert!(lines[1].starts_with("captured #"), "{text:?}");
+    assert!(lines[1].contains("[inbox] Line one line two z"), "{text:?}");
+    assert!(lines[1].ends_with('…'), "{text:?}");
+    assert!(!lines[1].contains(&"z".repeat(80)), "{text:?}");
+
+    let short = run(bin().args(["--db", db_arg, "--color", "never", "add", "Short title"]));
+    let short = String::from_utf8(short.stdout).unwrap();
+    let lines: Vec<&str> = short.lines().collect();
+    assert_eq!(lines.len(), 2, "{short:?}");
+    assert!(lines[1].ends_with("[inbox] Short title"), "{short:?}");
+
+    // --json is unchanged: the full title, no confirmation line.
+    let json = run(bin().args(["--db", db_arg, "--json", "add", &long_title]));
+    let created: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(created["title"].as_str().unwrap(), long_title);
 
     let _ = fs::remove_dir_all(root);
 }

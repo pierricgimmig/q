@@ -85,6 +85,8 @@ q "Write the parser" --body-file task.md
 q -e "Write the parser"
 ```
 
+Without `--json`, capture prints a blank line and then exactly one confirmation line: `captured #184 [inbox] Benchmark trace encoding variants`. The title is collapsed to one line and, like `q ls`, truncated with an ellipsis after 64 characters. `--json` prints the full task instead.
+
 `--body` and `--body-file` set the Markdown body at capture. `-e` (`--edit`) opens `$VISUAL` or `$EDITOR` on it first, seeded with that text or, when neither is given, with a template of the recommended sections (Goal, Repository / target, Scope, Deliverable, Acceptance criteria, Constraints / do not do, Dependencies). A body left blank is stored as no body. `--edit` is an error when no editor is set.
 
 Discovery precedence:

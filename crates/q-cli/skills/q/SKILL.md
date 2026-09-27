@@ -10,7 +10,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 ## Rules
 
 - Capture creates an **inbox** task. Inbox work is never claimable.
-- After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json`; with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
+- After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
 - A human must run `q ready ID` before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.

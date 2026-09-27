@@ -303,7 +303,7 @@ fn dispatch(
             })?;
             let id = task.id;
             emit(ui, &task, || {
-                confirm(ui, "captured", id, task.status.as_str(), &task.title);
+                confirm_capture(ui, id, task.status.as_str(), &task.title);
             });
             Ok(())
         }
@@ -1015,6 +1015,22 @@ fn confirm(ui: &Ui, verb: &str, id: i64, status: &str, title: &str) {
         ui.out.status(status),
         ui.out.bold(title),
     );
+}
+
+/// Capture confirmation: a blank line, then exactly one line. The title is
+/// collapsed to one line and truncated with an ellipsis like `q ls`.
+fn confirm_capture(ui: &Ui, id: i64, status: &str, title: &str) {
+    println!();
+    println!("{}", capture_line(ui.out, id, status, title));
+}
+
+fn capture_line(paint: Paint, id: i64, status: &str, title: &str) -> String {
+    format!(
+        "captured {} [{}] {}",
+        paint.dim(&format!("#{id}")),
+        paint.status(status),
+        paint.bold(&format_list_title(title)),
+    )
 }
 
 fn meta(paint: Paint, line: &str) {
@@ -1910,10 +1926,37 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_project, format_list_title, render_task_rows, render_task_rows_painted,
-        render_tree, render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
+        capture_line, display_project, format_list_title, render_task_rows,
+        render_task_rows_painted, render_tree, render_tree_with, truncate_chars, TaskListRow,
+        TITLE_MAX_CHARS,
     };
+    use crate::style::Paint;
     use q_core::{TaskStatus, TaskTree, TreeFeature, TreeNode};
+
+    #[test]
+    fn capture_confirmation_is_one_truncated_line() {
+        let short = capture_line(
+            Paint::plain(),
+            184,
+            "inbox",
+            "Benchmark trace encoding variants",
+        );
+        assert_eq!(
+            short,
+            "captured #184 [inbox] Benchmark trace encoding variants"
+        );
+
+        let long = format!("first line\nsecond {}", "x".repeat(TITLE_MAX_CHARS + 20));
+        let line = capture_line(Paint::plain(), 7, "inbox", &long);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.starts_with("captured #7 [inbox] first line second x"),
+            "{line}"
+        );
+        assert!(line.ends_with('…'), "{line}");
+        let title = line.trim_start_matches("captured #7 [inbox] ");
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
+    }
 
     #[test]
     fn unassigned_project_uses_a_stable_label() {
