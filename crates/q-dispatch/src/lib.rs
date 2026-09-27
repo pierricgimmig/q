@@ -121,9 +121,9 @@ mod tests {
     }
 
     #[test]
-    fn inbox_is_never_eligible() {
+    fn held_is_never_eligible() {
         let mut candidate = task();
-        candidate.status = TaskStatus::Inbox;
+        candidate.status = TaskStatus::Held;
         assert!(!is_eligible(&candidate, &request(), 0, None, false));
     }
 

@@ -5,9 +5,10 @@ pub fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
     matches!(
         (from, to),
-        (Inbox, Ready)
-            | (Inbox, Blocked)
-            | (Inbox, Cancelled)
+        (Held, Ready)
+            | (Held, Blocked)
+            | (Held, Cancelled)
+            | (Ready, Held)
             | (Ready, Claimed)
             | (Ready, Blocked)
             | (Ready, Cancelled)
@@ -21,11 +22,11 @@ pub fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
             | (Review, Done)
             | (Review, InProgress)
             | (Review, Blocked)
-            | (Blocked, Inbox)
+            | (Blocked, Held)
             | (Blocked, Ready)
             | (Blocked, Cancelled)
             | (Done, Ready)
-            | (Cancelled, Inbox)
+            | (Cancelled, Held)
     )
 }
 
@@ -43,15 +44,16 @@ mod tests {
     use TaskStatus::*;
 
     const ALL: [TaskStatus; 8] = [
-        Inbox, Ready, Claimed, InProgress, Review, Blocked, Done, Cancelled,
+        Held, Ready, Claimed, InProgress, Review, Blocked, Done, Cancelled,
     ];
 
     #[test]
     fn legal_transitions_match_the_state_machine() {
         let legal = [
-            (Inbox, Ready),
-            (Inbox, Blocked),
-            (Inbox, Cancelled),
+            (Held, Ready),
+            (Held, Blocked),
+            (Held, Cancelled),
+            (Ready, Held),
             (Ready, Claimed),
             (Ready, Blocked),
             (Ready, Cancelled),
@@ -65,11 +67,11 @@ mod tests {
             (Review, Done),
             (Review, InProgress),
             (Review, Blocked),
-            (Blocked, Inbox),
+            (Blocked, Held),
             (Blocked, Ready),
             (Blocked, Cancelled),
             (Done, Ready),
-            (Cancelled, Inbox),
+            (Cancelled, Held),
         ];
         for (from, to) in legal {
             assert!(
@@ -82,10 +84,10 @@ mod tests {
     #[test]
     fn forbidden_transitions_are_rejected() {
         let forbidden = [
-            (Inbox, Claimed),
-            (Inbox, InProgress),
-            (Inbox, Done),
-            (Inbox, Review),
+            (Held, Claimed),
+            (Held, InProgress),
+            (Held, Done),
+            (Held, Review),
             (Ready, Done),
             (Ready, InProgress),
             (Ready, Review),
@@ -93,7 +95,7 @@ mod tests {
             (Claimed, Review),
             (Claimed, Cancelled),
             (Done, InProgress),
-            (Done, Inbox),
+            (Done, Held),
             (Cancelled, Ready),
             (Cancelled, Done),
             (Review, Ready),

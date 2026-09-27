@@ -90,7 +90,7 @@ fn stream_allows_color(stream: &impl anstream::stream::RawStream) -> bool {
 /// misleading color.
 pub fn status_style(status: &str) -> Style {
     match status {
-        "inbox" => Style::new().fg_color(Some(AnsiColor::Blue.into())),
+        "held" => Style::new().fg_color(Some(AnsiColor::Blue.into())),
         "ready" => Style::new().fg_color(Some(AnsiColor::Green.into())),
         "claimed" => Style::new().fg_color(Some(AnsiColor::Yellow.into())),
         "in_progress" => Style::new().fg_color(Some(AnsiColor::Cyan.into())),
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn color_wraps_status_without_changing_visible_text() {
         for status in [
-            "inbox",
+            "held",
             "ready",
             "claimed",
             "in_progress",

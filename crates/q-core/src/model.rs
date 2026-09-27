@@ -16,7 +16,9 @@ fn norm_token(value: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
-    Inbox,
+    /// Captured but deliberately kept out of the claimable pool until a
+    /// human releases it with `ready`.
+    Held,
     Ready,
     Claimed,
     InProgress,
@@ -29,7 +31,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Inbox => "inbox",
+            Self::Held => "held",
             Self::Ready => "ready",
             Self::Claimed => "claimed",
             Self::InProgress => "in_progress",
@@ -42,7 +44,7 @@ impl TaskStatus {
 
     pub fn parse(value: &str) -> Result<Self, QueueError> {
         match norm_token(value).as_str() {
-            "inbox" => Ok(Self::Inbox),
+            "held" => Ok(Self::Held),
             "ready" => Ok(Self::Ready),
             "claimed" => Ok(Self::Claimed),
             "in_progress" => Ok(Self::InProgress),
@@ -51,7 +53,7 @@ impl TaskStatus {
             "done" => Ok(Self::Done),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             other => Err(QueueError::InvalidInput(format!(
-                "unknown status '{other}' (expected inbox, ready, claimed, in_progress, review, blocked, done, cancelled)"
+                "unknown status '{other}' (expected held, ready, claimed, in_progress, review, blocked, done, cancelled)"
             ))),
         }
     }
@@ -532,7 +534,7 @@ impl ClaimOutcome {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusCounts {
-    pub inbox: i64,
+    pub held: i64,
     pub ready: i64,
     pub claimed: i64,
     pub in_progress: i64,
@@ -584,6 +586,10 @@ pub struct CaptureRequest {
     pub policy: Option<ProjectPolicy>,
     pub actor: Actor,
     pub context_source: Option<String>,
+    /// Create the task as `held` instead of `ready`, so it stays out of the
+    /// claimable pool until a human runs `ready`. Defaults to false.
+    #[serde(default)]
+    pub hold: bool,
 }
 
 /// Filters for [`crate::QueueService::list`].
@@ -743,6 +749,13 @@ pub struct BlockRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRequest {
+    pub task_id: i64,
+    pub actor: Actor,
+}
+
+/// Move a ready or blocked task back to `held` so it is no longer claimable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldRequest {
     pub task_id: i64,
     pub actor: Actor,
 }

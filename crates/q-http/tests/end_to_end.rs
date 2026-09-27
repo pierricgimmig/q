@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ActorKind, ArtifactInput, CaptureRequest, ClaimRequest, CompleteRequest,
-    HeartbeatRequest, ListFilter, LogRequest, QueueError, QueueService, ReadyRequest, RiskLevel,
-    StartRequest, TaskKind, TaskStatus,
+    HeartbeatRequest, HoldRequest, ListFilter, LogRequest, QueueError, QueueService, ReadyRequest,
+    RiskLevel, StartRequest, TaskKind, TaskStatus,
 };
 use q_http::{serve_on, AuthConfig, RemoteQueue};
 use q_store::Queue;
@@ -100,6 +100,8 @@ fn capture(title: &str, actor: Actor) -> CaptureRequest {
         policy: None,
         actor,
         context_source: None,
+        // Tests exercise the human gate, so captures start held.
+        hold: true,
     }
 }
 
@@ -113,9 +115,22 @@ fn full_claim_lifecycle_over_http() {
     let task = queue
         .capture(capture("Benchmark trace encoding", Actor::human(None)))
         .unwrap();
-    assert_eq!(task.status, TaskStatus::Inbox);
+    assert_eq!(task.status, TaskStatus::Held);
 
-    // Inbox work is not claimable.
+    // A plain capture is ready at once; hold moves it back over the wire.
+    let mut open = capture("Open capture", Actor::human(None));
+    open.hold = false;
+    let open = queue.capture(open).unwrap();
+    assert_eq!(open.status, TaskStatus::Ready);
+    let open = queue
+        .hold(HoldRequest {
+            task_id: open.id,
+            actor: Actor::human(None),
+        })
+        .unwrap();
+    assert_eq!(open.status, TaskStatus::Held);
+
+    // Held work is not claimable.
     let none = queue.claim_next(ClaimRequest::new("agent-1")).unwrap();
     assert!(!none.found);
     assert_eq!(none.reason.as_deref(), Some(q_core::NO_ELIGIBLE_REASON));
@@ -220,9 +235,10 @@ fn full_claim_lifecycle_over_http() {
             ..ListFilter::default()
         })
         .unwrap();
-    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.len(), 2);
     let status = queue.status().unwrap();
     assert_eq!(status.counts.done, 1);
+    assert_eq!(status.counts.held, 1);
     let events = queue.events(task.id).unwrap();
     assert!(events
         .iter()
@@ -272,7 +288,7 @@ fn tokens_gate_access_and_roles() {
         })
         .unwrap_err();
     assert!(forbidden.to_string().contains("forbidden"), "{forbidden}");
-    assert_eq!(human.get(task.id).unwrap().task.status, TaskStatus::Inbox);
+    assert_eq!(human.get(task.id).unwrap().task.status, TaskStatus::Held);
 
     human
         .mark_ready(ReadyRequest {

@@ -9,7 +9,7 @@ use rusqlite::{params, Connection};
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
     CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
-    HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
+    HeartbeatRequest, HoldRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
     ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
     TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
@@ -81,13 +81,25 @@ fn capture_with(queue: &Queue, title: &str, risk: RiskLevel, policy: Option<Proj
             policy,
             actor: actor(),
             context_source: Some("test".into()),
+            hold: true,
         })
         .unwrap()
         .id
 }
 
+/// Capture a held task. Most tests release it with `make_ready` so the
+/// human-gate path stays covered; `capture_defaults_to_ready` covers the default.
 fn capture(queue: &Queue, title: &str) -> i64 {
     capture_with(queue, title, RiskLevel::Low, None)
+}
+
+fn hold(queue: &Queue, id: i64) {
+    queue
+        .hold(HoldRequest {
+            task_id: id,
+            actor: actor(),
+        })
+        .unwrap();
 }
 
 fn make_ready(queue: &Queue, id: i64) {
@@ -175,7 +187,7 @@ fn capture_preserves_original_text_and_normalizes_repo() {
     let task = queue.get(id).unwrap().task;
     assert_eq!(task.title, "Renamed");
     assert_eq!(task.original_capture, "Benchmark delta coding");
-    assert_eq!(task.status, TaskStatus::Inbox);
+    assert_eq!(task.status, TaskStatus::Held);
     assert_eq!(task.repo.as_deref(), Some("github.com/acme/demo"));
     let events = queue.events(id).unwrap();
     assert!(events
@@ -185,10 +197,10 @@ fn capture_preserves_original_text_and_normalizes_repo() {
 }
 
 #[test]
-fn sparse_inbox_task_can_be_marked_ready() {
+fn sparse_held_task_can_be_marked_ready() {
     let (queue, _) = queue();
     let id = capture(&queue, "sparse idea");
-    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
+    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Held);
     let outcome = queue
         .mark_ready(ReadyRequest {
             task_id: id,
@@ -477,13 +489,13 @@ fn events_are_append_only_across_status_changes() {
 }
 
 #[test]
-fn inbox_and_high_risk_tasks_are_not_claimed_by_default() {
+fn held_and_high_risk_tasks_are_not_claimed_by_default() {
     let (queue, _) = queue();
-    let inbox = capture(&queue, "not ready");
+    let held = capture(&queue, "not ready");
     let outcome = claim(&queue, "agent-a");
     assert!(!outcome.found);
     assert_eq!(outcome.reason.as_deref(), Some(NO_ELIGIBLE_REASON));
-    assert_eq!(queue.get(inbox).unwrap().task.status, TaskStatus::Inbox);
+    assert_eq!(queue.get(held).unwrap().task.status, TaskStatus::Held);
 
     let risky = capture_with(&queue, "dangerous", RiskLevel::High, None);
     make_ready(&queue, risky);
@@ -615,6 +627,7 @@ fn project_cap_limits_active_claims() {
             policy: Some(policy),
             actor: actor(),
             context_source: None,
+            hold: true,
         })
         .unwrap();
     let second = queue
@@ -637,6 +650,7 @@ fn project_cap_limits_active_claims() {
             policy: None,
             actor: actor(),
             context_source: None,
+            hold: true,
         })
         .unwrap();
     for id in [first.id, second.id] {
@@ -679,7 +693,7 @@ fn cancel_block_and_reopen_follow_the_state_machine() {
         .filter(|event| event.event_type == "task_cancelled")
         .all(|event| event.payload.get("reason").is_none()));
     queue.reopen(id, actor()).unwrap();
-    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
+    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Held);
     let recovered = queue
         .recover_stale(RecoverRequest {
             to: Some(StaleDisposition::Blocked),
@@ -727,29 +741,29 @@ fn count_rows(path: &PathBuf, sql: &str, task_id: i64) -> i64 {
 }
 
 #[test]
-fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
+fn delete_removes_held_and_ready_tasks_and_cascades_dependents() {
     let (queue, path) = queue();
-    let inbox = capture(&queue, "inbox task");
+    let held = capture(&queue, "held task");
     let ready = capture(&queue, "ready task");
     make_ready(&queue, ready);
     let mut edit = EditRequest::empty(actor());
-    edit.dependencies = Some(vec![inbox]);
+    edit.dependencies = Some(vec![held]);
     queue.edit(ready, edit).unwrap();
 
     let removed = queue
         .delete(DeleteRequest {
-            task_id: inbox,
+            task_id: held,
             force: false,
             actor: actor(),
         })
         .unwrap();
-    assert_eq!(removed.task_id, inbox);
-    assert_eq!(removed.status, TaskStatus::Inbox);
+    assert_eq!(removed.task_id, held);
+    assert_eq!(removed.status, TaskStatus::Held);
     assert!(!removed.active_claim_cleared);
     assert!(removed.events_removed >= 1);
     assert_eq!(removed.dependencies_removed, 1);
     assert!(matches!(
-        queue.get(inbox).unwrap_err(),
+        queue.get(held).unwrap_err(),
         QueueError::NotFound(_)
     ));
     let listed = queue
@@ -763,29 +777,21 @@ fn delete_removes_inbox_and_ready_tasks_and_cascades_dependents() {
             include_terminal: false,
         })
         .unwrap();
-    assert!(listed.iter().all(|task| task.id != inbox));
+    assert!(listed.iter().all(|task| task.id != held));
     assert!(listed.iter().any(|task| task.id == ready));
     assert_eq!(
-        count_rows(
-            &path,
-            "SELECT COUNT(*) FROM claims WHERE task_id = ?",
-            inbox
-        ),
+        count_rows(&path, "SELECT COUNT(*) FROM claims WHERE task_id = ?", held),
         0
     );
     assert_eq!(
-        count_rows(
-            &path,
-            "SELECT COUNT(*) FROM events WHERE task_id = ?",
-            inbox
-        ),
+        count_rows(&path, "SELECT COUNT(*) FROM events WHERE task_id = ?", held),
         0
     );
     assert_eq!(
         count_rows(
             &path,
             "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1 OR depends_on_task_id = ?1",
-            inbox
+            held
         ),
         0
     );
@@ -942,7 +948,7 @@ fn empty_claim_is_success_and_list_filters() {
     let id = capture(&queue, "listed");
     let rows = queue
         .list(ListFilter {
-            status: Some(TaskStatus::Inbox),
+            status: Some(TaskStatus::Held),
             project: Some("demo".into()),
             repo: Some("https://github.com/acme/demo.git".into()),
             kind: Some(TaskKind::Implementation),
@@ -954,7 +960,7 @@ fn empty_claim_is_success_and_list_filters() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, id);
     let status = queue.status().unwrap();
-    assert_eq!(status.counts.inbox, 1);
+    assert_eq!(status.counts.held, 1);
     assert_eq!(status.active_claims, 0);
 }
 
@@ -979,6 +985,7 @@ fn capture_named(queue: &Queue, title: &str, project: Option<&str>) -> i64 {
             policy: None,
             actor: actor(),
             context_source: Some("test".into()),
+            hold: true,
         })
         .unwrap()
         .id
@@ -1127,10 +1134,10 @@ fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
         listed(&queue, Some(TaskStatus::Done), false, 100),
         vec![alpha_done]
     );
-    let inbox = listed(&queue, Some(TaskStatus::Inbox), true, 100);
-    assert!(!inbox.contains(&alpha_done));
-    assert!(!inbox.contains(&beta_cancelled));
-    assert!(inbox.contains(&alpha_new));
+    let held = listed(&queue, Some(TaskStatus::Held), true, 100);
+    assert!(!held.contains(&alpha_done));
+    assert!(!held.contains(&beta_cancelled));
+    assert!(held.contains(&alpha_new));
     assert_eq!(listed(&queue, None, false, 1), vec![alpha_new]);
 
     let beta_only = queue
@@ -1179,6 +1186,7 @@ fn capture_in(
             policy: None,
             actor: actor(),
             context_source: Some("test".into()),
+            hold: true,
         })
         .unwrap()
         .id
@@ -1229,7 +1237,7 @@ fn features_group_tasks_across_repos_and_resolve_by_id_or_title() {
     );
     let other = capture_in(
         &queue,
-        "Unrelated inbox note",
+        "Unrelated held note",
         Some("notes"),
         Some("github.com/acme/notes"),
         None,
@@ -1305,6 +1313,7 @@ fn features_group_tasks_across_repos_and_resolve_by_id_or_title() {
         policy: None,
         actor: actor(),
         context_source: None,
+        hold: false,
     });
     assert!(matches!(ambiguous, Err(QueueError::Conflict(_))));
 
@@ -1411,6 +1420,117 @@ fn list_sorts_by_feature_then_project_then_updated_at() {
 }
 
 #[test]
+fn capture_defaults_to_ready_and_hold_keeps_it_out_of_the_pool() {
+    let (queue, _) = queue();
+    let ready = queue
+        .capture(CaptureRequest {
+            title: "claim me".into(),
+            body: None,
+            kind: TaskKind::Implementation,
+            priority: 0,
+            risk: RiskLevel::Low,
+            project: Some("demo".into()),
+            repo: Some("git@github.com:acme/demo.git".into()),
+            capture_path: "/tmp/demo".into(),
+            repo_relative_path: None,
+            git_root: None,
+            git_head: None,
+            agent_pool: None,
+            required_capabilities: vec![],
+            dependencies: vec![],
+            feature: None,
+            policy: None,
+            actor: actor(),
+            context_source: None,
+            hold: false,
+        })
+        .unwrap();
+    assert_eq!(ready.status, TaskStatus::Ready);
+    let created = queue
+        .events(ready.id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "task_created")
+        .unwrap();
+    assert_eq!(created.payload["status"], "ready");
+
+    let held = capture(&queue, "hold me");
+    assert_eq!(queue.get(held).unwrap().task.status, TaskStatus::Held);
+    let created = queue
+        .events(held)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "task_created")
+        .unwrap();
+    assert_eq!(created.payload["status"], "held");
+
+    let outcome = claim(&queue, "agent-a");
+    assert!(outcome.found);
+    assert_eq!(outcome.task.unwrap().task.id, ready.id);
+    assert!(!claim(&queue, "agent-b").found);
+}
+
+#[test]
+fn hold_moves_ready_or_blocked_work_back_and_ready_releases_it() {
+    let (queue, _) = queue();
+    let id = capture(&queue, "triage me");
+    make_ready(&queue, id);
+    hold(&queue, id);
+    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Held);
+    assert!(!claim(&queue, "agent-a").found);
+    let held_event = queue
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "task_held")
+        .unwrap();
+    assert_eq!(held_event.payload["from"], "ready");
+    assert_eq!(held_event.payload["to"], "held");
+
+    // A held task cannot be held again.
+    assert!(matches!(
+        queue.hold(HoldRequest {
+            task_id: id,
+            actor: actor(),
+        }),
+        Err(QueueError::InvalidTransition { .. })
+    ));
+
+    make_ready(&queue, id);
+    queue
+        .block(BlockRequest {
+            task_id: id,
+            claim_token: None,
+            actor: actor(),
+        })
+        .unwrap();
+    hold(&queue, id);
+    assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Held);
+
+    make_ready(&queue, id);
+    assert!(claim(&queue, "agent-a").found);
+    // Claimed work is owned by its lease; hold is rejected.
+    assert!(matches!(
+        queue.hold(HoldRequest {
+            task_id: id,
+            actor: actor(),
+        }),
+        Err(QueueError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
+fn held_is_the_only_spelling_of_the_held_status() {
+    assert_eq!(TaskStatus::parse("held").unwrap(), TaskStatus::Held);
+    assert!(TaskStatus::parse("inbox").is_err());
+    assert_eq!(TaskStatus::Held.as_str(), "held");
+    assert_eq!(
+        serde_json::to_value(TaskStatus::Held).unwrap(),
+        serde_json::Value::String("held".into())
+    );
+}
+
+#[test]
 fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
     let path = temp_db();
     let conn = Connection::open(&path).unwrap();
@@ -1428,7 +1548,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             public_id, title, original_capture, status, kind, priority, risk, capture_path,
             required_capabilities_json, created_at, updated_at
          ) VALUES (
-            '018f1a7e-7b6a-7c10-8000-000000000001', 'legacy', 'legacy', 'inbox',
+            '018f1a7e-7b6a-7c10-8000-000000000001', 'legacy', 'legacy', 'held',
             'implementation', 0, 'low', '/tmp', '[]', '2026-01-01T00:00:00Z',
             '2026-01-01T00:00:00Z'
          )",
@@ -1511,7 +1631,7 @@ fn tree_chain_and_diamond_keep_shared_dependencies_once() {
     assert!(chain.feature.is_none());
     assert_eq!(chain.roots[0].id, left);
     assert_eq!(chain.roots[0].title, "Write the schema");
-    assert_eq!(chain.roots[0].status, TaskStatus::Inbox);
+    assert_eq!(chain.roots[0].status, TaskStatus::Held);
     assert_eq!(chain.roots[0].depends_on[0].id, base);
     assert!(chain.roots[0].depends_on[0].depends_on.is_empty());
 

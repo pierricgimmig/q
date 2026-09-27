@@ -1,9 +1,9 @@
 use crate::model::{
     ArtifactContent, BlockRequest, CancelRequest, CaptureRequest, ClaimOutcome, ClaimRequest,
     CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest,
-    EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter, LogRequest,
-    QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest,
-    StartRequest, Task, TaskDetail, TaskSummary, TaskTree, TreeQuery,
+    EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, HoldRequest, ListFilter,
+    LogRequest, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord,
+    ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary, TaskTree, TreeQuery,
 };
 use crate::QueueError;
 
@@ -25,6 +25,9 @@ pub trait QueueService: Send + Sync {
     fn get(&self, id: i64) -> Result<TaskDetail, QueueError>;
     fn edit(&self, id: i64, request: EditRequest) -> Result<Task, QueueError>;
     fn mark_ready(&self, request: ReadyRequest) -> Result<ReadyOutcome, QueueError>;
+    /// Move a ready or blocked task back to `held` so agents cannot claim it
+    /// until a human runs `mark_ready` again.
+    fn hold(&self, request: HoldRequest) -> Result<Task, QueueError>;
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError>;
     fn cancel(&self, request: CancelRequest) -> Result<Task, QueueError>;
     /// Hard-delete a task and rows that reference it.

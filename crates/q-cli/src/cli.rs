@@ -52,6 +52,7 @@ fn is_command(word: &str) -> bool {
             | "tree"
             | "edit"
             | "ready"
+            | "hold"
             | "block"
             | "cancel"
             | "delete"
@@ -84,6 +85,9 @@ fn is_bool_flag(arg: &str) -> bool {
         arg,
         "--json"
             | "-j"
+            | "--hold"
+            | "-w"
+            | "--wait"
             | "--edit"
             | "-e"
             | "--once"
@@ -212,7 +216,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Capture a task into the inbox.
+    /// Capture a task. It is ready for agents at once unless --hold is set.
     Add {
         /// Title words. Quoted text is the usual form: q "Fix the bug".
         #[arg(required = true, num_args = 1.., value_name = "TITLE")]
@@ -250,13 +254,19 @@ pub enum Commands {
         /// Feature id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Keep the task held, out of the claimable pool, until `q ready ID`.
+        ///
+        /// Use this for work that needs a human look before an agent may
+        /// start it. `-w` and `--wait` are aliases.
+        #[arg(short = 'w', long, visible_alias = "wait")]
+        hold: bool,
     },
     /// List tasks. Done and cancelled are hidden unless --all or --status is set.
     #[command(visible_alias = "list")]
     Ls {
         /// Show only this status. Includes done or cancelled when that status is named.
         ///
-        /// Statuses: inbox, ready, claimed, in_progress, review, blocked, done, cancelled.
+        /// Statuses: held, ready, claimed, in_progress, review, blocked, done, cancelled.
         #[arg(long, value_name = "STATUS")]
         status: Option<String>,
         /// implementation, research, review, benchmark, documentation, or other.
@@ -368,7 +378,7 @@ pub enum Commands {
         #[arg(long)]
         clear_feature: bool,
     },
-    /// Move one or more tasks to ready so agents may claim them.
+    /// Move one or more tasks to ready so agents may claim them. Releases held work.
     ///
     /// Ids are processed in order. A failure on one id is reported and the
     /// rest still run; the exit status is non-zero if any id failed.
@@ -376,6 +386,11 @@ pub enum Commands {
         /// Task ids.
         #[arg(required = true, value_name = "ID", num_args = 1..)]
         ids: Vec<i64>,
+    },
+    /// Move a ready or blocked task back to held so agents cannot claim it.
+    Hold {
+        /// Task id.
+        id: i64,
     },
     /// Block a task. Claimed work also requires --claim-token.
     Block {
@@ -385,7 +400,7 @@ pub enum Commands {
         #[arg(long)]
         claim_token: Option<String>,
     },
-    /// Cancel tasks that are inbox, ready, or blocked. The rows and their history stay.
+    /// Cancel tasks that are held, ready, or blocked. The rows and their history stay.
     ///
     /// Ids are processed in order; one failure does not stop the rest.
     #[command(visible_alias = "canceled")]
@@ -497,7 +512,7 @@ pub enum Commands {
         /// Task id.
         id: i64,
     },
-    /// Reopen done work to ready, or cancelled work to inbox.
+    /// Reopen done work to ready, or cancelled work to held.
     ///
     /// Ids are processed in order; one failure does not stop the rest.
     Reopen {
@@ -675,9 +690,19 @@ mod tests {
             "/tmp/q.db".into(),
             "ls".into(),
             "--status".into(),
-            "inbox".into(),
+            "held".into(),
         ]);
-        assert_eq!(args, vec!["--db", "/tmp/q.db", "ls", "--status", "inbox"]);
+        assert_eq!(args, vec!["--db", "/tmp/q.db", "ls", "--status", "held"]);
+    }
+
+    #[test]
+    fn hold_flag_does_not_hide_the_bare_title() {
+        let args = preprocess(vec!["--hold".into(), "Risky migration".into()]);
+        assert_eq!(args, vec!["add", "--hold", "Risky migration"]);
+        let args = preprocess(vec!["-w".into(), "Risky migration".into()]);
+        assert_eq!(args, vec!["add", "-w", "Risky migration"]);
+        let args = preprocess(vec!["hold".into(), "12".into()]);
+        assert_eq!(args, vec!["hold", "12"]);
     }
 
     #[test]

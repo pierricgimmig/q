@@ -71,10 +71,11 @@ fn capture_ready_and_claim_json_stay_on_protocol_streams() {
         "--db",
         db.to_str().unwrap(),
         "--json",
+        "--hold",
         "Benchmark delta coding versus varint timestamps",
     ]));
     let created: Value = serde_json::from_slice(&captured.stdout).expect("capture json");
-    assert_eq!(created["status"], "inbox");
+    assert_eq!(created["status"], "held");
     assert_eq!(created["repo"], "github.com/acme/profiler-core");
     assert_eq!(created["project"], "profiler-core");
     assert_eq!(created["repo_relative_path"], "crates/trace");
@@ -89,7 +90,7 @@ fn capture_ready_and_claim_json_stay_on_protocol_streams() {
         "--json",
     ]));
     let detail: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(detail["status"], "inbox");
+    assert_eq!(detail["status"], "held");
     assert_eq!(
         detail["original_capture"],
         "Benchmark delta coding versus varint timestamps"
@@ -226,14 +227,14 @@ fn mcp_stdio_is_protocol_clean() {
 fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
     let db = temp_root("delete").join("queue.db");
     let db_arg = db.to_str().unwrap();
-    let captured = run(bin().args(["--db", db_arg, "--json", "Throwaway inbox task"]));
+    let captured = run(bin().args(["--db", db_arg, "--json", "-w", "Throwaway held task"]));
     let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
     let id = created["id"].as_i64().unwrap().to_string();
 
     let deleted = run(bin().args(["--db", db_arg, "delete", &id]));
     let text = String::from_utf8(deleted.stdout).unwrap();
     assert!(text.contains(&format!("deleted #{id}")), "{text}");
-    assert!(text.contains("[inbox]"), "{text}");
+    assert!(text.contains("[held]"), "{text}");
     assert!(text.contains("claims="), "{text}");
     assert!(!text.contains("reason:"), "{text}");
 
@@ -248,8 +249,8 @@ fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
 
     let captured = run(bin().args(["--db", db_arg, "--json", "Claimed work"]));
     let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
+    assert_eq!(created["status"], "ready");
     let id = created["id"].as_i64().unwrap().to_string();
-    run(bin().args(["--db", db_arg, "ready", &id]));
     run(bin().args(["--db", db_arg, "claim", "--agent", "codex-local-01"]));
     let rejected = bin()
         .args(["--db", db_arg, "delete", &id])
@@ -279,6 +280,10 @@ fn ready_cancel_reopen_and_delete_accept_several_ids_and_keep_going_on_failure()
     let second = add_task(db_arg, "Second capture", "alpha", None, None);
     let third = add_task(db_arg, "Third capture", "alpha", None, None);
     let (first, second, third) = (first.to_string(), second.to_string(), third.to_string());
+    // Captures are ready by default; hold them so `q ready` has work to release.
+    for id in [&first, &second, &third] {
+        run(bin().args(["--db", db_arg, "hold", id]));
+    }
 
     // One id keeps the single-task human line and the single-task JSON shape.
     let single = run(bin().args(["--db", db_arg, "--json", "ready", &first]));
@@ -325,9 +330,9 @@ fn ready_cancel_reopen_and_delete_accept_several_ids_and_keep_going_on_failure()
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0]["id"].as_i64().unwrap().to_string(), first);
-    assert_eq!(results[0]["status"], "inbox");
+    assert_eq!(results[0]["status"], "held");
     assert_eq!(results[1]["id"].as_i64().unwrap().to_string(), second);
-    assert_eq!(results[1]["status"], "inbox");
+    assert_eq!(results[1]["status"], "held");
     let errors = body["errors"].as_array().unwrap();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["id"].as_i64().unwrap().to_string(), third);
@@ -455,10 +460,22 @@ fn ls_hides_terminal_tasks_unless_all_or_status_and_prints_a_table() {
     run(bin()
         .current_dir(&work)
         .args(["--db", db_arg, "cancel", &cancelled.to_string()]));
-    let done = capture("Ship finished report", Some("proj-beta"));
-    run(bin()
-        .current_dir(&work)
-        .args(["--db", db_arg, "ready", &done.to_string()]));
+    // Every capture is ready, so priority decides which one the claim takes.
+    let done = {
+        let output = run(bin().current_dir(&work).args([
+            "--db",
+            db_arg,
+            "--json",
+            "--project",
+            "proj-beta",
+            "add",
+            "Ship finished report",
+            "--priority",
+            "9",
+        ]));
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        body["id"].as_i64().unwrap()
+    };
     let claimed = run(bin().current_dir(&work).args([
         "--db",
         db_arg,
@@ -971,14 +988,13 @@ fn color_flags_leave_json_and_piped_auto_plain() {
         "--json",
         "--color",
         "always",
-        "Capture a colored inbox task",
+        "Capture a colored task",
     ]));
     assert!(!captured.stdout.contains(&0x1b));
     let created: Value = serde_json::from_slice(&captured.stdout).unwrap();
     let id = created["id"].as_i64().unwrap().to_string();
     assert!(created["updated_at"].as_str().unwrap().contains('T'));
-
-    run(bin().args(["--db", db_arg, "ready", &id]));
+    assert_eq!(created["status"], "ready");
     let cancelled = run(bin().args(["--db", db_arg, "--json", "add", "Cancelled row"]));
     let cancelled: Value = serde_json::from_slice(&cancelled.stdout).unwrap();
     let cancelled_id = cancelled["id"].as_i64().unwrap().to_string();
@@ -1187,14 +1203,13 @@ fn top_once_prints_counts_table_and_changes() {
     let root = temp_root("top");
     let db = root.join("queue.db");
     let db_arg = db.to_str().unwrap();
-    let first = add_task(db_arg, "Watch me", "alpha", None, None);
-    run(bin().args(["--db", db_arg, "ready", &first.to_string()]));
+    let _first = add_task(db_arg, "Watch me", "alpha", None, None);
 
     let frame = run(bin().args(["--db", db_arg, "top", "--once"]));
     let text = String::from_utf8(frame.stdout).unwrap();
     assert!(text.starts_with("q top database: "), "{text}");
     assert!(text.contains("every 2.0s"), "{text}");
-    assert!(text.contains("inbox 0  ready 1  claimed 0"), "{text}");
+    assert!(text.contains("held 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
     assert!(
         text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED   TITLE"),
@@ -1235,7 +1250,6 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
     let db_arg = db.to_str().unwrap();
     let first = add_task(db_arg, "Finish me", "alpha", None, None);
     let second = add_task(db_arg, "Drop me", "alpha", None, None);
-    run(bin().args(["--db", db_arg, "ready", &first.to_string()]));
     let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot"]));
     let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
     let token = claim["claim"]["token"].as_str().unwrap().to_string();
@@ -1304,7 +1318,7 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
     assert!(
         change_lines
             .iter()
-            .any(|line| line.contains("#3  new      -> inbox        New arrival")),
+            .any(|line| line.contains("#3  new      -> ready        New arrival")),
         "{last}"
     );
     assert!(
@@ -1316,7 +1330,7 @@ fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {
     assert!(
         change_lines
             .iter()
-            .any(|line| line.contains("#2  inbox    -> deleted      Drop me")),
+            .any(|line| line.contains("#2  ready    -> deleted      Drop me")),
         "{last}"
     );
     let title_columns: std::collections::HashSet<usize> = change_lines
@@ -1344,8 +1358,8 @@ fn log_and_artifact_commands_keep_a_per_task_log() {
     let root = temp_root("log");
     let db = root.join("queue.db");
     let db_arg = db.to_str().unwrap();
+    // Captures are ready by default, so the task is claimable at once.
     let id = add_task(db_arg, "Write the report", "alpha", None, None);
-    run(bin().args(["--db", db_arg, "ready", &id.to_string()]));
     let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot-9"]));
     let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
     let token = claim["claim"]["token"].as_str().unwrap().to_string();
@@ -1529,7 +1543,7 @@ fn capture_confirmation_is_a_blank_line_then_one_truncated_line() {
     assert_eq!(lines.len(), 2, "{text:?}");
     assert_eq!(lines[0], "", "{text:?}");
     assert!(lines[1].starts_with("captured #"), "{text:?}");
-    assert!(lines[1].contains("[inbox] Line one line two z"), "{text:?}");
+    assert!(lines[1].contains("[ready] Line one line two z"), "{text:?}");
     assert!(lines[1].ends_with('…'), "{text:?}");
     assert!(!lines[1].contains(&"z".repeat(80)), "{text:?}");
 
@@ -1537,12 +1551,68 @@ fn capture_confirmation_is_a_blank_line_then_one_truncated_line() {
     let short = String::from_utf8(short.stdout).unwrap();
     let lines: Vec<&str> = short.lines().collect();
     assert_eq!(lines.len(), 2, "{short:?}");
-    assert!(lines[1].ends_with("[inbox] Short title"), "{short:?}");
+    assert!(lines[1].ends_with("[ready] Short title"), "{short:?}");
 
     // --json is unchanged: the full title, no confirmation line.
     let json = run(bin().args(["--db", db_arg, "--json", "add", &long_title]));
     let created: Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(created["title"].as_str().unwrap(), long_title);
+}
+
+#[test]
+fn hold_keeps_work_out_of_the_pool_until_ready() {
+    let root = temp_root("hold");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    let held = run(bin().args(["--db", db_arg, "--hold", "Risky migration"]));
+    let held_text = String::from_utf8(held.stdout).unwrap();
+    assert!(
+        held_text.contains("captured #1 [held] Risky migration"),
+        "{held_text}"
+    );
+
+    let open = run(bin().args(["--db", db_arg, "Safe cleanup"]));
+    let open_text = String::from_utf8(open.stdout).unwrap();
+    assert!(
+        open_text.contains("captured #2 [ready] Safe cleanup"),
+        "{open_text}"
+    );
+
+    // Only the ready task can be claimed.
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(claim["task"]["id"], 2);
+    let none = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot-2"]));
+    let none: Value = serde_json::from_slice(&none.stdout).unwrap();
+    assert_eq!(none["found"], false);
+
+    let listed = run(bin().args(["--db", db_arg, "--json", "ls", "--status", "held"]));
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["tasks"][0]["status"], "held");
+    let status = run(bin().args(["--db", db_arg, "--json", "status"]));
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["counts"]["held"], 1);
+
+    // ready releases held work; hold takes ready work back.
+    let released = run(bin().args(["--db", db_arg, "ready", "1"]));
+    let released = String::from_utf8(released.stdout).unwrap();
+    assert!(
+        released.contains("ready #1 [ready] Risky migration"),
+        "{released}"
+    );
+    let back = run(bin().args(["--db", db_arg, "hold", "1"]));
+    let back = String::from_utf8(back.stdout).unwrap();
+    assert!(back.contains("held #1 [held] Risky migration"), "{back}");
+    let twice = bin().args(["--db", db_arg, "hold", "1"]).output().unwrap();
+    assert!(!twice.status.success());
+
+    // Cancelled work reopens to held for another look.
+    run(bin().args(["--db", db_arg, "cancel", "1"]));
+    let reopened = run(bin().args(["--db", db_arg, "--json", "reopen", "1"]));
+    let reopened: Value = serde_json::from_slice(&reopened.stdout).unwrap();
+    assert_eq!(reopened["status"], "held");
 
     let _ = fs::remove_dir_all(root);
 }
