@@ -149,15 +149,16 @@ q reopen 184
 
 `q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
 
-Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
+Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `PROG`, `UPDATED`, `TITLE`. `PROG` is the percent complete last reported by the working agent (`q log ID --progress 40`), blank until reported, `100%` once done. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
 
 On a terminal, status is colored: `inbox` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` bright green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
 
 ```text
-ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
- 4  inbox   (none)   alpha      0  3m ago   Keep the inbox item
- 2  ready   (none)   beta       1  1h ago   Compare encodings
- 1  inbox   (none)   (none)     0  2d ago   Unassigned capture
+ID  STATUS       FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
+ 4  inbox        (none)   alpha      0        3m ago   Keep the inbox item
+ 3  in_progress  (none)   alpha      0   40%  1m ago   Port the encoder
+ 2  ready        (none)   beta       1        1h ago   Compare encodings
+ 1  inbox        (none)   (none)     0        2d ago   Unassigned capture
 ```
 
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits.
@@ -211,6 +212,7 @@ q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
   --artifact report=./docs/benchmarks/trace-encoding.md
 q release 184 --claim-token TOKEN
 q log 184 "Encoder read; the varint path is the slow one" --claim-token TOKEN
+q log 184 --progress 40 --claim-token TOKEN
 q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.md
 q log 184
 q artifact 7
@@ -233,6 +235,7 @@ If the project sets `require_pr` and the task kind is implementation, `complete`
 Every task has a log: the append-only event list. Each entry has a UTC timestamp, the event, who did it, and what changed. State changes are recorded by the queue itself (`task_created`, `task_ready`, `task_claimed` with the agent id, `task_started`, `task_completed`, and so on, each with the `from -> to` move). Agents add their own entries while they work:
 
 - `q log ID "message" --claim-token TOKEN` appends a `task_note`. The token attributes the note to the claiming agent; a human runs it without a token and is recorded by `$USER`.
+- `q log ID --progress 40 --claim-token TOKEN` reports percent complete, alone or with a message. It is stored on the task, shown in the `PROG` column of `q ls` and `q top`, and appears in the `q top` change list as `[in_progress 40%]`. Completion sets it to `100%`; `q reopen` clears it.
 - `q log ID --artifact kind=value` records a reference such as a PR URL or a path. `--attach [KIND=]PATH` reads a file and stores its text in the database (kind defaults to `report`), so a Markdown or HTML report survives even if the file goes away. Both work on `q complete` too.
 - `q log ID` with nothing to add prints the log, oldest first. `q events ID` is the same list.
 - `q show ID` lists artifacts with their ids and the stored size. `q artifact ARTIFACT_ID` prints the stored content; `--json` returns the artifact with `content`.
@@ -301,7 +304,7 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_start` | Mark a claim in progress and record branch or worktree. |
 | `queue_block` | Block claimed work. Requires the claim token. |
 | `queue_complete` | Complete or send to review, with summary and artifacts. |
-| `queue_log` | Append a note and/or artifacts to a task's log. Artifacts may carry `content` to store in the database. |
+| `queue_log` | Append a note, a `progress` percent, and/or artifacts to a task's log. Artifacts may carry `content` to store in the database. |
 | `queue_artifact` | Fetch one artifact by id with its stored content. |
 | `queue_release` | Return a claim to ready. Requires the claim token. |
 | `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |

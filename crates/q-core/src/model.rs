@@ -285,6 +285,10 @@ pub struct Task {
     pub kind: TaskKind,
     pub priority: i32,
     pub risk: RiskLevel,
+    /// Percent complete, 0 to 100, as last reported by the working agent.
+    /// Set to 100 on completion and cleared on reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,6 +326,9 @@ pub struct TaskSummary {
     pub kind: TaskKind,
     pub priority: i32,
     pub risk: RiskLevel,
+    /// Percent complete as last reported. See [`Task::progress`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -436,12 +443,14 @@ impl ArtifactInput {
     }
 }
 
-/// Append to a task's log: a timestamped note, artifacts, or both.
+/// Append to a task's log: a timestamped note, a progress report,
+/// artifacts, or any mix.
 ///
 /// With `claim_token`, the token must match the task's active claim and the
 /// entry is attributed to that claim's agent. Without a token the entry is
-/// attributed to `actor`. At least one of `message` and `artifacts` is
-/// required.
+/// attributed to `actor`. At least one of `message`, `progress`, and
+/// `artifacts` is required. `progress` is a percent, 0 to 100, stored on the
+/// task so lists can show how far along in-progress work is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRequest {
     pub task_id: i64,
@@ -449,6 +458,8 @@ pub struct LogRequest {
     pub claim_token: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub progress: Option<u8>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactInput>,
     pub actor: Actor,
@@ -902,6 +913,7 @@ mod tests {
             kind: TaskKind::Benchmark,
             priority: 10,
             risk: RiskLevel::Low,
+            progress: None,
             project: Some("profiler-core".into()),
             repo: Some("github.com/acme/profiler-core".into()),
             capture_path: "/tmp/profiler-core/crates/trace".into(),

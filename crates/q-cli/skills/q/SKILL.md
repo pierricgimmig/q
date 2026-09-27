@@ -14,6 +14,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 - A human must run `q ready ID` (or several at once: `q ready 11 12 13`) before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
+- Report progress as you pass milestones: `q log ID --progress 40 --claim-token TOKEN` (MCP `queue_log` with `progress`), optionally with a message. Use your honest estimate of percent complete; humans watch it in `q top` and `q ls`. Do not report 100; completing the task sets that.
 - `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason. Claim tokens are still required for claimed work.
 - `q ready`, `q cancel`, `q reopen`, and `q delete` accept one or more ids, processed in order. One failing id is reported and the rest still run; the exit status is non-zero if any failed. With `--json`, one id prints the usual single-task document and several ids print `{"results":[...],"errors":[{"id":..,"error":..}]}`.
@@ -44,6 +45,7 @@ q heartbeat 184 --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" --artifact report=./docs/benchmarks/trace-encoding.md
 q log 184 "Encoder read; varint path is the slow one" --claim-token TOKEN
+q log 184 --progress 40 --claim-token TOKEN
 q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.md --artifact pr=https://github.com/acme/x/pull/7
 q log 184
 q artifact 7
@@ -76,7 +78,7 @@ q edit 12 --clear-feature
 - `queue_start` — mark a claim in progress and record a branch or worktree
 - `queue_block` — block claimed work with the claim token
 - `queue_complete` — complete or send to review, with a summary and artifacts
-- `queue_log` — append a note and/or artifacts to the task log; pass `claim_token` so the entry carries your agent id. An artifact `{kind, value, content}` stores `content` in the database
+- `queue_log` — append a note, a `progress` percent (0 to 100), and/or artifacts to the task log; pass `claim_token` so the entry carries your agent id. An artifact `{kind, value, content}` stores `content` in the database
 - `queue_artifact` — fetch one artifact by `artifact_id` with its stored content
 - `queue_release` — return a claim to ready with the claim token
 - `queue_delete` — hard-delete a task (`task_id`, optional `force`). Unlike cancel, the row and its events are removed.

@@ -34,7 +34,7 @@ SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_captur
 tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.capture_path, \
 tasks.repo_relative_path, tasks.git_root, tasks.git_head, tasks.agent_pool, \
 tasks.required_capabilities_json, tasks.blocked_reason, tasks.created_at, tasks.updated_at, \
-tasks.feature_id, features.title \
+tasks.feature_id, features.title, tasks.progress \
 FROM tasks \
 LEFT JOIN features ON features.id = tasks.feature_id";
 
@@ -216,6 +216,7 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         kind: parse_kind(6, &kind)?,
         priority: row.get(7)?,
         risk: parse_risk(8, &risk)?,
+        progress: progress_from(row.get::<_, Option<i64>>(22)?),
         project: row.get(9)?,
         repo: row.get(10)?,
         capture_path: row.get(11)?,
@@ -231,6 +232,26 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: parse_time(18, &created_at)?,
         updated_at: parse_time(19, &updated_at)?,
     })
+}
+
+/// A stored percent, clamped to 0..=100.
+fn progress_from(value: Option<i64>) -> Option<u8> {
+    value.map(|percent| percent.clamp(0, 100) as u8)
+}
+
+/// Store a progress percent (or clear it) and bump `updated_at`.
+fn set_progress(
+    conn: &Connection,
+    id: i64,
+    progress: Option<u8>,
+    now: &str,
+) -> Result<(), QueueError> {
+    conn.execute(
+        "UPDATE tasks SET progress = ?, updated_at = ? WHERE id = ?",
+        params![progress.map(i64::from), now, id],
+    )
+    .db()?;
+    Ok(())
 }
 
 fn parse_uuid(idx: usize, value: &str) -> rusqlite::Result<Uuid> {
@@ -1140,7 +1161,8 @@ impl QueueService for Queue {
             .prepare(
                 "SELECT tasks.id, tasks.public_id, tasks.title, tasks.status, tasks.kind, \
                  tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.agent_pool, \
-                 tasks.created_at, tasks.updated_at, tasks.feature_id, features.title \
+                 tasks.created_at, tasks.updated_at, tasks.feature_id, features.title, \
+                 tasks.progress \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
                  WHERE ((?1 IS NOT NULL AND tasks.status = ?1) \
@@ -1197,6 +1219,7 @@ impl QueueService for Queue {
                         kind: parse_kind(4, &kind)?,
                         priority: row.get(5)?,
                         risk: parse_risk(6, &risk)?,
+                        progress: progress_from(row.get::<_, Option<i64>>(14)?),
                         project: row.get(7)?,
                         repo: row.get(8)?,
                         agent_pool: row.get(9)?,
@@ -1757,10 +1780,16 @@ impl QueueService for Queue {
             ensure_transition(status, target)?;
             set_status(&tx, task.id, status, target, &now)?;
             retire_claim(&tx, claim.id, &now)?;
+            if target == TaskStatus::Done {
+                set_progress(&tx, task.id, Some(100), &now)?;
+            }
             Actor::agent(claim.agent_id)
         } else if task.status == TaskStatus::Review {
             ensure_transition(task.status, target)?;
             set_status(&tx, task.id, task.status, target, &now)?;
+            if target == TaskStatus::Done {
+                set_progress(&tx, task.id, Some(100), &now)?;
+            }
             request.actor.clone()
         } else {
             return Err(QueueError::InvalidTransition {
@@ -1837,9 +1866,16 @@ impl QueueService for Queue {
             .as_deref()
             .map(str::trim)
             .filter(|text| !text.is_empty());
-        if message.is_none() && request.artifacts.is_empty() {
+        if let Some(percent) = request.progress {
+            if percent > 100 {
+                return Err(QueueError::InvalidInput(
+                    "progress is a percent from 0 to 100".into(),
+                ));
+            }
+        }
+        if message.is_none() && request.progress.is_none() && request.artifacts.is_empty() {
             return Err(QueueError::InvalidInput(
-                "log needs a message or at least one artifact".into(),
+                "log needs a message, a progress percent, or at least one artifact".into(),
             ));
         }
         let mut conn = open_connection(&self.path)?;
@@ -1859,13 +1895,23 @@ impl QueueService for Queue {
         for artifact in &request.artifacts {
             artifact_ids.push(insert_artifact(&tx, task.id, artifact, &actor, &now)?);
         }
-        if let Some(message) = message {
+        if let Some(percent) = request.progress {
+            set_progress(&tx, task.id, Some(percent), &now)?;
+        }
+        if message.is_some() || request.progress.is_some() {
+            let mut payload = json!({"artifact_ids": artifact_ids});
+            if let Some(message) = message {
+                payload["message"] = json!(message);
+            }
+            if let Some(percent) = request.progress {
+                payload["progress"] = json!(percent);
+            }
             insert_event(
                 &tx,
                 Some(task.id),
                 q_core::NOTE_EVENT,
                 &actor,
-                json!({"message": message, "artifact_ids": artifact_ids}),
+                payload,
                 &now,
             )?;
         }
@@ -1953,6 +1999,7 @@ impl QueueService for Queue {
         };
         ensure_transition(task.status, to)?;
         set_status(&tx, task.id, task.status, to, &now)?;
+        set_progress(&tx, task.id, None, &now)?;
         if to == TaskStatus::Inbox {
             tx.execute(
                 "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
