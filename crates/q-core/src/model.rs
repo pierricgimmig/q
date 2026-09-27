@@ -411,7 +411,7 @@ pub struct Artifact {
     /// Bytes of content stored in the database, when the artifact was
     /// published inline (for example a Markdown or HTML report). `None` when
     /// the artifact is only a reference such as a URL or path. Fetch the
-    /// text with [`QueueService::artifact`].
+    /// text with [`crate::QueueService::artifact`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_bytes: Option<u64>,
     #[serde(with = "ts")]
@@ -470,7 +470,7 @@ pub struct LogRequest {
     pub actor: Actor,
 }
 
-/// Event type written by [`QueueService::log`] for a note.
+/// Event type written by [`crate::QueueService::log`] for a note.
 pub const NOTE_EVENT: &str = "task_note";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
