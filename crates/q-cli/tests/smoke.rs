@@ -272,6 +272,103 @@ fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
 }
 
 #[test]
+fn ready_cancel_reopen_and_delete_accept_several_ids_and_keep_going_on_failure() {
+    let db = temp_root("multi").join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let first = add_task(db_arg, "First capture", "alpha", None, None);
+    let second = add_task(db_arg, "Second capture", "alpha", None, None);
+    let third = add_task(db_arg, "Third capture", "alpha", None, None);
+    let (first, second, third) = (first.to_string(), second.to_string(), third.to_string());
+
+    // One id keeps the single-task human line and the single-task JSON shape.
+    let single = run(bin().args(["--db", db_arg, "--json", "ready", &first]));
+    let body: Value = serde_json::from_slice(&single.stdout).unwrap();
+    assert_eq!(body["task"]["id"].as_i64().unwrap().to_string(), first);
+    assert_eq!(body["task"]["status"], "ready");
+    assert!(body["warnings"].is_array());
+    assert!(body.get("results").is_none());
+
+    // Several ids print one confirmation per task, in order.
+    let many = run(bin().args(["--db", db_arg, "ready", &second, &third]));
+    let text = String::from_utf8(many.stdout).unwrap();
+    let second_line = text.find(&format!("ready #{second}")).expect(&text);
+    let third_line = text.find(&format!("ready #{third}")).expect(&text);
+    assert!(second_line < third_line, "{text}");
+    assert_eq!(text.matches("[ready]").count(), 2, "{text}");
+
+    // A failing id is reported and the others still change; exit is non-zero.
+    let mixed = bin()
+        .args(["--db", db_arg, "cancel", &first, "999", &second])
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
+    let stdout = String::from_utf8(mixed.stdout).unwrap();
+    let stderr = String::from_utf8(mixed.stderr).unwrap();
+    assert!(stdout.contains(&format!("cancelled #{first}")), "{stdout}");
+    assert!(stdout.contains(&format!("cancelled #{second}")), "{stdout}");
+    assert!(stderr.contains("#999"), "{stderr}");
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(stderr.contains("1 of 3 tasks failed"), "{stderr}");
+    for id in [&first, &second] {
+        let shown = run(bin().args(["--db", db_arg, "show", id, "--json"]));
+        let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert_eq!(shown["status"], "cancelled", "task {id}");
+    }
+
+    // With --json and several ids, one document lists results and errors.
+    let mixed = bin()
+        .args(["--db", db_arg, "--json", "reopen", &first, &third, &second])
+        .output()
+        .unwrap();
+    assert!(!mixed.status.success());
+    let body: Value = serde_json::from_slice(&mixed.stdout).expect("stdout must be json only");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["id"].as_i64().unwrap().to_string(), first);
+    assert_eq!(results[0]["status"], "inbox");
+    assert_eq!(results[1]["id"].as_i64().unwrap().to_string(), second);
+    assert_eq!(results[1]["status"], "inbox");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["id"].as_i64().unwrap().to_string(), third);
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("status is ready"),
+        "{body}"
+    );
+    let stderr = String::from_utf8(mixed.stderr).unwrap();
+    assert!(stderr.contains("1 of 3 tasks failed"), "{stderr}");
+
+    // All ids succeeding exits zero and reports no errors.
+    let all = run(bin().args(["--db", db_arg, "--json", "delete", &first, &second, &third]));
+    let body: Value = serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(body["results"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        body["results"][2]["task_id"].as_i64().unwrap().to_string(),
+        third
+    );
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0);
+    let listed = run(bin().args(["--db", db_arg, "ls", "-a"]));
+    assert!(String::from_utf8(listed.stdout)
+        .unwrap()
+        .contains("no tasks"));
+
+    // A single failing id is still a plain error with nothing on stdout.
+    let missing = bin()
+        .args(["--db", db_arg, "--json", "ready", &first])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    let stderr = String::from_utf8(missing.stderr).unwrap();
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(!stderr.contains("tasks failed"), "{stderr}");
+    let _ = fs::remove_dir_all(db.parent().unwrap());
+}
+
+#[test]
 fn skill_prints_frontmatter_and_install_help() {
     let home = temp_root("skill-home");
     let db = temp_root("skill-db").join("queue.db");

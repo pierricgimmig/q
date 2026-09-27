@@ -367,10 +367,14 @@ pub enum Commands {
         #[arg(long)]
         clear_feature: bool,
     },
-    /// Move a task to ready so agents may claim it.
+    /// Move one or more tasks to ready so agents may claim them.
+    ///
+    /// Ids are processed in order. A failure on one id is reported and the
+    /// rest still run; the exit status is non-zero if any id failed.
     Ready {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
     },
     /// Block a task. Claimed work also requires --claim-token.
     Block {
@@ -380,20 +384,25 @@ pub enum Commands {
         #[arg(long)]
         claim_token: Option<String>,
     },
-    /// Cancel a task that is inbox, ready, or blocked. The row and its history stay.
+    /// Cancel tasks that are inbox, ready, or blocked. The rows and their history stay.
+    ///
+    /// Ids are processed in order; one failure does not stop the rest.
     #[command(visible_alias = "canceled")]
     Cancel {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
     },
-    /// Hard-delete a task and its claims, events, artifacts, and dependency rows.
+    /// Hard-delete tasks and their claims, events, artifacts, and dependency rows.
     ///
     /// Unlike cancel, nothing remains in the queue database. Events cascade with
     /// the task and are not retained. An unexpired claim requires --force.
+    /// Ids are processed in order; one failure does not stop the rest.
     #[command(visible_alias = "rm")]
     Delete {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
         /// Delete even when an unexpired claim is held. Clears that claim in the same transaction.
         #[arg(long)]
         force: bool,
@@ -488,9 +497,12 @@ pub enum Commands {
         id: i64,
     },
     /// Reopen done work to ready, or cancelled work to inbox.
+    ///
+    /// Ids are processed in order; one failure does not stop the rest.
     Reopen {
-        /// Task id.
-        id: i64,
+        /// Task ids.
+        #[arg(required = true, value_name = "ID", num_args = 1..)]
+        ids: Vec<i64>,
     },
     /// Append a note or artifacts to a task's log, or print the log.
     ///
@@ -770,8 +782,8 @@ mod tests {
         }
         let removed = Cli::try_parse_from(["q", "rm", "9", "--force"]).unwrap();
         match removed.command {
-            Commands::Delete { id, force } => {
-                assert_eq!(id, 9);
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![9]);
                 assert!(force);
             }
             other => panic!("unexpected {other:?}"),
@@ -780,10 +792,66 @@ mod tests {
             Cli::try_parse_from(["q", "recover"]).unwrap().command,
             Commands::RecoverStale { .. }
         ));
-        assert!(matches!(
-            Cli::try_parse_from(["q", "canceled", "3"]).unwrap().command,
-            Commands::Cancel { id: 3 }
-        ));
+        match Cli::try_parse_from(["q", "canceled", "3"]).unwrap().command {
+            Commands::Cancel { ids } => assert_eq!(ids, vec![3]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_commands_accept_one_or_more_ids() {
+        match Cli::try_parse_from(["q", "ready", "11", "12", "13"])
+            .unwrap()
+            .command
+        {
+            Commands::Ready { ids } => assert_eq!(ids, vec![11, 12, 13]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "ready", "11"]).unwrap().command {
+            Commands::Ready { ids } => assert_eq!(ids, vec![11]),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["q", "ready"]).is_err());
+        assert!(Cli::try_parse_from(["q", "ready", "11", "twelve"]).is_err());
+
+        match Cli::try_parse_from(["q", "cancel", "4", "5"])
+            .unwrap()
+            .command
+        {
+            Commands::Cancel { ids } => assert_eq!(ids, vec![4, 5]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "reopen", "6", "7"])
+            .unwrap()
+            .command
+        {
+            Commands::Reopen { ids } => assert_eq!(ids, vec![6, 7]),
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "delete", "8", "9", "--force"])
+            .unwrap()
+            .command
+        {
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![8, 9]);
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match Cli::try_parse_from(["q", "delete", "--force", "8", "9"])
+            .unwrap()
+            .command
+        {
+            Commands::Delete { ids, force } => {
+                assert_eq!(ids, vec![8, 9]);
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            preprocess(vec!["ready".into(), "11".into(), "12".into(), "13".into()]),
+            vec!["ready", "11", "12", "13"]
+        );
     }
 
     #[test]
