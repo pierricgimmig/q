@@ -10,6 +10,7 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 ## Rules
 
 - Capture creates an **inbox** task. Inbox work is never claimable.
+- After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json`; with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
 - A human must run `q ready ID` before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, and release.
 - `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
@@ -32,6 +33,7 @@ q "Benchmark trace encoding variants"
 q ls
 q ls --all
 q ls --status inbox
+q top
 q show 184
 q tree 184
 q tree --feature "Cross-repo rollout"
@@ -49,7 +51,7 @@ q ls --feature "Cross-repo rollout"
 q edit 12 --clear-feature
 ```
 
-`q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` (`-a`) includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The human table has feature, project, priority, and a relative `UPDATED` time, and it is colored on a terminal. Prefer `q --json` (`-j`) when reading tasks: JSON timestamps stay absolute and are never colored. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update. `q done` is `q complete`. `q rm` is `q delete`. `q recover` is `q recover-stale`.
+`q top` redraws counts, the table, and recent changes every two seconds until Ctrl-C; it is for humans watching the queue, not for agents. `q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` (`-a`) includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The human table has feature, project, priority, and a relative `UPDATED` time, and it is colored on a terminal. Prefer `q --json` (`-j`) when reading tasks: JSON timestamps stay absolute and are never colored. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update. `q done` is `q complete`. `q rm` is `q delete`. `q recover` is `q recover-stale`.
 
 `q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready.
 

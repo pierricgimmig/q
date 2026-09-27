@@ -81,7 +81,11 @@ q -C ~/src/agent-orchestrator "Add stale-job recovery"
 q --repo github.com/acme/agent-orchestrator "Add stale-job recovery"
 q --project agent-orchestrator "Add stale-job recovery"
 q add --feature "Cross-repo rollout" "Add the migration"
+q "Write the parser" --body-file task.md
+q -e "Write the parser"
 ```
+
+`--body` and `--body-file` set the Markdown body at capture. `-e` (`--edit`) opens `$VISUAL` or `$EDITOR` on it first, seeded with that text or, when neither is given, with a template of the recommended sections (Goal, Repository / target, Scope, Deliverable, Acceptance criteria, Constraints / do not do, Dependencies). A body left blank is stored as no body. `--edit` is an error when no editor is set.
 
 Discovery precedence:
 
@@ -130,13 +134,15 @@ q ls --status cancelled
 q show 184
 q tree 184
 q edit 184 --body-file task.md
+q edit 184
+q edit 184 --priority 2 -e
 q ready 184
 q block 184
 q cancel 184
 q delete 184
 ```
 
-`q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
+`q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
 
 Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
 
@@ -152,6 +158,17 @@ ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
 `q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body. Recommended sections (Goal, Scope, Deliverable, Acceptance criteria, Repository/target, Constraints, and Dependencies) are warnings only and do not block the transition. The original capture text is kept after later edits.
 
 `q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
+
+## Watching the queue
+
+```bash
+q top
+q top -i 5 -a
+q top --feature "Cross-repo rollout"
+q top --once
+```
+
+`q top` redraws the queue counts, the task table, and a list of recent changes every two seconds until Ctrl-C. `-i` (`--interval`) sets the seconds between refreshes. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `-a`, and `-n`, default 30 rows). Recent changes are noticed between refreshes: a task added, a status move such as `[claimed] -> [done]`, or a deletion, newest first, up to ten. The last frame stays on screen after Ctrl-C. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes. `--json` is not supported; use `q ls --json` or `q status --json`.
 
 ## Dependency tree
 
