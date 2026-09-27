@@ -146,7 +146,7 @@ q delete 184
 
 Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `UPDATED`, `TITLE`. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
 
-On a terminal, status is colored: `inbox` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` dim green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
+On a terminal, status is colored: `inbox` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` bright green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
 
 ```text
 ID  STATUS  FEATURE  PROJECT  PRI  UPDATED  TITLE
@@ -168,7 +168,7 @@ q top --feature "Cross-repo rollout"
 q top --once
 ```
 
-`q top` redraws the queue counts, the task table, and a list of recent changes every two seconds until Ctrl-C. `-i` (`--interval`) sets the seconds between refreshes. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `-a`, and `-n`, default 30 rows). Recent changes are noticed between refreshes: a task added, a status move such as `[claimed] -> [done]`, or a deletion, newest first, up to ten. The last frame stays on screen after Ctrl-C. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes. `--json` is not supported; use `q ls --json` or `q status --json`.
+`q top` redraws the queue counts, the task table, and a list of recent changes every two seconds until Ctrl-C. `-i` (`--interval`) sets the seconds between refreshes. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `-a`, and `-n`, default 30 rows). Recent changes are noticed between refreshes and listed newest first, up to ten, in aligned columns: time, id, the status before, the status after, and the title. A task seen for the first time comes from `new`, and a deleted task goes to `deleted`. The last frame stays on screen after Ctrl-C. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes. `--json` is not supported; use `q ls --json` or `q status --json`.
 
 ## Dependency tree
 

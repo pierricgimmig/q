@@ -96,9 +96,7 @@ pub fn status_style(status: &str) -> Style {
         "in_progress" => Style::new().fg_color(Some(AnsiColor::Cyan.into())),
         "review" => Style::new().fg_color(Some(AnsiColor::Magenta.into())),
         "blocked" => Style::new().bold().fg_color(Some(AnsiColor::Red.into())),
-        "done" => Style::new()
-            .dimmed()
-            .fg_color(Some(AnsiColor::Green.into())),
+        "done" => Style::new().fg_color(Some(AnsiColor::BrightGreen.into())),
         "cancelled" => Style::new()
             .dimmed()
             .strikethrough()
@@ -218,6 +216,8 @@ mod tests {
         }
         assert!(Paint::color().status("ready").contains("32"));
         assert!(Paint::color().status("blocked").contains("31"));
+        assert!(Paint::color().status("done").contains("92"));
+        assert!(!Paint::color().status("done").contains("[2m"));
         assert!(Paint::color().status("cancelled").contains('9'));
         assert_eq!(Paint::color().status("not-a-status"), "not-a-status");
     }
