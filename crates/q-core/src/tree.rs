@@ -228,7 +228,7 @@ mod tests {
         let tasks = vec![
             task(1, TaskStatus::Done, None),
             task(2, TaskStatus::Ready, None),
-            task(3, TaskStatus::Inbox, None),
+            task(3, TaskStatus::Held, None),
         ];
         let edges = vec![(3, 2), (2, 1)];
         let tree = build_task_tree(&tasks, &edges, 3).unwrap();
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(tree.roots.len(), 1);
         let root = &tree.roots[0];
         assert_eq!(root.id, 3);
-        assert_eq!(root.status, TaskStatus::Inbox);
+        assert_eq!(root.status, TaskStatus::Held);
         assert_eq!(ids(&root.depends_on), vec![2]);
         assert_eq!(root.depends_on[0].status, TaskStatus::Ready);
         assert_eq!(ids(&root.depends_on[0].depends_on), vec![1]);
@@ -248,9 +248,9 @@ mod tests {
     #[test]
     fn diamond_expands_a_shared_dependency_once() {
         let tasks = vec![
-            task(1, TaskStatus::Inbox, None),
-            task(2, TaskStatus::Inbox, None),
-            task(3, TaskStatus::Inbox, None),
+            task(1, TaskStatus::Held, None),
+            task(2, TaskStatus::Held, None),
+            task(3, TaskStatus::Held, None),
             task(4, TaskStatus::Done, None),
         ];
         let edges = vec![(1, 2), (1, 3), (2, 4), (3, 4)];
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn cycle_stops_without_looping() {
         let tasks = vec![
-            task(1, TaskStatus::Inbox, None),
+            task(1, TaskStatus::Held, None),
             task(2, TaskStatus::Blocked, None),
         ];
         let edges = vec![(1, 2), (2, 1), (1, 1)];
@@ -306,17 +306,17 @@ mod tests {
         shared.title = "Shared schema".into();
         shared.project = Some("db".into());
         shared.feature = Some("Other".into());
-        let mut leaf = task(2, TaskStatus::Inbox, Some(7));
+        let mut leaf = task(2, TaskStatus::Held, Some(7));
         leaf.title = "Add the types".into();
         let mut mid = task(3, TaskStatus::Ready, Some(7));
         mid.title = "Write the schema".into();
-        let mut top = task(4, TaskStatus::Inbox, Some(7));
+        let mut top = task(4, TaskStatus::Held, Some(7));
         top.title = "Ship the rollout".into();
         top.project = Some("api".into());
-        let mut notes = task(5, TaskStatus::Inbox, Some(7));
+        let mut notes = task(5, TaskStatus::Held, Some(7));
         notes.title = "Write the notes".into();
         notes.project = Some("web".into());
-        let mut outsider = task(9, TaskStatus::Inbox, Some(8));
+        let mut outsider = task(9, TaskStatus::Held, Some(8));
         outsider.title = "Ignore me".into();
 
         let tasks = vec![shared, leaf, mid, top, notes, outsider];
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn empty_feature_is_an_empty_forest() {
-        let tasks = vec![task(1, TaskStatus::Inbox, Some(2))];
+        let tasks = vec![task(1, TaskStatus::Held, Some(2))];
         let tree = build_feature_forest(&tasks, &[], 4, "Empty");
         assert!(tree.roots.is_empty());
         assert_eq!(tree.feature.unwrap().id, 4);
@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn feature_cycle_is_still_shown() {
         let tasks = vec![
-            task(1, TaskStatus::Inbox, Some(3)),
-            task(2, TaskStatus::Inbox, Some(3)),
+            task(1, TaskStatus::Held, Some(3)),
+            task(2, TaskStatus::Held, Some(3)),
         ];
         let edges = vec![(1, 2), (2, 1)];
         let tree = build_feature_forest(&tasks, &edges, 3, "Loop");
@@ -370,12 +370,12 @@ mod tests {
 
     #[test]
     fn json_omits_unset_feature_and_false_flags() {
-        let tasks = vec![task(1, TaskStatus::Inbox, None)];
+        let tasks = vec![task(1, TaskStatus::Held, None)];
         let tree = build_task_tree(&tasks, &[], 1).unwrap();
         let value = serde_json::to_value(&tree).unwrap();
         assert!(value.get("feature").is_none());
         assert_eq!(value["roots"][0]["id"], 1);
-        assert_eq!(value["roots"][0]["status"], "inbox");
+        assert_eq!(value["roots"][0]["status"], "held");
         assert!(value["roots"][0].get("external").is_none());
         assert!(value["roots"][0].get("already_shown").is_none());
         assert!(value["roots"][0]["depends_on"]

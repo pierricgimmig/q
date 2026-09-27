@@ -81,7 +81,7 @@ impl Session {
                         "protocolVersion": version,
                         "capabilities": { "tools": { "listChanged": false } },
                         "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                        "instructions": "Local queue. Inbox tasks cannot be claimed until marked ready. High and external-action risk are excluded from default claims."
+                        "instructions": "Local queue. Captured tasks are ready and claimable at once unless captured with hold, which keeps them held until a human marks them ready. High and external-action risk are excluded from default claims."
                     }),
                 ))
             }
@@ -219,6 +219,7 @@ fn queue_capture(
             "dependencies",
             "agent_pool",
             "feature",
+            "hold",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -263,6 +264,7 @@ fn queue_capture(
         context_source: serde_json::to_value(context.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
+        hold: optional_bool(args, "hold")?,
     })?;
     serde_json::to_value(task).map_err(|err| ToolFailure::Invalid(err.to_string()))
 }
@@ -735,13 +737,17 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "queue_capture",
-            "Capture an inbox task. Inbox work is never claimable until a human marks it ready.",
+            "Capture a task. It is ready and claimable at once unless hold is true, which keeps it held until a human runs q ready.",
             json!({
                 "type": "object",
                 "required": ["title"],
                 "properties": {
                     "title": {"type": "string"},
                     "body": {"type": "string"},
+                    "hold": {
+                        "type": "boolean",
+                        "description": "Create the task as held instead of ready. Held work is never claimable until a human marks it ready. Defaults to false."
+                    },
                     "repo": {"type": "string"},
                     "project": {"type": "string"},
                     "capture_path": {"type": "string"},
@@ -765,7 +771,10 @@ fn tool_definitions() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "description": "held, ready, claimed, in_progress, review, blocked, done, or cancelled."
+                    },
                     "project": {"type": "string"},
                     "repo": {"type": "string"},
                     "kind": {"type": "string"},
@@ -1131,13 +1140,8 @@ mod tests {
             2,
             json!({"name": "queue_capture", "arguments": {"title": "log me"}}),
         );
+        // Captures are ready by default, so the task is claimable at once.
         let id = tool_body(&captured)["id"].as_i64().unwrap();
-        queue
-            .mark_ready(q_core::ReadyRequest {
-                task_id: id,
-                actor: Actor::human(None),
-            })
-            .unwrap();
         let claimed = call(
             &mut session,
             &queue,
@@ -1268,7 +1272,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("reason"));
-        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Inbox);
+        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
 
         let deleted = call(
             &mut session,
@@ -1280,7 +1284,7 @@ mod tests {
         assert_eq!(deleted["result"]["isError"], false);
         let body = tool_body(&deleted);
         assert_eq!(body["task_id"], id);
-        assert_eq!(body["status"], "inbox");
+        assert_eq!(body["status"], "ready");
         assert!(body.get("reason").is_none());
         assert_eq!(body["active_claim_cleared"], false);
         assert!(matches!(queue.get(id), Err(QueueError::NotFound(_))));
@@ -1305,6 +1309,7 @@ mod tests {
                 policy: None,
                 actor: Actor::agent("mcp"),
                 context_source: None,
+                hold: true,
             })
             .unwrap();
         queue
@@ -1632,5 +1637,76 @@ mod tests {
             .iter()
             .map(|task| task["id"].as_i64().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn capture_is_ready_by_default_and_hold_keeps_it_held() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let open = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "open work"}}),
+        ));
+        assert_eq!(open["status"], "ready");
+        let held = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "held work", "hold": true}}),
+        ));
+        assert_eq!(held["status"], "held");
+
+        let claim = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot"}}),
+        ));
+        assert_eq!(claim["task"]["id"], open["id"]);
+        let none = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-2"}}),
+        ));
+        assert_eq!(none["found"], false);
+
+        // Filtering by held returns only the held task.
+        let listed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_list", "arguments": {"status": "held"}}),
+        ));
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], held["id"]);
+        assert_eq!(tasks[0]["status"], "held");
+
+        let tools = call(&mut session, &queue, "tools/list", 7, json!({}));
+        let capture_tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "queue_capture")
+            .unwrap();
+        assert_eq!(
+            capture_tool["inputSchema"]["properties"]["hold"]["type"],
+            "boolean"
+        );
     }
 }

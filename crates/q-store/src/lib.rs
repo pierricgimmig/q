@@ -16,10 +16,10 @@ use q_core::{
     ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
     ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
     DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
-    Feature, HeartbeatRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
-    QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest,
-    RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind,
-    TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
+    Feature, HeartbeatRequest, HoldRequest, ListFilter, LogRequest, ProjectPolicy, QueueError,
+    QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord,
+    ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail,
+    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -1085,18 +1085,25 @@ impl QueueService for Queue {
         };
         let feature_id = optional_feature_id(&tx, request.feature.as_deref())?;
         let public_id = Uuid::now_v7().to_string();
+        // Captured work is claimable right away unless the caller holds it.
+        let status = if request.hold {
+            TaskStatus::Held
+        } else {
+            TaskStatus::Ready
+        };
         tx.execute(
             "INSERT INTO tasks (
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             params![
                 public_id,
                 title,
                 body,
                 original_capture,
+                status.as_str(),
                 request.kind.as_str(),
                 request.priority,
                 request.risk.as_str(),
@@ -1126,7 +1133,7 @@ impl QueueService for Queue {
             &request.actor,
             json!({
                 "title": title,
-                "status": "inbox",
+                "status": status.as_str(),
                 "kind": request.kind.as_str(),
                 "risk": request.risk.as_str(),
                 "project": project,
@@ -1425,6 +1432,32 @@ impl QueueService for Queue {
         tx.commit().db()?;
         let task = self.with_conn(|conn| load_task(conn, request.task_id))?;
         Ok(ReadyOutcome { task, warnings })
+    }
+
+    fn hold(&self, request: HoldRequest) -> Result<Task, QueueError> {
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        ensure_transition(task.status, TaskStatus::Held)?;
+        set_status(&tx, task.id, task.status, TaskStatus::Held, &now)?;
+        tx.execute(
+            "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
+            params![task.id],
+        )
+        .db()?;
+        insert_event(
+            &tx,
+            Some(task.id),
+            "task_held",
+            &request.actor,
+            json!({"from": task.status.as_str(), "to": "held"}),
+            &now,
+        )?;
+        tx.commit().db()?;
+        self.with_conn(|conn| load_task(conn, request.task_id))
     }
 
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError> {
@@ -1945,7 +1978,7 @@ impl QueueService for Queue {
         for row in rows {
             let (status, count) = row.db()?;
             match TaskStatus::parse(&status)? {
-                TaskStatus::Inbox => counts.inbox = count,
+                TaskStatus::Held => counts.held = count,
                 TaskStatus::Ready => counts.ready = count,
                 TaskStatus::Claimed => counts.claimed = count,
                 TaskStatus::InProgress => counts.in_progress = count,
@@ -1990,7 +2023,7 @@ impl QueueService for Queue {
         let task = load_task_in(&tx, id)?;
         let to = match task.status {
             TaskStatus::Done => TaskStatus::Ready,
-            TaskStatus::Cancelled => TaskStatus::Inbox,
+            TaskStatus::Cancelled => TaskStatus::Held,
             other => {
                 return Err(QueueError::InvalidInput(format!(
                     "only done or cancelled tasks can be reopened (status is {other})"
@@ -2000,7 +2033,7 @@ impl QueueService for Queue {
         ensure_transition(task.status, to)?;
         set_status(&tx, task.id, task.status, to, &now)?;
         set_progress(&tx, task.id, None, &now)?;
-        if to == TaskStatus::Inbox {
+        if to == TaskStatus::Held {
             tx.execute(
                 "UPDATE tasks SET blocked_reason = NULL WHERE id = ?",
                 params![id],

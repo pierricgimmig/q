@@ -1,6 +1,6 @@
 # q
 
-Local-first work queue for coding and research agents. Capture an idea in one command, keep it in an inbox until a person marks it ready, then let an idle agent claim it through the CLI or an MCP server on stdio.
+Local-first work queue for coding and research agents. Capture a task in one command and it is ready for an idle agent to claim through the CLI or an MCP server on stdio. Capture it with `--hold` instead to keep it held until a person marks it ready.
 
 `q` is one binary. The human CLI and `q mcp` call the same service API. SQLite is the only store, and the only SQL lives in the store crate. To share one queue across machines, run `q serve` where the database lives and point every CLI and MCP client at it with `--server`.
 
@@ -72,10 +72,11 @@ The wire format is `POST /v1/<method>` with the request as JSON and the result a
 
 ## Capture and discovery
 
-A bare title is shorthand for `q add` and always lands in **inbox**. Inbox tasks are never claimable.
+A bare title is shorthand for `q add`. A captured task lands in **ready** and an idle agent may claim it at once. Add `--hold` (short `-w`, alias `--wait`) to land it in **held** instead: held tasks are never claimable until a person runs `q ready ID`. Use `--hold` for work that needs a human look first, such as a risky migration or an idea that is not yet specified.
 
 ```bash
 q "Benchmark trace encoding variants"
+q --hold "Rewrite the auth flow"
 q "Compare KV-cache quantization approaches" --kind research
 q -C ~/src/agent-orchestrator "Add stale-job recovery"
 q --repo github.com/acme/agent-orchestrator "Add stale-job recovery"
@@ -85,7 +86,7 @@ q "Write the parser" --body-file task.md
 q -e "Write the parser"
 ```
 
-Without `--json`, capture prints a blank line and then exactly one confirmation line: `captured #184 [inbox] Benchmark trace encoding variants`. The title is collapsed to one line and, like `q ls`, truncated with an ellipsis after 64 characters. `--json` prints the full task instead.
+Without `--json`, capture prints a blank line and then exactly one confirmation line: `captured #184 [ready] Benchmark trace encoding variants`. The title is collapsed to one line and, like `q ls`, truncated with an ellipsis after 64 characters. `--json` prints the full task instead.
 
 `--body` and `--body-file` set the Markdown body at capture. `-e` (`--edit`) opens `$VISUAL` or `$EDITOR` on it first, seeded with that text or, when neither is given, with a template of suggested sections (Goal, Repository / target, Scope, Deliverable, Acceptance criteria, Constraints / do not do, Dependencies). None of them are required. A body left blank is stored as no body. `--edit` is an error when no editor is set.
 
@@ -131,13 +132,14 @@ q feature delete 1
 ```bash
 q ls
 q ls -a
-q ls --status inbox
+q ls --status held
 q ls --status cancelled
 q show 184
 q tree 184
 q edit 184 --body-file task.md
 q edit 184
 q edit 184 --priority 2 -e
+q hold 184
 q ready 184
 q ready 11 12 13
 q block 184
@@ -147,25 +149,25 @@ q delete 184
 q reopen 184
 ```
 
-`q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. `-n` sets the row limit (default 100).
+`q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. Statuses are `held`, `ready`, `claimed`, `in_progress`, `review`, `blocked`, `done`, and `cancelled`. `-n` sets the row limit (default 100).
 
 Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `PROG`, `UPDATED`, `TITLE`. `PROG` is the percent complete last reported by the working agent (`q log ID --progress 40`), blank until reported, `100%` once done. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
 
-On a terminal, status is colored: `inbox` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` bright green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
+On a terminal, status is colored: `held` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` bright green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
 
 ```text
 ID  STATUS       FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
- 4  inbox        (none)   alpha      0        3m ago   Keep the inbox item
+ 4  held         (none)   alpha      0        3m ago   Keep the held item
  3  in_progress  (none)   alpha      0   40%  1m ago   Port the encoder
  2  ready        (none)   beta       1        1h ago   Compare encodings
- 1  inbox        (none)   (none)     0        2d ago   Unassigned capture
+ 1  held         (none)   (none)     0        2d ago   Unassigned capture
 ```
 
-`q ready` is the permission boundary. Any task the state machine allows can be marked ready, including a sparse inbox body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits.
+`q hold` and `q ready` are the human gate. `q hold ID` moves a ready or blocked task to `held`, where no agent can claim it. `q ready ID` releases a held or blocked task. Any task the state machine allows can be marked ready, including a sparse body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits. Neither command is exposed as an MCP tool, and a `q serve` agent token cannot call `ready`.
 
 `q ready`, `q cancel`, `q reopen`, and `q delete` take one or more ids: `q ready 11 12 13`. Ids are processed in order, each one in its own transaction. A failure on one id (not found, wrong status, active claim) is reported for that id and the remaining ids still run; the command exits non-zero at the end if any id failed. Human output prints the usual confirmation or error line per id as it happens. With `--json` and exactly one id the output is the same document as before, so existing callers do not change. With `--json` and several ids the output is a single `{"results":[...],"errors":[{"id":13,"error":"..."}]}` document, where each entry in `results` has the single-id shape (`{"task":...,"warnings":[...]}` for ready, the task for cancel and reopen, and the delete outcome for delete).
 
-`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to inbox. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
+`q cancel` is a status change. The task row, claims, and event history stay, and `q reopen` can bring a cancelled task back to held for another look. `q delete` is a hard delete: one `BEGIN IMMEDIATE` transaction removes the task and the rows that reference it (claims, events, artifacts, and dependency edges, which the schema cascades). It is allowed from any status. An unexpired claim is rejected unless `--force` is passed; `--force` clears that claim in the same transaction. Events cascade with the task, so nothing is written to the event log. None of these commands take a reason.
 
 ## Watching the queue
 
@@ -193,10 +195,10 @@ A task with no dependencies is one line. `--feature` prints every task in that f
 Titles use the same 64-character ellipsis as `q ls`. Status words use the same colors as the list. Connectors stay the box-drawing characters below.
 
 ```text
-#3  inbox        Ship the rollout  [api]
+#3  held         Ship the rollout  [api]
 ├── #1  done         Shared schema  [db]  {Other}  (external)
 └── #2  ready        Write the schema  [api]
-    └── #4  inbox        Add the types  [api]
+    └── #4  held         Add the types  [api]
 ```
 
 `--json` prints `{"roots":[...]}`. A feature tree also includes `feature`. Each node has `id`, `status`, `title`, and `depends_on`. `project`, `feature`, `external`, `already_shown`, and `cycle` are left out when they would be empty or false.
@@ -228,7 +230,7 @@ Default lease is 45 minutes (minimum 1 minute, maximum 24 hours). Heartbeat exte
 
 Default `--max-risk` is `medium`. High and `external_action` tasks are not selected unless the claim raises the ceiling. External-action tasks also require `allow_external_actions` on the project, which defaults to false. Empty repo, project, and kind filters mean unrestricted. Required capabilities must be a subset of the worker's capabilities. Dependencies must be `done`. A project's `max_parallel_jobs` counts claimed and in-progress tasks.
 
-If the project sets `require_pr` and the task kind is implementation, `complete` lands in `review` even when the requested target is `done`. A human can then accept it with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready so it can be claimed again, or cancelled work back to inbox.
+If the project sets `require_pr` and the task kind is implementation, `complete` lands in `review` even when the requested target is `done`. A human can then accept it with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready so it can be claimed again, or cancelled work back to held.
 
 ## Task log and artifacts
 
@@ -292,7 +294,7 @@ Tools, all backed by the same service methods as the CLI:
 
 | Tool | Purpose |
 |---|---|
-| `queue_capture` | Create an inbox task. Optional repo, project, path, kind, priority, risk, and feature (id or unique title). |
+| `queue_capture` | Create a ready task, or a held one with `hold: true`. Optional repo, project, path, kind, priority, risk, and feature (id or unique title). |
 | `queue_list` | Bounded summaries with status, project, repo, kind, and feature filters. Omits `done` and `cancelled` unless `status` is set or `include_terminal` (alias `all`) is true. |
 | `queue_feature_create` | Create a feature (title, optional body). |
 | `queue_feature_list` | List features. |
@@ -347,9 +349,9 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 
 ## Safety defaults
 
-- Capture is local and always creates an inbox task at low risk unless you set a higher risk.
-- Only an explicit ready transition makes work claimable.
-- High-risk and external-action tasks are excluded from default claims.
+- Capture is local and creates a `ready` task at low risk unless you set a higher risk. Agents may claim it at once.
+- `q add --hold` (MCP `hold: true`) creates a `held` task instead. Held work is never claimable, and only a human `q ready` releases it. That is the safe capture for work you want to look at first.
+- Completion is still gated: high and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept.
 - External action also needs the project policy flag.
 - `delete` removes the task from the database. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason.

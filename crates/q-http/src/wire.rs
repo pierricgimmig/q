@@ -19,6 +19,7 @@ pub const METHODS: &[&str] = &[
     "get",
     "edit",
     "mark_ready",
+    "hold",
     "block",
     "cancel",
     "delete",
@@ -184,7 +185,7 @@ mod tests {
             QueueError::NotFound(7),
             QueueError::FeatureNotFound("auth".into()),
             QueueError::InvalidTransition {
-                from: TaskStatus::Inbox,
+                from: TaskStatus::Held,
                 to: TaskStatus::Done,
             },
             QueueError::TokenMismatch,

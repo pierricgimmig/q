@@ -14,9 +14,10 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use q_core::{
     format_timestamp, lease_from_minutes, Actor, ArtifactInput, BlockRequest, CancelRequest,
     CaptureRequest, ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteRequest,
-    EditFeatureRequest, EditRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
-    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition,
-    StartRequest, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode, TreeQuery,
+    EditFeatureRequest, EditRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus, TaskSummary, TaskTree, TreeNode,
+    TreeQuery,
 };
 use q_http::RemoteQueue;
 use q_project::{discover, render_init_config, DiscoverOptions, ProjectContext};
@@ -267,6 +268,7 @@ fn dispatch(
             agent_pool,
             depends_on,
             feature,
+            hold,
         } => {
             let context = resolve_context(directory, repo, project)?;
             let mut body = read_body(body, body_file.as_deref())?;
@@ -303,6 +305,7 @@ fn dispatch(
                 context_source: serde_json::to_value(context.source)
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string)),
+                hold,
             })?;
             let id = task.id;
             emit(ui, &task, || {
@@ -438,6 +441,16 @@ fn dispatch(
                 confirm(ui, "ready", task.id, task.status.as_str(), &task.title);
             },
         ),
+        Commands::Hold { id } => {
+            let task = queue.hold(HoldRequest {
+                task_id: id,
+                actor: human_actor(),
+            })?;
+            emit(ui, &task, || {
+                confirm(ui, "held", task.id, task.status.as_str(), &task.title);
+            });
+            Ok(())
+        }
         Commands::Block { id, claim_token } => {
             let task = queue.block(BlockRequest {
                 task_id: id,
@@ -1514,7 +1527,7 @@ fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
     let counts = &status.counts;
     let mut parts = Vec::new();
     for (label, count) in [
-        ("inbox", counts.inbox),
+        ("held", counts.held),
         ("ready", counts.ready),
         ("claimed", counts.claimed),
         ("in_progress", counts.in_progress),
@@ -1598,7 +1611,7 @@ fn format_clock(at: OffsetDateTime) -> String {
 fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
     println!("{}", backend.describe(paint));
     for (label, count) in [
-        ("inbox", status.counts.inbox),
+        ("held", status.counts.held),
         ("ready", status.counts.ready),
         ("claimed", status.counts.claimed),
         ("in_progress", status.counts.in_progress),
@@ -2242,23 +2255,23 @@ mod tests {
         let short = capture_line(
             Paint::plain(),
             184,
-            "inbox",
+            "held",
             "Benchmark trace encoding variants",
         );
         assert_eq!(
             short,
-            "captured #184 [inbox] Benchmark trace encoding variants"
+            "captured #184 [held] Benchmark trace encoding variants"
         );
 
         let long = format!("first line\nsecond {}", "x".repeat(TITLE_MAX_CHARS + 20));
-        let line = capture_line(Paint::plain(), 7, "inbox", &long);
+        let line = capture_line(Paint::plain(), 7, "held", &long);
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(
-            line.starts_with("captured #7 [inbox] first line second x"),
+            line.starts_with("captured #7 [held] first line second x"),
             "{line}"
         );
         assert!(line.ends_with('…'), "{line}");
-        let title = line.trim_start_matches("captured #7 [inbox] ");
+        let title = line.trim_start_matches("captured #7 [held] ");
         assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
     }
 
@@ -2318,7 +2331,7 @@ mod tests {
         let rows = vec![
             TaskListRow {
                 id: "12".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "rollout".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
@@ -2368,13 +2381,13 @@ mod tests {
         let rows = vec![
             TaskListRow {
                 id: "4".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
                 progress: "".into(),
                 updated: "3m ago".into(),
-                title: "Keep the inbox item".into(),
+                title: "Keep the held item".into(),
             },
             TaskListRow {
                 id: "2".into(),
@@ -2388,7 +2401,7 @@ mod tests {
             },
             TaskListRow {
                 id: "1".into(),
-                status: "inbox".into(),
+                status: "held".into(),
                 feature: "(none)".into(),
                 project: "(none)".into(),
                 priority: "0".into(),
@@ -2407,9 +2420,9 @@ mod tests {
             shown,
             "\
 ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
- 4  inbox   (none)   alpha      0        3m ago   Keep the inbox item
+ 4  held    (none)   alpha      0        3m ago   Keep the held item
  2  ready   (none)   beta       1        1h ago   Compare encodings
- 1  inbox   (none)   (none)     0        2d ago   Unassigned capture"
+ 1  held    (none)   (none)     0        2d ago   Unassigned capture"
         );
     }
 
@@ -2459,7 +2472,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
     fn tree_layout_marks_external_repeats_and_empty_features() {
         let types = TreeNode {
             id: 4,
-            status: TaskStatus::Inbox,
+            status: TaskStatus::Held,
             title: "Add the types".into(),
             project: Some("api".into()),
             feature_id: Some(1),
@@ -2497,7 +2510,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
         };
         let ship = TreeNode {
             id: 3,
-            status: TaskStatus::Inbox,
+            status: TaskStatus::Held,
             title: "Ship the rollout".into(),
             project: Some("api".into()),
             feature_id: Some(1),
@@ -2519,7 +2532,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
             cycle: false,
             depends_on: vec![TreeNode {
                 id: 3,
-                status: TaskStatus::Inbox,
+                status: TaskStatus::Held,
                 title: "Ship the rollout".into(),
                 project: Some("api".into()),
                 feature_id: Some(1),
@@ -2540,14 +2553,14 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  TITLE
         assert_eq!(
             render_tree(&tree),
             "\
-#3  inbox        Ship the rollout  [api]
+#3  held         Ship the rollout  [api]
 ├── #1  done         Shared schema  [db]  {Other}  (external)
-│   └── #4  inbox        Add the types  [api]  (already shown)
+│   └── #4  held         Add the types  [api]  (already shown)
 └── #2  ready        Write the schema  [api]
-    └── #4  inbox        Add the types  [api]
+    └── #4  held         Add the types  [api]
 
 #5  blocked      Write the notes
-└── #3  inbox        Ship the rollout  [api]  (cycle)"
+└── #3  held         Ship the rollout  [api]  (cycle)"
         );
 
         let empty = TaskTree {

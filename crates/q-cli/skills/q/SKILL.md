@@ -1,6 +1,6 @@
 ---
 name: q
-description: Use the local-first q agent work queue (CLI + MCP) to capture inbox tasks, wait for human ready, claim/heartbeat/complete work with claim tokens, and respect risk/lease safety. Use when the user mentions q, the agent work queue, claiming tasks, or inbox/ready workflow.
+description: Use the local-first q agent work queue (CLI + MCP) to capture ready or held tasks, claim/heartbeat/complete work with claim tokens, and respect the human gate plus risk/lease safety. Use when the user mentions q, the agent work queue, claiming tasks, or the held/ready workflow.
 ---
 
 # q agent work queue
@@ -9,9 +9,11 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 
 ## Rules
 
-- Capture creates an **inbox** task. Inbox work is never claimable.
-- After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [inbox] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
-- A human must run `q ready ID` (or several at once: `q ready 11 12 13`) before an agent may claim the task. There is no MCP ready tool. Do not mark inbox work ready yourself, and do not treat a captured task as permission to start.
+- Capture creates a **ready** task that any idle agent may claim at once. Pass `--hold` (`-w`, `--wait`) or MCP `hold: true` to create a **held** task instead. Held work is never claimable until a human runs `q ready ID`.
+- Hold anything that should get a human look before an agent starts it: risky or destructive changes, external actions, or an idea that is not specified yet. When in doubt, hold.
+- After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [ready] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
+- Only a human releases held work with `q ready ID` (or several at once: `q ready 11 12 13`) or takes ready work back with `q hold ID`. There is no MCP ready or hold tool. Do not mark held work ready yourself, and do not treat a captured task as permission to start it in the current session; claim it.
+- Completion is still gated after a claim: `high` and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept.
 - Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
 - Report progress as you pass milestones: `q log ID --progress 40 --claim-token TOKEN` (MCP `queue_log` with `progress`), optionally with a message. Use your honest estimate of percent complete; humans watch it in `q top` and `q ls`. Do not report 100; completing the task sets that.
@@ -33,9 +35,10 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture inbox
 
 ```bash
 q "Benchmark trace encoding variants"
+q --hold "Rewrite the auth flow"
 q ls
 q ls --all
-q ls --status inbox
+q ls --status held
 q top
 q show 184
 q tree 184
@@ -62,13 +65,13 @@ q edit 12 --clear-feature
 
 `q top` redraws counts, the table, and recent changes every two seconds until `q` (or Esc or Ctrl-C) is pressed; it is for humans watching the queue, not for agents. `q ls` (alias `q list`) omits `done` and `cancelled`. `q ls --all` (`-a`) includes them. `q ls --status done` or `q ls --status cancelled` shows that status without `--all`. The human table has feature, project, priority, and a relative `UPDATED` time, and it is colored on a terminal. Prefer `q --json` (`-j`) when reading tasks: JSON timestamps stay absolute and are never colored. Tasks with no feature or project are `(none)` and sort last. Order is feature, then project, then newest update. `q done` is `q complete`. `q rm` is `q delete`. `q recover` is `q recover-stale`.
 
-`q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready.
+`q complete` of claimed work moves through `in_progress`, then to `done`. If the project sets `require_pr` and the kind is `implementation`, completion lands in `review` instead. A human accepts review with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready, or cancelled work back to held.
 
 ## MCP
 
 `q mcp` serves newline-delimited JSON-RPC on stdio and does not open a network port. Tools:
 
-- `queue_capture` — create an inbox task. Optional `feature` is an id or unique title
+- `queue_capture` — create a ready task, or a held one with `hold: true`. Optional `feature` is an id or unique title
 - `queue_feature_create`, `queue_feature_list`, `queue_feature_get` — named task groups
 - `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true. Optional `feature` filters by id or unique title
 - `queue_get` — fetch one task, its claim, artifacts, and recent events

@@ -27,8 +27,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use q_core::{
     Actor, ActorKind, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
-    QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest, TreeQuery,
+    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest,
+    TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -274,6 +275,11 @@ pub fn dispatch(
             stamp(&mut request.actor, principal);
             reply(queue.mark_ready(request))
         }
+        "hold" => {
+            let mut request: HoldRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.hold(request))
+        }
         "block" => {
             let mut request: BlockRequest = parse(body)?;
             stamp(&mut request.actor, principal);
@@ -485,6 +491,9 @@ mod tests {
                 unreachable!()
             }
             fn mark_ready(&self, _: ReadyRequest) -> Result<q_core::ReadyOutcome, QueueError> {
+                unreachable!()
+            }
+            fn hold(&self, _: HoldRequest) -> Result<q_core::Task, QueueError> {
                 unreachable!()
             }
             fn block(&self, _: BlockRequest) -> Result<q_core::Task, QueueError> {

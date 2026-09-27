@@ -7,10 +7,10 @@ use std::time::Duration;
 use q_core::{
     Actor, ArtifactContent, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimOutcome,
     ClaimRequest, CompleteRequest, CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome,
-    DeleteRequest, EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, ListFilter,
-    LogRequest, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest,
-    RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary, TaskTree,
-    TreeQuery,
+    DeleteRequest, EditFeatureRequest, EditRequest, Event, Feature, HeartbeatRequest, HoldRequest,
+    ListFilter, LogRequest, QueueError, QueueService, QueueStatus, ReadyOutcome, ReadyRequest,
+    RecoverRequest, RecoveryRecord, ReleaseRequest, StartRequest, Task, TaskDetail, TaskSummary,
+    TaskTree, TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -124,6 +124,10 @@ impl QueueService for RemoteQueue {
 
     fn mark_ready(&self, request: ReadyRequest) -> Result<ReadyOutcome, QueueError> {
         self.call("mark_ready", &request)
+    }
+
+    fn hold(&self, request: HoldRequest) -> Result<Task, QueueError> {
+        self.call("hold", &request)
     }
 
     fn block(&self, request: BlockRequest) -> Result<Task, QueueError> {
