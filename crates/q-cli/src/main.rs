@@ -224,9 +224,22 @@ async fn serve(
         "q serve listening on http://{local} (database: {}, {mode})",
         db.display()
     );
-    let public = public_url
-        .map(|url| url.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| format!("http://{local}"));
+    // The origin the server will actually answer for: the canonical form of
+    // --public-url, or the loopback address when bound to all interfaces.
+    let public = match public_url {
+        Some(url) => q_http::canonical_origin(url.trim()).map_err(CliError::message)?,
+        None => {
+            let mut shown = local;
+            if shown.ip().is_unspecified() {
+                shown.set_ip(if shown.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                });
+            }
+            format!("http://{shown}")
+        }
+    };
     eprintln!("connector URL for Grok, Claude, or ChatGPT: {public}/mcp");
     if store.is_none() {
         eprintln!("chat connectors need a token file; run: q token create NAME --role human");
@@ -234,7 +247,7 @@ async fn serve(
     let options = q_http::ServerOptions {
         auth: store,
         grants,
-        public_url: public_url.map(|url| url.trim_end_matches('/').to_string()),
+        public_url: Some(public),
         signing_key,
         base_dir: base_dir(cli.directory.as_deref())?,
     };

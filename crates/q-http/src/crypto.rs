@@ -84,12 +84,56 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-/// 32 random bytes from the OS CSPRNG.
+/// 32 random bytes from the OS CSPRNG. Every bit is random; a UUID-based
+/// source would pin the version and variant nibbles.
 pub fn random_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
-    out[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    out[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    getrandom::fill(&mut out).expect("the OS random source is unavailable");
     out
+}
+
+/// Write a secret file so that no other user and no concurrent reader ever
+/// sees a partial or world-readable version: the bytes go to a sibling
+/// temporary file created with mode 0600 (unix), then renamed over `path`.
+pub(crate) fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "secret".into());
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.tmp",
+        base64url_encode(&random_bytes()[..6])
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&tmp)
+            .map_err(|err| format!("cannot create {}: {err}", tmp.display()))?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+            .map_err(|err| format!("cannot replace {}: {err}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A random, URL-safe secret.
@@ -114,6 +158,46 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_bytes_have_no_fixed_uuid_nibbles() {
+        let draws: Vec<[u8; 32]> = (0..64).map(|_| random_bytes()).collect();
+        assert!(
+            draws.iter().any(|b| b[6] >> 4 != 4),
+            "byte 6 always looks like a UUID version"
+        );
+        assert!(
+            draws.iter().any(|b| b[8] & 0xc0 != 0x80),
+            "byte 8 always looks like a UUID variant"
+        );
+        assert!(draws.iter().any(|b| b[22] >> 4 != 4));
+        assert!(draws.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn secret_files_are_private_and_replaced_atomically() {
+        let dir = std::env::temp_dir().join(format!("q-secret-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("nested").join("tokens.toml");
+        write_secret_file(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_secret_file(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files must not remain");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn base64url_round_trips() {

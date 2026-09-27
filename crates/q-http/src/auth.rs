@@ -17,7 +17,7 @@
 //! new or revoked token takes effect without a restart.
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -103,14 +103,7 @@ impl AuthConfig {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
         }
-        std::fs::write(path, text)
-            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::crypto::write_secret_file(path, text.as_bytes())
     }
 
     /// Add a token with a fresh random secret to `path`, creating the file if
@@ -188,9 +181,20 @@ impl Principal {
     }
 }
 
+/// Identity of the token file as last read: modification time and size.
+/// Both are compared, so an edit inside one mtime tick is still noticed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    len: u64,
+}
+
 struct Loaded {
-    config: AuthConfig,
-    modified: Option<SystemTime>,
+    config: Arc<AuthConfig>,
+    stamp: Option<FileStamp>,
+    /// Whether the "unavailable" warning has been logged for the current
+    /// outage, so a missing file does not log on every request.
+    warned: bool,
 }
 
 /// The token file as the server sees it, reloaded when the file changes.
@@ -201,12 +205,14 @@ pub struct TokenStore {
 
 impl TokenStore {
     pub fn from_file(path: &Path) -> Result<Self, String> {
-        let config = AuthConfig::load(path)?;
+        let stamp = file_stamp(path);
+        let config = Arc::new(AuthConfig::load(path)?);
         Ok(Self {
             path: Some(path.to_path_buf()),
             loaded: RwLock::new(Loaded {
                 config,
-                modified: modified_at(path),
+                stamp,
+                warned: false,
             }),
         })
     }
@@ -216,8 +222,9 @@ impl TokenStore {
         Self {
             path: None,
             loaded: RwLock::new(Loaded {
-                config,
-                modified: None,
+                config: Arc::new(config),
+                stamp: None,
+                warned: false,
             }),
         }
     }
@@ -228,26 +235,46 @@ impl TokenStore {
 
     /// Current configuration, re-read if the file changed. Missing, unreadable,
     /// or invalid files deny all access until a valid configuration is restored.
-    pub fn snapshot(&self) -> AuthConfig {
+    /// The current tokens. Reloads when the file's stamp (mtime and size)
+    /// changed; the common case takes only the read lock and clones an
+    /// `Arc`, so authentication does not serialize on a mutex.
+    pub fn snapshot(&self) -> Arc<AuthConfig> {
+        let Some(path) = &self.path else {
+            return self
+                .loaded
+                .read()
+                .map(|loaded| loaded.config.clone())
+                .unwrap_or_default();
+        };
+        let stamp = file_stamp(path);
+        if let Ok(loaded) = self.loaded.read() {
+            if stamp.is_some() && loaded.stamp == stamp {
+                return loaded.config.clone();
+            }
+        }
         // Serialize reloads so an older snapshot cannot overwrite a revocation.
         let Ok(mut loaded) = self.loaded.write() else {
-            return AuthConfig::default();
+            return Arc::default();
         };
-        if let Some(path) = &self.path {
-            let modified = modified_at(path);
-            if modified.is_none() || loaded.modified != modified {
-                match AuthConfig::load(path) {
-                    Ok(config) => {
-                        loaded.config = config;
-                        loaded.modified = modified;
-                    }
-                    Err(err) => {
-                        tracing::warn!("token file unavailable; denying access: {err}");
-                        loaded.config = AuthConfig::default();
-                        // Retry even if a repaired file has the same timestamp.
-                        loaded.modified = None;
-                    }
+        if stamp.is_some() && loaded.stamp == stamp {
+            return loaded.config.clone();
+        }
+        match AuthConfig::load(path) {
+            Ok(config) => {
+                loaded.config = Arc::new(config);
+                // The stamp from before the read: a write that lands in
+                // between is picked up on the next request.
+                loaded.stamp = stamp;
+                loaded.warned = false;
+            }
+            Err(err) => {
+                if !loaded.warned {
+                    tracing::warn!("token file unavailable; denying access: {err}");
+                    loaded.warned = true;
                 }
+                loaded.config = Arc::default();
+                // Retry even if a repaired file has the same stamp.
+                loaded.stamp = None;
             }
         }
         loaded.config.clone()
@@ -262,8 +289,12 @@ impl TokenStore {
     }
 }
 
-fn modified_at(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+    })
 }
 
 #[cfg(test)]
@@ -367,5 +398,27 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(Role::parse("HUMAN").is_ok());
         assert!(Role::parse("root").is_err());
+    }
+
+    #[test]
+    fn reload_notices_an_edit_that_keeps_the_same_mtime() {
+        let path = temp_path();
+        let alice = AuthConfig::create_token(&path, "alice", Role::Human).unwrap();
+        let store = TokenStore::from_file(&path).unwrap();
+        assert!(store.snapshot().find_by_secret(&alice).is_some());
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let bob = AuthConfig::create_token(&path, "bob", Role::Agent).unwrap();
+        // Pin the mtime back to its previous value: only the size differs.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert!(
+            store.snapshot().find_by_secret(&bob).is_some(),
+            "size change must trigger a reload"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

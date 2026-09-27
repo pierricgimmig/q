@@ -20,6 +20,8 @@ tracing.workspace = true
 ureq.workspace = true
 url.workspace = true
 uuid.workspace = true
+getrandom = "0.4"
+serde_urlencoded = "0.7"
 
 [dev-dependencies]
 q-store.workspace = true

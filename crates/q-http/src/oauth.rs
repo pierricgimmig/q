@@ -51,17 +51,7 @@ impl SigningKey {
             return Ok(Self(key));
         }
         let key = random_bytes();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
-        }
-        std::fs::write(path, base64url_encode(&key))
-            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::crypto::write_secret_file(path, base64url_encode(&key).as_bytes())?;
         Ok(Self(key))
     }
 
@@ -150,7 +140,7 @@ pub struct OAuthError {
 }
 
 impl OAuthError {
-    fn new(code: &'static str, description: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, description: impl Into<String>) -> Self {
         Self {
             code,
             description: description.into(),

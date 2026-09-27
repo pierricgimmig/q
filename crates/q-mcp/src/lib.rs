@@ -29,6 +29,10 @@ pub struct ToolContext {
     /// Expose `queue_ready` and `queue_reopen`. Only `q serve` sets this, for
     /// human tokens, so a local stdio agent never sees a ready tool.
     pub human_tools: bool,
+    /// Reject a `capture_path` outside `base_dir`. `q serve` sets this: a
+    /// remote token holder must not be able to run discovery (git, config
+    /// files) against arbitrary directories on the server.
+    pub confine_capture_path: bool,
 }
 
 pub struct Session {
@@ -44,6 +48,7 @@ impl Session {
                 base_dir,
                 actor: Actor::agent("mcp"),
                 human_tools: false,
+                confine_capture_path: false,
             },
         }
     }
@@ -67,14 +72,19 @@ impl Session {
         self
     }
 
+    /// Only accept a `capture_path` inside the session's base directory.
+    pub fn confined(mut self) -> Self {
+        self.ctx.confine_capture_path = true;
+        self
+    }
+
     /// Handle one parsed JSON-RPC message. `None` means a notification.
     pub fn handle_value(&mut self, queue: &dyn QueueService, message: &Value) -> Option<Value> {
-        let line = serde_json::to_string(message).ok()?;
-        let response = self.handle_line(queue, &line)?;
-        serde_json::from_str(&response).ok()
+        self.handle_message(queue, message)
     }
 
     /// Handle one JSON-RPC line. `None` means the client sent a notification.
+    /// This is the stdio wrapper around the message handler.
     pub fn handle_line(&mut self, queue: &dyn QueueService, line: &str) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -82,8 +92,13 @@ impl Session {
         }
         let message: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
-            Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error", None)),
+            Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error", None).to_string()),
         };
+        self.handle_message(queue, &message)
+            .map(|response| response.to_string())
+    }
+
+    fn handle_message(&mut self, queue: &dyn QueueService, message: &Value) -> Option<Value> {
         if !message.is_object() {
             return Some(rpc_error(Value::Null, -32600, "invalid request", None));
         }
@@ -146,7 +161,7 @@ impl Session {
         }
     }
 
-    fn call_tool(&self, queue: &dyn QueueService, id: &Value, params: Option<&Value>) -> String {
+    fn call_tool(&self, queue: &dyn QueueService, id: &Value, params: Option<&Value>) -> Value {
         let params = params.cloned().unwrap_or_else(|| json!({}));
         let name = match params.get("name").and_then(Value::as_str) {
             Some(name) => name.to_string(),
@@ -357,6 +372,34 @@ fn queue_edit(
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
 }
 
+/// Resolve a caller-supplied `capture_path`. A confined session only accepts
+/// an existing directory inside `base_dir`, resolved through symlinks.
+fn capture_directory(ctx: &ToolContext, path: PathBuf) -> Result<PathBuf, ToolFailure> {
+    if !ctx.confine_capture_path {
+        return Ok(path);
+    }
+    let base = ctx
+        .base_dir
+        .canonicalize()
+        .map_err(|err| ToolFailure::Invalid(format!("served directory is unavailable: {err}")))?;
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        ctx.base_dir.join(path)
+    };
+    let resolved = candidate.canonicalize().map_err(|_| {
+        ToolFailure::Invalid(
+            "capture_path must be an existing directory inside the served directory".into(),
+        )
+    })?;
+    if !resolved.starts_with(&base) {
+        return Err(ToolFailure::Invalid(
+            "capture_path must be inside the served directory".into(),
+        ));
+    }
+    Ok(resolved)
+}
+
 fn queue_capture(
     queue: &dyn QueueService,
     ctx: &ToolContext,
@@ -381,7 +424,7 @@ fn queue_capture(
     )?;
     let title = required_string(args, "title")?;
     let directory = match optional_string(args, "capture_path")? {
-        Some(path) => PathBuf::from(path),
+        Some(path) => capture_directory(ctx, PathBuf::from(path))?,
         None => ctx.base_dir.clone(),
     };
     let context = discover(DiscoverOptions {
@@ -816,26 +859,24 @@ fn optional_i64_array(args: &Map<String, Value>, key: &str) -> Result<Vec<i64>, 
     }
 }
 
-fn rpc_result(id: Value, result: Value) -> String {
-    serde_json::to_string(&json!({
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": result,
-    }))
-    .expect("rpc result serializes")
+    })
 }
 
-fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> String {
+fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
     if let Some(data) = data {
         error["data"] = data;
     }
-    serde_json::to_string(&json!({
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": error,
-    }))
-    .expect("rpc error serializes")
+    })
 }
 
 fn tool_success(value: Value) -> Value {
@@ -1767,5 +1808,54 @@ mod tests {
             json!({"name": "queue_edit", "arguments": {"task_id": id}}),
         );
         assert_eq!(nothing["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn confined_sessions_keep_capture_paths_inside_the_served_directory() {
+        let queue = temp_queue();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("q-confined-{nanos}"));
+        std::fs::create_dir_all(base.join("inner")).unwrap();
+        let mut session = Session::new(base.clone()).stateless().confined();
+        let outside = session
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "peek", "capture_path": "/"}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(outside["error"]["code"], -32602, "{outside}");
+        assert!(outside["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("served directory"));
+        let inside = session
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "ok", "capture_path": "inner"}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(inside["result"]["isError"], false, "{inside}");
+        // An unconfined (stdio) session keeps the old behaviour.
+        let mut local = Session::new(base.clone()).stateless();
+        let anywhere = local
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "local", "capture_path": std::env::temp_dir()}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(anywhere["result"]["isError"], false, "{anywhere}");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -20,4 +20,5 @@ pub use auth::{AuthConfig, Principal, Role, TokenStore};
 pub use client::RemoteQueue;
 pub use grants::GrantStore;
 pub use oauth::SigningKey;
+pub use origin::canonical_origin;
 pub use server::{check_bind, serve_on, ServerOptions};

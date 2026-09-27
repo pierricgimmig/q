@@ -181,8 +181,7 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
+        .and_then(bearer_token)
         .filter(|value| !value.is_empty());
     let Some(bearer) = bearer else {
         return Err(ErrorBody::new(
@@ -194,6 +193,35 @@ pub fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Principal, 
         .oauth
         .authenticate(&store.snapshot(), bearer)
         .ok_or_else(|| ErrorBody::new("unauthorized", "missing or invalid bearer token"))
+}
+
+/// The credential in `Authorization: Bearer <token>`. The scheme is
+/// case-insensitive and may be followed by more than one space (RFC 7235).
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.trim().split_once(char::is_whitespace)?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+}
+
+/// Parse an `application/x-www-form-urlencoded` body by hand so every
+/// failure is an OAuth JSON error instead of axum's plain-text rejection.
+fn oauth_form<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, OAuthError> {
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+    if !mime.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        return Err(OAuthError::new(
+            "invalid_request",
+            "token requests must be application/x-www-form-urlencoded",
+        ));
+    }
+    serde_urlencoded::from_bytes(body)
+        .map_err(|err| OAuthError::new("invalid_request", format!("malformed form body: {err}")))
 }
 
 async fn health() -> Json<HealthBody> {
@@ -330,7 +358,15 @@ async fn oauth_authorize_submit(
     }
 }
 
-async fn oauth_token(State(state): State<Arc<AppState>>, Form(form): Form<TokenForm>) -> Response {
+async fn oauth_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let form: TokenForm = match oauth_form(&headers, &body) {
+        Ok(form) => form,
+        Err(error) => return oauth_error(StatusCode::BAD_REQUEST, error),
+    };
     let tokens = state
         .options
         .auth
@@ -339,6 +375,10 @@ async fn oauth_token(State(state): State<Arc<AppState>>, Form(form): Form<TokenF
         .unwrap_or_default();
     match state.oauth.token(&tokens, &form) {
         Ok(issued) => no_store(Json(issued)),
+        // RFC 6749 section 5.2: a failed client authentication is 401.
+        Err(error) if error.code == "invalid_client" => {
+            oauth_error(StatusCode::UNAUTHORIZED, error)
+        }
         Err(error) => oauth_error(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -347,6 +387,35 @@ async fn oauth_token(State(state): State<Arc<AppState>>, Form(form): Form<TokenF
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_tolerates_spaces() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER   abc  "), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("abc"), None);
+    }
+
+    #[test]
+    fn token_requests_must_be_form_encoded() {
+        let mut headers = HeaderMap::new();
+        let err = oauth_form::<TokenForm>(&headers, b"grant_type=x").unwrap_err();
+        assert_eq!(err.code, "invalid_request");
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert!(oauth_form::<TokenForm>(&headers, b"{}").is_err());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "Application/x-www-form-urlencoded; charset=utf-8"
+                .parse()
+                .unwrap(),
+        );
+        let form: TokenForm =
+            oauth_form(&headers, b"grant_type=refresh_token&refresh_token=r").unwrap();
+        assert_eq!(form.grant_type, "refresh_token");
+        assert_eq!(form.refresh_token.as_deref(), Some("r"));
+    }
 
     #[test]
     fn unauthenticated_bind_must_be_loopback() {

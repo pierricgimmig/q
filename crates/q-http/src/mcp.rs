@@ -48,7 +48,9 @@ pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
         let mut session = Session::new(base_dir)
             .with_actor(actor_for(&principal))
             .with_human_tools(principal.role == Role::Human)
-            .stateless();
+            .stateless()
+            // Remote callers may not point captures at arbitrary server paths.
+            .confined();
         match message {
             Value::Array(items) => {
                 let responses: Vec<Value> = items

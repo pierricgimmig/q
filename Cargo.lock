@@ -860,12 +860,14 @@ name = "q-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "getrandom 0.4.3",
  "q-core",
  "q-mcp",
  "q-store",
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "tokio",
  "toml",
