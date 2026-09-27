@@ -52,6 +52,26 @@ impl Paint {
         self.paint(status_style(status), status)
     }
 
+    /// The text to show for a link: the label on a terminal that gets escape
+    /// codes, the URL itself otherwise, so piped output keeps the address.
+    pub fn link_text<'a>(self, label: &'a str, url: &'a str) -> &'a str {
+        if self.enabled {
+            label
+        } else {
+            url
+        }
+    }
+
+    /// An OSC 8 hyperlink around `text` when escapes are on. Terminals that
+    /// support it make the text clickable; the visible text is unchanged.
+    pub fn link(self, text: &str, url: &str) -> String {
+        if !self.enabled || text.is_empty() {
+            return text.to_string();
+        }
+        let styled = self.paint(Style::new().underline(), text);
+        format!("\x1b]8;;{url}\x1b\\{styled}\x1b]8;;\x1b\\")
+    }
+
     pub fn warning_label(self) -> String {
         self.paint(
             Style::new().bold().fg_color(Some(AnsiColor::Yellow.into())),
@@ -220,5 +240,21 @@ mod tests {
         assert!(!Paint::color().status("done").contains("[2m"));
         assert!(Paint::color().status("cancelled").contains('9'));
         assert_eq!(Paint::color().status("not-a-status"), "not-a-status");
+    }
+
+    #[test]
+    fn links_are_osc8_on_a_terminal_and_the_url_when_plain() {
+        let url = "https://example.com/pr/9";
+        assert_eq!(Paint::plain().link_text("PR", url), url);
+        assert_eq!(Paint::plain().link(url, url), url);
+        assert_eq!(Paint::color().link_text("PR", url), "PR");
+        let linked = Paint::color().link("PR", url);
+        assert!(
+            linked.starts_with("\x1b]8;;https://example.com/pr/9\x1b\\"),
+            "{linked:?}"
+        );
+        assert!(linked.ends_with("\x1b]8;;\x1b\\"), "{linked:?}");
+        assert!(linked.contains("PR"), "{linked:?}");
+        assert_eq!(Paint::color().link("", url), "");
     }
 }
