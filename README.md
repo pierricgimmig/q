@@ -1,8 +1,8 @@
 # q
 
-A local-first work queue for coding agents. You capture tasks; idle agents
-claim them, one at a time, atomically, over the CLI or MCP; you watch the
-queue move.
+The explicit work queue for your coding agents. Capture tasks and say which
+are ready; idle Claude Code, Codex or Cursor sessions claim them, one at a
+time, atomically, over the CLI or MCP; you watch the queue move.
 
 ![q top](docs/images/q-top.png)
 
