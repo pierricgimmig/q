@@ -21,20 +21,71 @@ const SERVER_NAME: &str = "q";
 const SERVER_VERSION: &str = "0.1.0";
 const KNOWN_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
+/// Per-call context handed to every tool.
+pub struct ToolContext {
+    pub base_dir: PathBuf,
+    /// Recorded on events. stdio sessions are the agent `mcp`; `q serve`
+    /// sets the authenticated principal.
+    pub actor: Actor,
+    /// Expose `queue_ready` and `queue_reopen`. Only `q serve` sets this, for
+    /// human tokens, so a local stdio agent never sees a ready tool.
+    pub human_tools: bool,
+    /// Reject a `capture_path` outside `base_dir`. `q serve` sets this: a
+    /// remote token holder must not be able to run discovery (git, config
+    /// files) against arbitrary directories on the server.
+    pub confine_capture_path: bool,
+}
+
 pub struct Session {
     initialized: bool,
-    base_dir: PathBuf,
+    ctx: ToolContext,
 }
 
 impl Session {
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             initialized: false,
-            base_dir,
+            ctx: ToolContext {
+                base_dir,
+                actor: Actor::agent("mcp"),
+                human_tools: false,
+                confine_capture_path: false,
+            },
         }
     }
 
+    /// Record events as this actor instead of the agent `mcp`.
+    pub fn with_actor(mut self, actor: Actor) -> Self {
+        self.ctx.actor = actor;
+        self
+    }
+
+    /// Expose the human-only triage tools.
+    pub fn with_human_tools(mut self, human_tools: bool) -> Self {
+        self.ctx.human_tools = human_tools;
+        self
+    }
+
+    /// Treat the session as already initialized. Streamable HTTP is
+    /// stateless, so each request may arrive without an `initialize`.
+    pub fn stateless(mut self) -> Self {
+        self.initialized = true;
+        self
+    }
+
+    /// Only accept a `capture_path` inside the session's base directory.
+    pub fn confined(mut self) -> Self {
+        self.ctx.confine_capture_path = true;
+        self
+    }
+
+    /// Handle one parsed JSON-RPC message. `None` means a notification.
+    pub fn handle_value(&mut self, queue: &dyn QueueService, message: &Value) -> Option<Value> {
+        self.handle_message(queue, message)
+    }
+
     /// Handle one JSON-RPC line. `None` means the client sent a notification.
+    /// This is the stdio wrapper around the message handler.
     pub fn handle_line(&mut self, queue: &dyn QueueService, line: &str) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -42,8 +93,13 @@ impl Session {
         }
         let message: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
-            Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error", None)),
+            Err(_) => return Some(rpc_error(Value::Null, -32700, "parse error", None).to_string()),
         };
+        self.handle_message(queue, &message)
+            .map(|response| response.to_string())
+    }
+
+    fn handle_message(&mut self, queue: &dyn QueueService, message: &Value) -> Option<Value> {
         if !message.is_object() {
             return Some(rpc_error(Value::Null, -32600, "invalid request", None));
         }
@@ -90,7 +146,10 @@ impl Session {
                 if !self.initialized {
                     return Some(rpc_error(id, -32600, "server not initialized", None));
                 }
-                Some(rpc_result(id, json!({ "tools": tool_definitions() })))
+                Some(rpc_result(
+                    id,
+                    json!({ "tools": tool_definitions(self.ctx.human_tools) }),
+                ))
             }
             "tools/call" => {
                 if !self.initialized {
@@ -103,7 +162,7 @@ impl Session {
         }
     }
 
-    fn call_tool(&self, queue: &dyn QueueService, id: &Value, params: Option<&Value>) -> String {
+    fn call_tool(&self, queue: &dyn QueueService, id: &Value, params: Option<&Value>) -> Value {
         let params = params.cloned().unwrap_or_else(|| json!({}));
         let name = match params.get("name").and_then(Value::as_str) {
             Some(name) => name.to_string(),
@@ -128,7 +187,7 @@ impl Session {
                 Some(json!({"code": "invalid_input", "error": "arguments must be an object"})),
             );
         }
-        match dispatch_tool(queue, &self.base_dir, &name, &arguments) {
+        match dispatch_tool(queue, &self.ctx, &name, &arguments) {
             Ok(value) => rpc_result(id.clone(), tool_success(value)),
             Err(ToolFailure::Invalid(message)) => rpc_error(
                 id.clone(),
@@ -171,37 +230,182 @@ impl From<QueueError> for ToolFailure {
     }
 }
 
+/// Tools that make work claimable. Listed and callable only for human
+/// principals over `q serve`.
+pub const HUMAN_ONLY_TOOLS: &[&str] = &["queue_ready", "queue_reopen"];
+
 fn dispatch_tool(
     queue: &dyn QueueService,
-    base_dir: &std::path::Path,
+    ctx: &ToolContext,
     name: &str,
     arguments: &Value,
 ) -> Result<Value, ToolFailure> {
     let args = arguments.as_object().expect("object checked by caller");
+    if HUMAN_ONLY_TOOLS.contains(&name) && !ctx.human_tools {
+        return Err(ToolFailure::Invalid(format!(
+            "{name} is only available to a human signed in to q serve"
+        )));
+    }
     match name {
-        "queue_capture" => queue_capture(queue, base_dir, args),
+        "queue_capture" => queue_capture(queue, ctx, args),
         "queue_list" => queue_list(queue, args),
         "queue_get" => queue_get(queue, args),
         "queue_tree" => queue_tree(queue, args),
+        "queue_status" => queue_status(queue, args),
         "queue_feature_create" => queue_feature_create(queue, args),
         "queue_feature_list" => queue_feature_list(queue, args),
         "queue_feature_get" => queue_feature_get(queue, args),
+        "queue_edit" => queue_edit(queue, ctx, args),
+        "queue_ready" => queue_ready(queue, ctx, args),
+        "queue_reopen" => queue_reopen(queue, ctx, args),
+        "queue_cancel" => queue_cancel(queue, ctx, args),
         "queue_claim_next" => queue_claim_next(queue, args),
-        "queue_heartbeat" => queue_heartbeat(queue, args),
-        "queue_start" => queue_start(queue, args),
-        "queue_block" => queue_block(queue, args),
-        "queue_complete" => queue_complete(queue, args),
-        "queue_release" => queue_release(queue, args),
-        "queue_delete" => queue_delete(queue, args),
+        "queue_heartbeat" => queue_heartbeat(queue, ctx, args),
+        "queue_start" => queue_start(queue, ctx, args),
+        "queue_block" => queue_block(queue, ctx, args),
+        "queue_complete" => queue_complete(queue, ctx, args),
+        "queue_release" => queue_release(queue, ctx, args),
+        "queue_delete" => queue_delete(queue, ctx, args),
         "queue_log" => queue_log(queue, args),
         "queue_artifact" => queue_artifact(queue, args),
         other => Err(ToolFailure::Invalid(format!("unknown tool {other}"))),
     }
 }
 
+fn queue_status(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+    expect_keys(args, &[])?;
+    let status = queue.status()?;
+    Ok(serde_json::to_value(status).unwrap_or(Value::Null))
+}
+
+fn queue_ready(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id"])?;
+    let outcome = queue.mark_ready(q_core::ReadyRequest {
+        task_id: required_task_id(args)?,
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+fn queue_reopen(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id"])?;
+    let task = queue.reopen(required_task_id(args)?, ctx.actor.clone())?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
+}
+
+fn queue_cancel(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id"])?;
+    let task = queue.cancel(q_core::CancelRequest {
+        task_id: required_task_id(args)?,
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
+}
+
+fn queue_edit(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(
+        args,
+        &[
+            "task_id",
+            "id",
+            "title",
+            "body",
+            "kind",
+            "priority",
+            "risk",
+            "project",
+            "repo",
+            "agent_pool",
+            "capabilities",
+            "dependencies",
+            "feature",
+            "clear_project",
+            "clear_repo",
+            "clear_agent_pool",
+            "clear_feature",
+        ],
+    )?;
+    let task_id = required_task_id(args)?;
+    let mut request = q_core::EditRequest::empty(ctx.actor.clone());
+    request.title = optional_string(args, "title")?;
+    request.body = optional_string(args, "body")?;
+    request.kind = match optional_string(args, "kind")? {
+        Some(kind) => Some(TaskKind::parse(&kind)?),
+        None => None,
+    };
+    request.priority = optional_i64(args, "priority")?.map(|value| value as i32);
+    request.risk = match optional_string(args, "risk")? {
+        Some(risk) => Some(RiskLevel::parse(&risk)?),
+        None => None,
+    };
+    request.project = optional_string(args, "project")?;
+    request.repo = optional_string(args, "repo")?;
+    request.agent_pool = optional_string(args, "agent_pool")?;
+    if args.contains_key("capabilities") {
+        request.required_capabilities = Some(optional_string_array(args, "capabilities")?);
+    }
+    if args.contains_key("dependencies") {
+        request.dependencies = Some(optional_i64_array(args, "dependencies")?);
+    }
+    request.feature = optional_feature(args)?;
+    request.clear_project = optional_bool(args, "clear_project")?;
+    request.clear_repo = optional_bool(args, "clear_repo")?;
+    request.clear_agent_pool = optional_bool(args, "clear_agent_pool")?;
+    request.clear_feature = optional_bool(args, "clear_feature")?;
+    if !request.has_changes() {
+        return Err(ToolFailure::Invalid("no fields to change".into()));
+    }
+    let task = queue.edit(task_id, request)?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
+}
+
+/// Resolve a caller-supplied `capture_path`. A confined session only accepts
+/// an existing directory inside `base_dir`, resolved through symlinks.
+fn capture_directory(ctx: &ToolContext, path: PathBuf) -> Result<PathBuf, ToolFailure> {
+    if !ctx.confine_capture_path {
+        return Ok(path);
+    }
+    let base = ctx
+        .base_dir
+        .canonicalize()
+        .map_err(|err| ToolFailure::Invalid(format!("served directory is unavailable: {err}")))?;
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        ctx.base_dir.join(path)
+    };
+    let resolved = candidate.canonicalize().map_err(|_| {
+        ToolFailure::Invalid(
+            "capture_path must be an existing directory inside the served directory".into(),
+        )
+    })?;
+    if !resolved.starts_with(&base) {
+        return Err(ToolFailure::Invalid(
+            "capture_path must be inside the served directory".into(),
+        ));
+    }
+    Ok(resolved)
+}
+
 fn queue_capture(
     queue: &dyn QueueService,
-    base_dir: &std::path::Path,
+    ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
     expect_keys(
@@ -224,8 +428,8 @@ fn queue_capture(
     )?;
     let title = required_string(args, "title")?;
     let directory = match optional_string(args, "capture_path")? {
-        Some(path) => PathBuf::from(path),
-        None => base_dir.to_path_buf(),
+        Some(path) => capture_directory(ctx, PathBuf::from(path))?,
+        None => ctx.base_dir.clone(),
     };
     let context = discover(DiscoverOptions {
         directory,
@@ -260,7 +464,7 @@ fn queue_capture(
         dependencies: optional_i64_array(args, "dependencies")?,
         feature: optional_feature(args)?,
         policy: context.policy,
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
         context_source: serde_json::to_value(context.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
@@ -404,6 +608,7 @@ fn queue_claim_next(
 
 fn queue_heartbeat(
     queue: &dyn QueueService,
+    ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
     expect_keys(args, &["task_id", "id", "claim_token", "lease_minutes"])?;
@@ -415,12 +620,16 @@ fn queue_heartbeat(
         task_id: required_task_id(args)?,
         claim_token: required_string(args, "claim_token")?,
         lease,
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(claim).unwrap_or(Value::Null))
 }
 
-fn queue_start(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+fn queue_start(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
     expect_keys(
         args,
         &[
@@ -438,23 +647,28 @@ fn queue_start(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Va
         branch: optional_string(args, "branch")?,
         worktree_path: optional_string(args, "worktree_path")?
             .or(optional_string(args, "worktree")?),
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
 }
 
-fn queue_block(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+fn queue_block(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
     expect_keys(args, &["task_id", "id", "claim_token"])?;
     let task = queue.block(BlockRequest {
         task_id: required_task_id(args)?,
         claim_token: Some(required_string(args, "claim_token")?),
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
 }
 
 fn queue_complete(
     queue: &dyn QueueService,
+    ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
     expect_keys(
@@ -479,7 +693,7 @@ fn queue_complete(
         summary: required_string(args, "summary")?,
         target,
         artifacts,
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
 }
@@ -550,25 +764,30 @@ fn queue_artifact(
     Ok(serde_json::to_value(artifact).unwrap_or(Value::Null))
 }
 
-fn queue_delete(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Value, ToolFailure> {
+fn queue_delete(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
     expect_keys(args, &["task_id", "force"])?;
     let outcome = queue.delete(DeleteRequest {
         task_id: required_task_id(args)?,
         force: optional_bool(args, "force")?,
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
 }
 
 fn queue_release(
     queue: &dyn QueueService,
+    ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
     expect_keys(args, &["task_id", "id", "claim_token"])?;
     let task = queue.release(ReleaseRequest {
         task_id: required_task_id(args)?,
         claim_token: required_string(args, "claim_token")?,
-        actor: Actor::agent("mcp"),
+        actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
 }
@@ -696,26 +915,24 @@ fn optional_i64_array(args: &Map<String, Value>, key: &str) -> Result<Vec<i64>, 
     }
 }
 
-fn rpc_result(id: Value, result: Value) -> String {
-    serde_json::to_string(&json!({
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": result,
-    }))
-    .expect("rpc result serializes")
+    })
 }
 
-fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> String {
+fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
     if let Some(data) = data {
         error["data"] = data;
     }
-    serde_json::to_string(&json!({
+    json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": error,
-    }))
-    .expect("rpc error serializes")
+    })
 }
 
 fn tool_success(value: Value) -> Value {
@@ -733,8 +950,8 @@ fn tool_error(error: &QueueError) -> Value {
     })
 }
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
+fn tool_definitions(human_tools: bool) -> Vec<Value> {
+    let mut tools = vec![
         tool(
             "queue_capture",
             "Capture a task. It is ready and claimable at once unless hold is true, which keeps it held until a human runs q ready.",
@@ -988,7 +1205,72 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             }),
         ),
-    ]
+        tool(
+            "queue_status",
+            "Counts per status plus active and expired claims.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        ),
+        tool(
+            "queue_edit",
+            "Edit task fields. Omitted fields are unchanged. Pass an empty array to clear capabilities or dependencies, and clear_* flags to unset project, repo, agent_pool, or feature.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["implementation", "research", "review", "benchmark", "documentation", "other"]},
+                    "priority": {"type": "integer"},
+                    "risk": {"type": "string", "enum": ["low", "medium", "high", "external_action"]},
+                    "project": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "agent_pool": {"type": "string"},
+                    "capabilities": {"type": "array", "items": {"type": "string"}},
+                    "dependencies": {"type": "array", "items": {"type": "integer"}},
+                    "feature": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                    "clear_project": {"type": "boolean"},
+                    "clear_repo": {"type": "boolean"},
+                    "clear_agent_pool": {"type": "boolean"},
+                    "clear_feature": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_cancel",
+            "Cancel a task. The task and its history are kept; use queue_delete to remove it.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {"task_id": {"type": "integer"}},
+                "additionalProperties": false
+            }),
+        ),
+    ];
+    if human_tools {
+        tools.push(tool(
+            "queue_ready",
+            "Move a held or blocked task to ready so agents may claim it. Confirm the task is well specified first.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {"task_id": {"type": "integer"}},
+                "additionalProperties": false
+            }),
+        ));
+        tools.push(tool(
+            "queue_reopen",
+            "Move a done task back to ready.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {"task_id": {"type": "integer"}},
+                "additionalProperties": false
+            }),
+        ));
+    }
+    tools
 }
 
 /// Schema for an `artifacts` array on complete and log.
@@ -1637,6 +1919,155 @@ mod tests {
             .iter()
             .map(|task| task["id"].as_i64().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn human_tools_are_gated_by_the_session() {
+        let queue = temp_queue();
+
+        // A stdio session never lists or runs the ready tool.
+        let mut agent = Session::new(std::env::temp_dir());
+        call(&mut agent, &queue, "initialize", 1, json!({}));
+        let listed = call(&mut agent, &queue, "tools/list", 2, json!({}));
+        let names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.iter().any(|name| name == "queue_ready"));
+        assert!(names.iter().any(|name| name == "queue_edit"));
+        assert!(names.iter().any(|name| name == "queue_cancel"));
+        assert!(names.iter().any(|name| name == "queue_status"));
+        let captured = call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "Chat triage", "hold": true, "capture_path": std::env::temp_dir()}}),
+        );
+        let id = tool_body(&captured)["id"].as_i64().unwrap();
+        let denied = call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_ready", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(denied["error"]["code"], -32602);
+        assert!(denied["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("human"));
+
+        // A human session over q serve lists it, runs it, and is recorded as
+        // the human, not as the agent `mcp`.
+        let mut human = Session::new(std::env::temp_dir())
+            .with_actor(Actor::human(Some("pierric".into())))
+            .with_human_tools(true)
+            .stateless();
+        let listed = call(&mut human, &queue, "tools/list", 5, json!({}));
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "queue_ready"));
+        let edited = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_edit", "arguments": {"task_id": id, "priority": 5, "body": "Goal: ship it"}}),
+        );
+        assert_eq!(tool_body(&edited)["priority"], 5);
+        let ready = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_ready", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(tool_body(&ready)["task"]["status"], "ready");
+        let status = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            8,
+            json!({"name": "queue_status", "arguments": {}}),
+        );
+        assert_eq!(tool_body(&status)["counts"]["ready"], 1);
+        let events = queue.events(id).unwrap();
+        let ready_event = events
+            .iter()
+            .find(|event| event.event_type == "task_ready")
+            .unwrap();
+        assert_eq!(ready_event.actor_type, "human");
+        assert_eq!(ready_event.actor_id.as_deref(), Some("pierric"));
+        let cancelled = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            9,
+            json!({"name": "queue_cancel", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(tool_body(&cancelled)["status"], "cancelled");
+        let nothing = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            10,
+            json!({"name": "queue_edit", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(nothing["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn confined_sessions_keep_capture_paths_inside_the_served_directory() {
+        let queue = temp_queue();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("q-confined-{nanos}"));
+        std::fs::create_dir_all(base.join("inner")).unwrap();
+        let mut session = Session::new(base.clone()).stateless().confined();
+        let outside = session
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "peek", "capture_path": "/"}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(outside["error"]["code"], -32602, "{outside}");
+        assert!(outside["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("served directory"));
+        let inside = session
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "ok", "capture_path": "inner"}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(inside["result"]["isError"], false, "{inside}");
+        // An unconfined (stdio) session keeps the old behaviour.
+        let mut local = Session::new(base.clone()).stateless();
+        let anywhere = local
+            .handle_value(
+                &queue,
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                    "name": "queue_capture",
+                    "arguments": {"title": "local", "capture_path": std::env::temp_dir()}
+                }}),
+            )
+            .unwrap();
+        assert_eq!(anywhere["result"]["isError"], false, "{anywhere}");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
