@@ -167,9 +167,64 @@ pub fn format_relative(then: OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
+/// Relative time to the second, for `q top`, where a row is watched tick by
+/// tick: `12s ago`, `3m 12s ago`, `2h 05m ago`. Beyond a day it falls back
+/// to [`format_relative`].
+pub fn format_relative_precise(then: OffsetDateTime, now: OffsetDateTime) -> String {
+    let delta = now.unix_timestamp().saturating_sub(then.unix_timestamp());
+    let future = delta < 0;
+    let seconds = delta.unsigned_abs();
+    if seconds >= DAY {
+        return format_relative(then, now);
+    }
+    let body = if seconds < MINUTE {
+        format!("{seconds}s")
+    } else if seconds < HOUR {
+        format!("{}m {:02}s", seconds / MINUTE, seconds % MINUTE)
+    } else {
+        format!("{}h {:02}m", seconds / HOUR, (seconds % HOUR) / MINUTE)
+    };
+    if future {
+        format!("in {body}")
+    } else {
+        format!("{body} ago")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precise_relative_times_tick_by_the_second() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let at = |ts: i64| OffsetDateTime::from_unix_timestamp(ts).unwrap();
+        assert_eq!(format_relative_precise(now, now), "0s ago");
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() - 12), now),
+            "12s ago"
+        );
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() - 59), now),
+            "59s ago"
+        );
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() - 192), now),
+            "3m 12s ago"
+        );
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() - 7500), now),
+            "2h 05m ago"
+        );
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() - 6 * 86400), now),
+            "6d ago"
+        );
+        assert_eq!(
+            format_relative_precise(at(now.unix_timestamp() + 10), now),
+            "in 10s"
+        );
+    }
 
     fn at(seconds: i64) -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(seconds).unwrap()

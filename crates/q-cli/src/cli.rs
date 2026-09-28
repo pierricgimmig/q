@@ -287,8 +287,8 @@ pub enum Commands {
     },
     /// Watch the queue. Redraws counts, the task table, and recent changes; press q to quit.
     Top {
-        /// Seconds between refreshes.
-        #[arg(short = 'i', long, default_value_t = 2.0, value_name = "SECONDS")]
+        /// Seconds between refreshes. Default 1, so ages tick by the second.
+        #[arg(short = 'i', long, default_value_t = 1.0, value_name = "SECONDS")]
         interval: f64,
         /// Show only this status. Includes done or cancelled when that status is named.
         #[arg(long, value_name = "STATUS")]
