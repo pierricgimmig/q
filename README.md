@@ -1,10 +1,8 @@
 # q
 
-The work queue for your coding agents. If you run more than one Claude Code,
-Codex or Cursor session at a time, you already have a queue, spread across
-chat windows and a TODO file. `q` makes it explicit: you capture tasks and say
-which are ready; idle agents claim them, one at a time, atomically, over the
-CLI or MCP; you watch the queue move.
+The explicit work queue for your coding agents. Capture tasks and say which
+are ready; idle Claude Code, Codex or Cursor sessions claim them, one at a
+time, atomically, over the CLI or MCP; you watch the queue move.
 
 ![q top](docs/images/q-top.png)
 
