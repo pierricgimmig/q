@@ -148,6 +148,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--artifact"
             | "--attach"
             | "--progress"
+            | "--activity"
             | "--target"
             | "--capability"
             | "--capabilities"
@@ -546,6 +547,10 @@ pub enum Commands {
         /// New lease length in minutes. Default 30.
         #[arg(long)]
         lease_minutes: Option<u64>,
+        /// What you are doing right now, for example "Bash: cargo test".
+        /// Shown in q top and q show until the next heartbeat replaces it.
+        #[arg(long, value_name = "TEXT")]
+        activity: Option<String>,
     },
     /// Mark claimed work in progress.
     Start {

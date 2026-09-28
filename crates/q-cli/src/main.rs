@@ -742,6 +742,7 @@ fn dispatch(
             id,
             claim_token,
             lease_minutes,
+            activity,
         } => {
             let lease = match lease_minutes {
                 Some(minutes) => Some(lease_from_minutes(minutes)?),
@@ -751,6 +752,7 @@ fn dispatch(
                 task_id: id,
                 claim_token,
                 lease,
+                activity,
                 actor: human_actor(),
             })?;
             emit(ui, &claim, || {
@@ -2030,6 +2032,10 @@ struct TaskListRow {
     /// Who, when, and why, while the task is escalated. Blank otherwise.
     escalated: String,
     title: String,
+    /// What the claiming agent last said it was doing, with its age. Blank
+    /// when nothing was reported; the column only appears when some row
+    /// has one.
+    activity: String,
 }
 
 fn print_task_list(tasks: &[TaskSummary], paint: Paint) {
@@ -2117,6 +2123,27 @@ fn task_list_row_with(
         stale,
         escalated: escalation_cell(task, now, precise),
         title: format_list_title(&task.title),
+        activity: format_activity(task.activity.as_deref(), task.activity_at, now),
+    }
+}
+
+const ACTIVITY_MAX_CHARS: usize = 40;
+
+/// `Bash: cargo test (12s)`: the agent's last reported activity and how long
+/// ago it was reported. Blank when the active claim never reported one.
+fn format_activity(
+    activity: Option<&str>,
+    at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> String {
+    match (activity, at) {
+        (Some(text), Some(at)) => {
+            let age = style::format_relative(at, now);
+            let age = age.strip_suffix(" ago").unwrap_or(&age).to_string();
+            format!("{} ({age})", truncate_chars(text, ACTIVITY_MAX_CHARS))
+        }
+        (Some(text), None) => truncate_chars(text, ACTIVITY_MAX_CHARS),
+        _ => String::new(),
     }
 }
 
@@ -2213,6 +2240,9 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
 }
 
 fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> String {
+    // The ACTIVITY column appears only while some agent has reported one,
+    // so a quiet queue keeps the compact table.
+    let with_activity = rows.iter().any(|row| !row.activity.is_empty());
     let mut headers = vec![
         "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TAGS",
     ];
@@ -2262,6 +2292,14 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
     let stale_style = Style::new()
         .bold()
         .fg_color(Some(anstyle::AnsiColor::Red.into()));
+    if with_activity {
+        headers.push("ACTIVITY");
+        align_right.push(false);
+        widths.push(column_width(
+            "ACTIVITY",
+            rows.iter().map(|row| row.activity.as_str()),
+        ));
+    }
     let header_styles = vec![style::dim_style(); headers.len()];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
@@ -2296,6 +2334,9 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
             ]);
         }
         cells.push(row.title.as_str());
+        if with_activity {
+            cells.push(row.activity.as_str());
+        }
         let mut styles = vec![
             style::dim_style(),
             style::status_style(&row.status),
@@ -2319,6 +2360,9 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
             ]);
         }
         styles.push(style::bold_style());
+        if with_activity {
+            styles.push(Style::new());
+        }
         let mut links = vec![None; cells.len()];
         links[7] = row.pr_url.as_deref();
         lines.push(format_task_line(
@@ -2696,6 +2740,15 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
         if let Some(branch) = &claim.branch {
             meta(paint, &format!("branch: {branch}"));
         }
+        if let Some(activity) = &claim.activity {
+            meta(
+                paint,
+                &format!(
+                    "activity: {activity} ({})",
+                    style::format_relative(claim.heartbeat_at, OffsetDateTime::now_utc())
+                ),
+            );
+        }
     }
     if !detail.artifacts.is_empty() {
         println!("\n{}", paint.bold("artifacts:"));
@@ -2906,6 +2959,7 @@ mod tests {
                 stale: String::new(),
                 escalated: String::new(),
                 title: "Short".into(),
+                activity: String::new(),
             },
             TaskListRow {
                 id: "3".into(),
@@ -2925,6 +2979,7 @@ mod tests {
                 stale: String::new(),
                 escalated: String::new(),
                 title: format_list_title(&long),
+                activity: String::new(),
             },
         ];
         let table = render_task_rows(&rows);
@@ -2974,6 +3029,7 @@ mod tests {
                 stale: String::new(),
                 escalated: String::new(),
                 title: "Keep the held item".into(),
+                activity: String::new(),
             },
             TaskListRow {
                 id: "2".into(),
@@ -2993,6 +3049,7 @@ mod tests {
                 stale: String::new(),
                 escalated: String::new(),
                 title: "Compare encodings".into(),
+                activity: String::new(),
             },
             TaskListRow {
                 id: "1".into(),
@@ -3012,6 +3069,7 @@ mod tests {
                 stale: String::new(),
                 escalated: String::new(),
                 title: "Unassigned capture".into(),
+                activity: String::new(),
             },
         ];
         let table = render_task_rows(&rows);
@@ -3050,6 +3108,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             stale: String::new(),
             escalated: String::new(),
             title: "Shipped".into(),
+            activity: String::new(),
         };
         let plain = render_task_rows(std::slice::from_ref(&row));
         assert!(
@@ -3106,6 +3165,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             stale: "stale".into(),
             escalated: String::new(),
             title: "Fix the parser".into(),
+            activity: String::new(),
         };
         let table = render_task_rows_painted(std::slice::from_ref(&row), Paint::plain(), true);
         let header = table.lines().next().unwrap();
@@ -3137,6 +3197,57 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
     }
 
     #[test]
+    fn activity_column_appears_only_when_reported() {
+        let mut row = TaskListRow {
+            id: "3".into(),
+            status: "in_progress".into(),
+            feature: "(none)".into(),
+            project: "alpha".into(),
+            priority: "0".into(),
+            progress: "40%".into(),
+            updated: "just now".into(),
+            pr_url: None,
+            tags: String::new(),
+            fails: String::new(),
+            model: String::new(),
+            host: String::new(),
+            note: String::new(),
+            beat: String::new(),
+            stale: String::new(),
+            escalated: String::new(),
+            title: "Port the encoder".into(),
+            activity: String::new(),
+        };
+        let quiet = render_task_rows(std::slice::from_ref(&row));
+        assert!(!quiet.contains("ACTIVITY"), "{quiet}");
+        row.activity = "Bash: cargo test (12s)".into();
+        let busy = render_task_rows(std::slice::from_ref(&row));
+        assert!(busy.contains("TITLE             ACTIVITY"), "{busy}");
+        assert!(
+            busy.contains("Port the encoder  Bash: cargo test (12s)"),
+            "{busy}"
+        );
+        let now = time::macros::datetime!(2026-09-27 10:00:00 UTC);
+        assert_eq!(
+            super::format_activity(
+                Some("Bash:   cargo   test"),
+                Some(now - time::Duration::seconds(12)),
+                now
+            ),
+            "Bash:   cargo   test (just now)"
+        );
+        assert_eq!(
+            super::format_activity(
+                Some("Read main.rs"),
+                Some(now - time::Duration::minutes(3)),
+                now
+            ),
+            "Read main.rs (3m)"
+        );
+        assert_eq!(super::format_activity(None, None, now), "");
+    }
+
+    #[test]
     fn color_does_not_change_visible_table_or_tree() {
         let rows = vec![TaskListRow {
             id: "2".into(),
@@ -3156,6 +3267,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             stale: String::new(),
             escalated: String::new(),
             title: "Compare encodings".into(),
+            activity: String::new(),
         }];
         let plain = render_task_rows(&rows);
         let colored = render_task_rows_painted(&rows, crate::style::Paint::color(), false);

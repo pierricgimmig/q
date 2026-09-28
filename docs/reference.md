@@ -265,6 +265,7 @@ q claim --agent codex-local-01 --model opus --tag rust
 q claim --agent claude-local-01 --repo github.com/acme/profiler-core --json
 q claim 184 --agent claude-local-01 --json
 q heartbeat 184 --claim-token TOKEN
+q heartbeat 184 --claim-token TOKEN --activity "Bash: cargo test --workspace"
 q note 184 "running tests" --claim-token TOKEN
 q fail 184 "tests failed" --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
@@ -277,6 +278,8 @@ q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.m
 q log 184
 q artifact 7
 ```
+
+`--activity` on a heartbeat records what the agent is doing right now on its claim. `q top` and `q ls` show it in an `ACTIVITY` column with its age while any agent has reported one, and `q show` prints it. A heartbeat without `--activity` keeps the previous line. `tools/hooks/q-activity.sh` is a Claude Code `PreToolUse` hook that sends it automatically from each tool call; the design is in `docs/blog/live-agent-introspection.html`.
 
 `q claim` runs inside one `BEGIN IMMEDIATE` transaction: recover expired claims, select one eligible ready task, mark it claimed, insert an opaque token and lease, and record `task_claimed`. No eligible work is success, not an error:
 

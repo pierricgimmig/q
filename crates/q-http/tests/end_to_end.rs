@@ -171,6 +171,7 @@ fn full_claim_lifecycle_over_http() {
             task_id: task.id,
             claim_token: lease.token.clone(),
             lease: None,
+            activity: None,
             actor: Actor::agent("agent-1"),
         })
         .unwrap();
@@ -181,6 +182,7 @@ fn full_claim_lifecycle_over_http() {
             task_id: task.id,
             claim_token: "not-the-token".into(),
             lease: None,
+            activity: None,
             actor: Actor::agent("agent-1"),
         })
         .unwrap_err();

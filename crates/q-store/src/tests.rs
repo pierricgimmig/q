@@ -267,6 +267,7 @@ fn expired_claims_are_recovered_with_events_and_can_be_reclaimed() {
             task_id: id,
             claim_token: first.claim.as_ref().unwrap().token.clone(),
             lease: None,
+            activity: None,
             actor: actor(),
         })
         .unwrap_err();
@@ -329,6 +330,7 @@ fn heartbeat_extends_only_a_matching_unexpired_token() {
             task_id: id,
             claim_token: "not-the-token".into(),
             lease: None,
+            activity: None,
             actor: actor(),
         })
         .unwrap_err();
@@ -341,6 +343,7 @@ fn heartbeat_extends_only_a_matching_unexpired_token() {
             task_id: id,
             claim_token: token,
             lease: Some(std::time::Duration::from_secs(60 * 60)),
+            activity: None,
             actor: actor(),
         })
         .unwrap();
@@ -353,6 +356,7 @@ fn heartbeat_extends_only_a_matching_unexpired_token() {
             task_id: id,
             claim_token: updated.token,
             lease: None,
+            activity: None,
             actor: actor(),
         })
         .unwrap_err();
@@ -478,6 +482,7 @@ fn events_are_append_only_across_status_changes() {
             task_id: id,
             claim_token: token,
             lease: None,
+            activity: None,
             actor: actor(),
         })
         .unwrap();
@@ -2574,4 +2579,53 @@ fn escalate_parks_the_task_until_a_human_marks_it_ready() {
     let again = claim(&queue, "agent-d");
     assert!(again.found);
     assert_eq!(again.task.unwrap().task.id, id);
+}
+
+#[test]
+fn heartbeat_records_the_agent_activity_and_list_shows_it() {
+    let (queue, _path) = queue();
+    let id = capture(&queue, "busy work");
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-busy").claim.unwrap().token;
+    let beat = |activity: Option<&str>| {
+        queue
+            .heartbeat(HeartbeatRequest {
+                task_id: id,
+                claim_token: token.clone(),
+                lease: None,
+                activity: activity.map(str::to_string),
+                actor: actor(),
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        beat(Some("  Bash:   cargo   test  ")).activity.as_deref(),
+        Some("Bash: cargo test")
+    );
+    // A heartbeat without activity keeps the previous line.
+    assert_eq!(beat(None).activity.as_deref(), Some("Bash: cargo test"));
+    let long = "x".repeat(500);
+    assert_eq!(
+        beat(Some(&long)).activity.unwrap().chars().count(),
+        q_core::ACTIVITY_MAX_CHARS
+    );
+    let rows = queue.list(ListFilter::default()).unwrap();
+    let row = rows.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(
+        row.activity.as_deref().map(str::len),
+        Some(q_core::ACTIVITY_MAX_CHARS)
+    );
+    assert!(row.activity_at.is_some());
+    assert!(queue.get(id).unwrap().claim.unwrap().activity.is_some());
+    // A released claim no longer contributes an activity to the summary.
+    queue
+        .release(ReleaseRequest {
+            task_id: id,
+            claim_token: token.clone(),
+            actor: actor(),
+        })
+        .unwrap();
+    let rows = queue.list(ListFilter::default()).unwrap();
+    let row = rows.iter().find(|task| task.id == id).unwrap();
+    assert_eq!(row.activity, None);
 }

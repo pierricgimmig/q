@@ -2171,3 +2171,60 @@ fn top_releases_a_claim_whose_lease_expired() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn heartbeat_activity_shows_in_top_ls_and_show() {
+    let root = temp_root("activity");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let id = add_task(db_arg, "Watch me work", "alpha", None, None);
+    add_task(db_arg, "Idle task", "alpha", None, None);
+    let claimed = run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "bot"]));
+    let claim: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+    let quiet = run(bin().args(["--db", db_arg, "ls"]));
+    assert!(!String::from_utf8(quiet.stdout)
+        .unwrap()
+        .contains("ACTIVITY"));
+
+    run(bin().args([
+        "--db",
+        db_arg,
+        "heartbeat",
+        &id.to_string(),
+        "--claim-token",
+        &token,
+        "--activity",
+        "Bash: cargo test --workspace",
+    ]));
+    let listed = run(bin().args(["--db", db_arg, "ls"]));
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("TITLE          ACTIVITY"), "{listed}");
+    assert!(
+        listed.contains("Watch me work  Bash: cargo test --workspace (just now)"),
+        "{listed}"
+    );
+    let top = run(bin().args(["--db", db_arg, "top", "--once"]));
+    let top = String::from_utf8(top.stdout).unwrap();
+    assert!(
+        top.contains("Bash: cargo test --workspace (just now)"),
+        "{top}"
+    );
+    let shown = run(bin().args(["--db", db_arg, "show", &id.to_string()]));
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        shown.contains("activity: Bash: cargo test --workspace (just now)"),
+        "{shown}"
+    );
+    let json = run(bin().args(["--db", db_arg, "--json", "ls"]));
+    let rows: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let row = rows["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == id)
+        .unwrap();
+    assert_eq!(row["activity"], "Bash: cargo test --workspace");
+    assert!(row["activity_at"].is_string());
+    let _ = fs::remove_dir_all(root);
+}

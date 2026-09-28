@@ -383,6 +383,12 @@ pub struct TaskSummary {
     /// Value of the newest `pr` artifact, usually the pull request URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// The active claim's last reported activity, see [`Claim::activity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// When that activity was reported (the claim's last heartbeat).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "ts_opt")]
+    pub activity_at: Option<OffsetDateTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,6 +422,10 @@ pub struct Claim {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// What the agent reported it is doing right now, set by heartbeat.
+    /// Free text such as `Bash: cargo test`; `heartbeat_at` says how old it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "ts_opt")]
     pub released_at: Option<OffsetDateTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -960,8 +970,15 @@ pub struct HeartbeatRequest {
     pub task_id: i64,
     pub claim_token: String,
     pub lease: Option<Duration>,
+    /// Current activity to record on the claim, for example the tool call
+    /// the agent just started. `None` leaves the previous value.
+    #[serde(default)]
+    pub activity: Option<String>,
     pub actor: Actor,
 }
+
+/// Longest activity line kept on a claim.
+pub const ACTIVITY_MAX_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartRequest {

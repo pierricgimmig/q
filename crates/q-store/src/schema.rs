@@ -147,6 +147,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     ensure_claim_identity(&tx)?;
     ensure_task_failures_and_tags(&tx)?;
     ensure_escalation(&tx)?;
+    ensure_claim_activity(&tx)?;
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
@@ -306,6 +307,22 @@ fn ensure_task_progress(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError
         .map_err(|err| QueueError::Database(err.to_string()))?;
     if has_progress == 0 {
         tx.execute_batch("ALTER TABLE tasks ADD COLUMN progress INTEGER;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Add `claims.activity` (what the agent last said it was doing) when missing.
+fn ensure_claim_activity(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    let has: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('claims') WHERE name = 'activity'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueueError::Database(err.to_string()))?;
+    if has == 0 {
+        tx.execute_batch("ALTER TABLE claims ADD COLUMN activity TEXT;")
             .map_err(|err| QueueError::Database(err.to_string()))?;
     }
     Ok(())
