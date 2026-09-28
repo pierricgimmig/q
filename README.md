@@ -46,7 +46,7 @@ q ls -a
 
 ![q ls -a](docs/images/q-ls.png)
 
-`q top` is the same table, redrawn every two seconds, with the last changes
+`q top` is the same table, redrawn every second with ages to the second, with the last changes
 underneath. Press `q` to leave it.
 
 ## The log

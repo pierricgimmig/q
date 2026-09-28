@@ -1614,7 +1614,7 @@ fn top_frame(
     if visible.is_empty() {
         out.push_str("no tasks\n");
     } else {
-        out.push_str(&render_task_table(&visible, paint));
+        out.push_str(&render_task_table_precise(&visible, paint));
         out.push('\n');
     }
     out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
@@ -1897,6 +1897,16 @@ fn print_task_list(tasks: &[TaskSummary], paint: Paint) {
     println!("{}", render_task_table(tasks, paint));
 }
 
+/// The table as `q top` draws it: ages tick by the second.
+fn render_task_table_precise(tasks: &[TaskSummary], paint: Paint) -> String {
+    let now = OffsetDateTime::now_utc();
+    let rows: Vec<TaskListRow> = tasks
+        .iter()
+        .map(|task| task_list_row_with(task, now, true))
+        .collect();
+    render_task_rows_painted(&rows, paint)
+}
+
 fn render_task_table(tasks: &[TaskSummary], paint: Paint) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<TaskListRow> = tasks.iter().map(|task| task_list_row(task, now)).collect();
@@ -1904,6 +1914,16 @@ fn render_task_table(tasks: &[TaskSummary], paint: Paint) -> String {
 }
 
 fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
+    task_list_row_with(task, now, false)
+}
+
+/// `precise` shows ages to the second (`12s ago`) for a live view.
+fn task_list_row_with(task: &TaskSummary, now: OffsetDateTime, precise: bool) -> TaskListRow {
+    let updated = if precise {
+        style::format_relative_precise(task.updated_at, now)
+    } else {
+        style::format_relative(task.updated_at, now)
+    };
     TaskListRow {
         id: task.id.to_string(),
         status: task.status.to_string(),
@@ -1911,7 +1931,7 @@ fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
         project: display_project(task.project.as_deref()),
         priority: task.priority.to_string(),
         progress: format_progress(task.progress),
-        updated: style::format_relative(task.updated_at, now),
+        updated,
         pr_url: task.pr_url.clone(),
         title: format_list_title(&task.title),
     }

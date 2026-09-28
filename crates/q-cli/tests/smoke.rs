@@ -1237,11 +1237,15 @@ fn top_once_prints_counts_table_and_changes() {
     let frame = run(bin().args(["--db", db_arg, "top", "--once"]));
     let text = String::from_utf8(frame.stdout).unwrap();
     assert!(text.starts_with("q top database: "), "{text}");
-    assert!(text.contains("every 2.0s"), "{text}");
+    assert!(text.contains("every 1.0s"), "{text}");
+    assert!(
+        text.contains("s ago"),
+        "top shows ages to the second: {text}"
+    );
     assert!(text.contains("held 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
     assert!(
-        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED   PR  TITLE"),
+        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE"),
         "{text}"
     );
     assert!(text.contains("Watch me"), "{text}");
