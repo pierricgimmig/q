@@ -297,4 +297,43 @@ mod tests {
         assert!(home.join(".codex/skills/q/SKILL.md").is_file());
         assert!(home.join(".claude/skills/q/SKILL.md").is_file());
     }
+
+    /// Every subcommand the binary accepts must be explained in the skill,
+    /// including nested ones such as `q feature ls` and `q project init`.
+    #[test]
+    fn skill_names_every_subcommand() {
+        use clap::CommandFactory;
+        fn walk(command: &clap::Command, prefix: &str, out: &mut Vec<String>) {
+            for sub in command.get_subcommands() {
+                if sub.is_hide_set() || sub.get_name() == "help" {
+                    continue;
+                }
+                let name = format!("{prefix} {}", sub.get_name());
+                out.push(name.clone());
+                walk(sub, &name, out);
+            }
+        }
+        let mut names = Vec::new();
+        walk(&crate::cli::Cli::command(), "q", &mut names);
+        assert!(names.len() > 25, "{names:?}");
+        let text = SKILL_MARKDOWN.replace("\\|", "|");
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                let (parent, leaf) = name.rsplit_once(' ').unwrap();
+                // `q feature create|ls|show` style rows count as naming each leaf.
+                !text.contains(name.as_str())
+                    && !text.split('`').any(|chunk| {
+                        chunk.starts_with(parent)
+                            && chunk.split('|').any(|alt| {
+                                alt.trim() == leaf || alt.trim().ends_with(&format!(" {leaf}"))
+                            })
+                    })
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "subcommands missing from the skill: {missing:?}"
+        );
+    }
 }
