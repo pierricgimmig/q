@@ -670,7 +670,7 @@ fn assert_aligned_table(table: &str) {
     // Match whole column names: "PR" must not match the start of "PROJECT".
     let columns: Vec<&str> = header.split_whitespace().collect();
     let present: Vec<usize> = [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TITLE",
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "TITLE", "PR",
     ]
     .iter()
     .filter_map(|label| columns.iter().position(|column| column == label))
@@ -1768,7 +1768,12 @@ fn pr_artifacts_show_as_a_link_in_the_table() {
     // Piped output keeps the address; a terminal gets a clickable PR label.
     let plain = run(bin().args(["--db", db_arg, "ls", "--all"]));
     let plain = String::from_utf8(plain.stdout).unwrap();
-    assert!(plain.contains("UPDATED   PR"), "{plain}");
+    let header = plain.lines().next().unwrap();
+    assert!(header.contains("UPDATED   TITLE"), "{plain}");
+    assert!(
+        header.trim_end().ends_with("PR"),
+        "PR trails the title: {plain}"
+    );
     assert!(plain.contains(url), "{plain}");
     let color = run(bin().args(["--db", db_arg, "--color", "always", "ls", "--all"]));
     let color = String::from_utf8(color.stdout).unwrap();
