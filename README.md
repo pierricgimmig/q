@@ -89,8 +89,13 @@ q tree --feature "Live viewer 1.0"
 ## Agents
 
 `q skill install` writes the agent skill into `~/.claude`, `~/.codex`,
-`~/.cursor` and `~/.agents`, so an agent that opens a session already knows
-to claim one task, heartbeat, log, and complete with the token.
+`~/.cursor` and `~/.agents`. After it is loaded, say **start the q worker**.
+The agent claims one ready task, heartbeats about every minute, notes
+meaningful steps, then marks the task done or failed and looks again. An
+empty queue waits about 30 seconds. There is no `q work` command: the agent
+does the work, and `q` only tracks it. A failed task goes back to ready so
+another agent can take it. A task that is too big, or that the worker cannot
+do, is escalated instead and waits for a human.
 
 For MCP clients, point them at the binary:
 

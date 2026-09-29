@@ -60,6 +60,9 @@ impl Server {
                     signing_key: SigningKey::ephemeral(),
                     base_dir: std::env::temp_dir(),
                     grants: Arc::new(q_http::GrantStore::in_memory().unwrap()),
+                    sweep_interval: std::time::Duration::from_secs(
+                        q_core::DEFAULT_LEASE_SWEEP_SECS,
+                    ),
                 };
                 serve_on(queue, listener, options, async move {
                     let _ = stopped.await;

@@ -133,11 +133,20 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     if current < 3 {
         apply_v3(&tx, &applied_at)?;
     }
+    if current < 4 {
+        apply_v4(&tx, &applied_at)?;
+    }
+    if current < 5 {
+        apply_v5(&tx, &applied_at)?;
+    }
     // Additive column checks run on every open, independent of the version
     // row. A database migrated by another branch can already sit above the
     // version a step is gated on, as `apply_v2` guards `feature_id` too.
     ensure_artifact_content(&tx)?;
     ensure_task_progress(&tx)?;
+    ensure_claim_identity(&tx)?;
+    ensure_task_failures_and_tags(&tx)?;
+    ensure_escalation(&tx)?;
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
@@ -200,6 +209,87 @@ fn ensure_artifact_content(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueEr
         .map_err(|err| QueueError::Database(err.to_string()))?;
     if has_content == 0 {
         tx.execute_batch("ALTER TABLE artifacts ADD COLUMN content TEXT;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// v4: claim identity (model, host), failure counts, and tags.
+fn apply_v4(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    ensure_claim_identity(tx)?;
+    ensure_task_failures_and_tags(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+fn column_exists(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool, QueueError> {
+    // `pragma_table_info` does not take a bound table name on every SQLite build.
+    let sql = match table {
+        "claims" => "SELECT COUNT(*) FROM pragma_table_info('claims') WHERE name = ?1",
+        "tasks" => "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = ?1",
+        other => {
+            return Err(QueueError::Database(format!(
+                "unknown table in migration check: {other}"
+            )))
+        }
+    };
+    let count: i64 = tx
+        .query_row(sql, params![column], |row| row.get(0))
+        .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(count > 0)
+}
+
+/// Add `claims.agent_model` and `claims.agent_host` when they are missing.
+fn ensure_claim_identity(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    if !column_exists(tx, "claims", "agent_model")? {
+        tx.execute_batch("ALTER TABLE claims ADD COLUMN agent_model TEXT;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    if !column_exists(tx, "claims", "agent_host")? {
+        tx.execute_batch("ALTER TABLE claims ADD COLUMN agent_host TEXT;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// v5: escalation reason, who, and when. The status itself is just a text value.
+fn apply_v5(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    ensure_escalation(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+/// Add escalation columns when they are missing.
+fn ensure_escalation(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    for column in ["escalated_reason", "escalated_by", "escalated_at"] {
+        if !column_exists(tx, "tasks", column)? {
+            tx.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {column} TEXT;"))
+                .map_err(|err| QueueError::Database(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Add `tasks.failure_count` and `tasks.tags_json` when they are missing.
+fn ensure_task_failures_and_tags(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    if !column_exists(tx, "tasks", "failure_count")? {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    if !column_exists(tx, "tasks", "tags_json")? {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';")
             .map_err(|err| QueueError::Database(err.to_string()))?;
     }
     Ok(())

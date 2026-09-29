@@ -203,19 +203,19 @@ q delete 184
 q reopen 184
 ```
 
-`q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. Statuses are `held`, `ready`, `claimed`, `in_progress`, `review`, `blocked`, `done`, and `cancelled`. `-n` sets the row limit (default 100).
+`q edit` with no flags opens `$VISUAL` or `$EDITOR` on the body. `-e` (`--edit`) does the same alongside other flags, seeded with `--body` or `--body-file` when given. `q ls` (alias `q list`) hides `done` and `cancelled`. `--all` (short `-a`) includes them. `--status` shows only that status, including `done` or `cancelled`, and does not require `--all`. Statuses are `held`, `ready`, `claimed`, `in_progress`, `review`, `blocked`, `escalated`, `done`, and `cancelled`. `q ls --escalated` is the same as `--status escalated`. `-n` sets the row limit (default 100).
 
-Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `PROG`, `UPDATED`, `PR`, `TITLE`. `PR` is the task's newest `pr` artifact (attached with `--artifact pr=URL` on `q log` or `q complete`): on a terminal it is a clickable `PR` label (an OSC 8 hyperlink, supported by most modern terminals), and when output is piped or color is off the full URL is printed instead. `q top` uses the same table, so a finished task's pull request is one click away there and in `q ls --all`; `q show` links the artifact too. `PROG` is the percent complete last reported by the working agent (`q log ID --progress 40`), blank until reported, `100%` once done. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
+Human output is an aligned table: `ID`, `STATUS`, `FEATURE`, `PROJECT`, `PRI`, `PROG`, `UPDATED`, `PR`, `TAGS`, `TITLE`. `TAGS` is the task's labels (`q add --tag` / `q edit --tag`, cleared with `--clear-tags`). `q ls --tag NAME` keeps tasks that carry every named tag. `PR` is the task's newest `pr` artifact (attached with `--artifact pr=URL` on `q log` or `q complete`): on a terminal it is a clickable `PR` label (an OSC 8 hyperlink, supported by most modern terminals), and when output is piped or color is off the full URL is printed instead. `q top` uses the same table, so a finished task's pull request is one click away there and in `q ls --all`; `q show` links the artifact too. `PROG` is the percent complete last reported by the working agent (`q log ID --progress 40`), blank until reported, `100%` once done. A task with no feature or project is shown as `(none)`. Rows are ordered by feature title, case-insensitively, with unset features last; then by project name the same way; then by newest `updated_at`. Titles longer than 64 characters are truncated with an ellipsis. `UPDATED` is a relative time (`3m ago`, `just now`). `q show` keeps the full UTC timestamp, along with the claim (model and host, printed as `-` when unset), tags, failure count, notes, artifacts, and recent events. `--json` prints the same rows as `{"tasks":[...]}` with absolute timestamps and no color.
 
 On a terminal, status is colored: `held` blue, `ready` green, `claimed` yellow, `in_progress` cyan, `review` magenta, `blocked` red, `done` bright green, `cancelled` dim strikethrough gray. Ids, projects, features, and times are dim. Titles are bold. Color follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE`, and turns off when stdout is not a terminal. `--color auto|always|never` overrides that (`always` wins over `NO_COLOR`). `--json` and `q mcp` are never colored. `-j` is short for `--json`.
 
 ```text
-ID  STATUS       FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
- 5  done         (none)   alpha      0  100%  5m ago   PR  Ship the parser
- 4  held         (none)   alpha      0        3m ago       Keep the held item
- 3  in_progress  (none)   alpha      0   40%  1m ago       Port the encoder
- 2  ready        (none)   beta       1        1h ago       Compare encodings
- 1  held         (none)   (none)     0        2d ago       Unassigned capture
+ID  STATUS       FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
+ 5  done         (none)   alpha      0  100%  5m ago   PR        Ship the parser
+ 4  held         (none)   alpha      0        3m ago             Keep the held item
+ 3  in_progress  (none)   alpha      0   40%  1m ago             Port the encoder
+ 2  ready        (none)   beta       1        1h ago             Compare encodings
+ 1  held         (none)   (none)     0        2d ago             Unassigned capture
 ```
 
 `q hold` and `q ready` are the human gate. `q hold ID` moves a ready or blocked task to `held`, where no agent can claim it. `q ready ID` releases a held or blocked task. Any task the state machine allows can be marked ready, including a sparse body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits. Neither command is exposed as an MCP tool, and a `q serve` agent token cannot call `ready`.
@@ -233,7 +233,7 @@ q top --feature "Cross-repo rollout"
 q top --once
 ```
 
-`q top` redraws the queue counts, the task table, and a list of recent changes every second until you press `q` (Esc and Ctrl-C also quit). While it runs the terminal is in raw mode, so keys you type are not echoed into the shell, and the mode is restored when it exits, including on an error. `-i` (`--interval`) sets the seconds between refreshes (default 1, minimum 0.1). The `UPDATED` column shows ages to the second there (`12s ago`, `3m 12s ago`), where `q ls` rounds them. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `-a`, and `-n`, default 30 rows). Recent changes are noticed between refreshes and listed newest first, up to ten, in aligned columns: time, id, the status before, the status after, and the title. A task seen for the first time comes from `new`, and a deleted task goes to `deleted`. The last frame stays on screen after quitting. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes and no key handling, so Ctrl-C quits there. `--json` is not supported; use `q ls --json` or `q status --json`.
+`q top` redraws the queue counts, the task table, and a list of recent changes every second until you press `q` (Esc and Ctrl-C also quit). Each frame also releases claims whose lease has expired, the same recovery `q claim` and `q serve` use, so a crashed worker does not sit in the table forever. While it runs the terminal is in raw mode, so keys you type are not echoed into the shell, and the mode is restored when it exits, including on an error. `-i` (`--interval`) sets the seconds between refreshes (default 1, minimum 0.1). The `UPDATED` column shows ages to the second there (`12s ago`, `3m 12s ago`), where `q ls` rounds them. The table takes the same filters as `q ls` (`--status`, `--kind`, `--feature`, `--tag`, `-a`, and `-n`, default 30 rows). Beyond the `q ls` columns it adds `FAILS` (blank until the task has failed), `MODEL`, `HOST`, `NOTE` (the latest note, only while a claim is active), `BEAT` (heartbeat age), and `STALE`. `--stale-after SECONDS` (default 120, `0` allowed) marks a worker `stale` when its last heartbeat is at least that old. That flag does not release the claim; the lease does. Recent changes are noticed between refreshes and listed newest first, up to ten, in aligned columns: time, id, the status before, the status after, and the title. A task seen for the first time comes from `new`, and a deleted task goes to `deleted`. The last frame stays on screen after quitting. `--once` draws a single frame and exits, and output that is not a terminal gets plain frames with no escape codes and no key handling, so Ctrl-C quits there. `--json` is not supported; use `q ls --json` or `q status --json`.
 
 ## Dependency tree
 
@@ -261,9 +261,11 @@ Titles use the same 64-character ellipsis as `q ls`. Status words use the same c
 ## Claim lifecycle
 
 ```bash
-q claim --agent codex-local-01
+q claim --agent codex-local-01 --model opus --tag rust
 q claim --agent claude-local-01 --repo github.com/acme/profiler-core --json
 q heartbeat 184 --claim-token TOKEN
+q note 184 "running tests" --claim-token TOKEN
+q fail 184 "tests failed" --claim-token TOKEN
 q start 184 --claim-token TOKEN --branch agent/task-184-trace-encoding
 q complete 184 --claim-token TOKEN --summary "Benchmark report committed" \
   --artifact report=./docs/benchmarks/trace-encoding.md
@@ -281,7 +283,15 @@ q artifact 7
 {"found": false, "reason": "no_eligible_ready_tasks"}
 ```
 
-Default lease is 45 minutes (minimum 1 minute, maximum 24 hours). Heartbeat extends only a matching, unexpired token. `block`, `release`, and `complete` of claimed or in-progress work require that token. A matching claim is retired rather than deleted, so branch and worktree history stay in the database.
+Default lease is 30 minutes (minimum 1 minute, maximum 24 hours), measured from the last heartbeat. Heartbeat extends only a matching, unexpired token. `block`, `release`, `fail`, `note`, and `complete` of claimed or in-progress work require that token. A matching claim is retired rather than deleted, so branch and worktree history stay in the database.
+
+`q claim` records the worker's model (`--model` or `$Q_AGENT_MODEL`) and hostname (`--host`, else `$Q_AGENT_HOST`, else this machine). Over `q serve` the server stores the host and model the client sends and does not substitute its own hostname. `q show` prints `model=-` and `host=-` when a claim has no value. The model and host cells in `q top` stay blank in that case.
+
+`--tag` on claim (repeatable; MCP `tags`; the same field on `POST /v1/claim_next`) keeps tasks that carry every tag, compared case-insensitively. An empty tag list is unrestricted. `--max-failures N` skips tasks whose failure count is already at least N. Omit it for no cap. `0` is rejected.
+
+`q fail ID [NOTE] --claim-token TOKEN` (`POST /v1/fail`, MCP `queue_fail`) releases the claim, increments `failure_count`, clears progress, stores the optional note on a `task_failed` event, and returns the task to ready. It is not a terminal status and it is not `q block`. Use it for a genuine execution failure.
+
+`q escalate ID REASON --claim-token TOKEN` (`POST /v1/escalate`, MCP `queue_escalate`) releases the claim and sets status `escalated`. The reason is required. The task records who escalated and when, and keeps the last reported progress. It is not claimable. `q top` shows who, when, and why in the `ESCALATED` column. `q show` prints `escalated_reason`, `escalated_by`, and `escalated_at`. A human reviews the queue with `q ls --escalated` or `q top --escalated` and returns a task to ready with `q ready` (human-only on `q serve`). `q hold` and `q cancel` are also allowed from `escalated`. This is a distinct status, not a flag on `ready`, so claim selection does not need a second check. `q note ID MESSAGE --claim-token TOKEN` (`POST /v1/note`, MCP `queue_note`) appends a `task_note`. `q show` lists those notes. `q top` shows the latest one while the claim is active.
 
 Default `--max-risk` is `medium`. High and `external_action` tasks are not selected unless the claim raises the ceiling. External-action tasks also require `allow_external_actions` on the project, which defaults to false. Empty repo, project, and kind filters mean unrestricted. Required capabilities must be a subset of the worker's capabilities. Dependencies must be `done`. A project's `max_parallel_jobs` counts claimed and in-progress tasks.
 
@@ -317,7 +327,7 @@ q recover-stale --to blocked
 q events 184
 ```
 
-Without `--to`, each task follows its project's stale policy (`ready` by default). Claim also recovers expired leases in the same transaction. There is no background daemon in v1. `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason, and events do not store one.
+Without `--to`, each task follows its project's stale policy (`ready` by default; `blocked` still parks the task). Claim, `q top`, and the `q serve` sweep (default every 15 seconds, `--sweep-interval SECONDS`, `0` disables it) all call that same recovery. A local queue has no extra daemon: the next claim, top frame, or `q recover-stale` releases the lease. The `task_recovered` event stores `reason` `lease_expired`. `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a user reason.
 
 ## JSON output
 
@@ -358,7 +368,9 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_edit` | Edit task fields, including feature, dependencies, and `clear_*` flags. |
 | `queue_status` | Counts per status plus active and expired claims. |
 | `queue_tree` | Dependency tree for a task id, or a forest for a feature id or unique title. Children are tasks that must be done first. |
-| `queue_claim_next` | Atomically claim one eligible ready task, or return no work. |
+| `queue_claim_next` | Atomically claim one eligible ready task, or return no work. Optional `tags`, `max_failures`, `agent_model`, `agent_host`. |
+| `queue_fail` | Release the claim, record an optional note, increment the failure count, and return the task to ready. |
+| `queue_note` | Append a short status message to a claimed task. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |
 | `queue_start` | Mark a claim in progress and record branch or worktree. |
 | `queue_block` | Block claimed work. Requires the claim token. |
@@ -379,7 +391,10 @@ Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`
   "allowed_repos": ["github.com/acme/profiler-core"],
   "allowed_kinds": ["implementation", "research", "benchmark"],
   "maximum_risk": "low",
-  "lease_minutes": 45
+  "lease_minutes": 30,
+  "agent_model": "opus",
+  "agent_host": "worker-a",
+  "tags": ["rust"]
 }
 ```
 

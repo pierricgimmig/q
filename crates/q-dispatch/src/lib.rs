@@ -16,6 +16,8 @@ pub struct EligibilityTask {
     pub agent_pool: Option<String>,
     pub required_capabilities: Vec<String>,
     pub dependency_statuses: Vec<TaskStatus>,
+    pub tags: Vec<String>,
+    pub failure_count: u32,
 }
 
 pub fn is_eligible(
@@ -96,6 +98,24 @@ pub fn is_eligible(
             return false;
         }
     }
+    if let Some(max_failures) = request.max_failures {
+        if task.failure_count >= max_failures {
+            return false;
+        }
+    }
+    if !request.tags.is_empty() {
+        let have: Vec<String> = task
+            .tags
+            .iter()
+            .map(|tag| tag.to_ascii_lowercase())
+            .collect();
+        if request.tags.iter().any(|tag| {
+            let key = tag.trim().to_ascii_lowercase();
+            !have.iter().any(|have| have == &key)
+        }) {
+            return false;
+        }
+    }
     true
 }
 
@@ -113,6 +133,8 @@ mod tests {
             agent_pool: None,
             required_capabilities: vec![],
             dependency_statuses: vec![],
+            tags: vec![],
+            failure_count: 0,
         }
     }
 
@@ -200,6 +222,27 @@ mod tests {
         candidate.agent_pool = Some("frontend".into());
         assert!(is_eligible(&candidate, &req, 0, None, false));
         candidate.agent_pool = None;
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+    }
+
+    #[test]
+    fn tags_must_all_match_and_failure_cap_skips_worn_tasks() {
+        let mut candidate = task();
+        candidate.tags = vec!["Rust".into(), "db".into()];
+        let mut req = request();
+        req.tags = vec!["rust".into()];
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+        req.tags = vec!["rust".into(), "db".into()];
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+        req.tags = vec!["python".into()];
+        assert!(!is_eligible(&candidate, &req, 0, None, false));
+        req.tags.clear();
+        candidate.failure_count = 2;
+        req.max_failures = Some(2);
+        assert!(!is_eligible(&candidate, &req, 0, None, false));
+        req.max_failures = Some(3);
+        assert!(is_eligible(&candidate, &req, 0, None, false));
+        req.max_failures = None;
         assert!(is_eligible(&candidate, &req, 0, None, false));
     }
 

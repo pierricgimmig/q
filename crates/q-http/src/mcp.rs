@@ -50,7 +50,9 @@ pub async fn post(State(state): State<Arc<AppState>>, headers: HeaderMap, body: 
             .with_human_tools(principal.role == Role::Human)
             .stateless()
             // Remote callers may not point captures at arbitrary server paths.
-            .confined();
+            .confined()
+            // Identity comes from the client. Do not stamp this machine.
+            .remote();
         match message {
             Value::Array(items) => {
                 let responses: Vec<Value> = items

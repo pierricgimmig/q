@@ -116,6 +116,9 @@ pub fn status_style(status: &str) -> Style {
         "in_progress" => Style::new().fg_color(Some(AnsiColor::Cyan.into())),
         "review" => Style::new().fg_color(Some(AnsiColor::Magenta.into())),
         "blocked" => Style::new().bold().fg_color(Some(AnsiColor::Red.into())),
+        "escalated" => Style::new()
+            .bold()
+            .fg_color(Some(AnsiColor::BrightYellow.into())),
         "done" => Style::new().fg_color(Some(AnsiColor::BrightGreen.into())),
         "cancelled" => Style::new()
             .dimmed()
@@ -281,6 +284,7 @@ mod tests {
             "in_progress",
             "review",
             "blocked",
+            "escalated",
             "done",
             "cancelled",
         ] {

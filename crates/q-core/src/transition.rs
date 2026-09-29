@@ -19,6 +19,11 @@ pub fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
             | (InProgress, Done)
             | (InProgress, Blocked)
             | (InProgress, Ready)
+            | (Claimed, Escalated)
+            | (InProgress, Escalated)
+            | (Escalated, Ready)
+            | (Escalated, Held)
+            | (Escalated, Cancelled)
             | (Review, Done)
             | (Review, InProgress)
             | (Review, Blocked)
@@ -43,8 +48,8 @@ mod tests {
     use super::*;
     use TaskStatus::*;
 
-    const ALL: [TaskStatus; 8] = [
-        Held, Ready, Claimed, InProgress, Review, Blocked, Done, Cancelled,
+    const ALL: [TaskStatus; 9] = [
+        Held, Ready, Claimed, InProgress, Review, Blocked, Escalated, Done, Cancelled,
     ];
 
     #[test]
@@ -64,6 +69,11 @@ mod tests {
             (InProgress, Done),
             (InProgress, Blocked),
             (InProgress, Ready),
+            (Claimed, Escalated),
+            (InProgress, Escalated),
+            (Escalated, Ready),
+            (Escalated, Held),
+            (Escalated, Cancelled),
             (Review, Done),
             (Review, InProgress),
             (Review, Blocked),
@@ -100,6 +110,9 @@ mod tests {
             (Cancelled, Done),
             (Review, Ready),
             (Review, Claimed),
+            (Ready, Escalated),
+            (Escalated, Claimed),
+            (Escalated, Done),
         ];
         for (from, to) in forbidden {
             assert!(

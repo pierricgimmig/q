@@ -39,6 +39,12 @@ pub trait QueueService: Send + Sync {
     /// case that claim is cleared too.
     fn delete(&self, request: DeleteRequest) -> Result<DeleteOutcome, QueueError>;
     fn claim_next(&self, request: ClaimRequest) -> Result<ClaimOutcome, QueueError>;
+    /// Release the claim, increment the failure count, and return the task to ready.
+    fn fail(&self, request: crate::model::FailRequest) -> Result<Task, QueueError>;
+    /// Release the claim and park the task as `escalated` until a human marks it ready.
+    fn escalate(&self, request: crate::model::EscalateRequest) -> Result<Task, QueueError>;
+    /// Append a short status note to a claimed task.
+    fn note(&self, request: crate::model::NoteRequest) -> Result<TaskDetail, QueueError>;
     fn heartbeat(&self, request: HeartbeatRequest) -> Result<crate::model::Claim, QueueError>;
     fn start(&self, request: StartRequest) -> Result<TaskDetail, QueueError>;
     fn complete(&self, request: CompleteRequest) -> Result<TaskDetail, QueueError>;
