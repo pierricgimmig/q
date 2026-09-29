@@ -662,17 +662,20 @@ fn assert_aligned_table(table: &str) {
     let lines: Vec<&str> = table.lines().filter(|line| !line.is_empty()).collect();
     assert!(lines.len() >= 2, "{table}");
     let header = lines[0];
-    for label in [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "UPDATED", "TITLE",
-    ] {
+    // Fixed columns always show; the rest only when some row has a value,
+    // so check the canonical order over whichever columns are present.
+    for label in ["ID", "STATUS", "PROJECT", "UPDATED", "TITLE"] {
         assert!(header.contains(label), "{header}");
     }
-    assert!(header.find("ID").unwrap() < header.find("STATUS").unwrap());
-    assert!(header.find("STATUS").unwrap() < header.find("FEATURE").unwrap());
-    assert!(header.find("FEATURE").unwrap() < header.find("PROJECT").unwrap());
-    assert!(header.find("PROJECT").unwrap() < header.find("PRI").unwrap());
-    assert!(header.find("PRI").unwrap() < header.find("UPDATED").unwrap());
-    assert!(header.find("UPDATED").unwrap() < header.find("TITLE").unwrap());
+    // Match whole column names: "PR" must not match the start of "PROJECT".
+    let columns: Vec<&str> = header.split_whitespace().collect();
+    let present: Vec<usize> = [
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TITLE",
+    ]
+    .iter()
+    .filter_map(|label| columns.iter().position(|column| column == label))
+    .collect();
+    assert!(present.windows(2).all(|pair| pair[0] < pair[1]), "{header}");
     let width = header.chars().count();
     assert!(
         lines.iter().all(|line| line.chars().count() == width),
@@ -1303,26 +1306,24 @@ fn top_once_prints_counts_table_and_changes() {
     );
     assert!(text.contains("held 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
-    assert!(
-        text.contains("TAGS") && text.contains("STALE") && text.contains("Watch me"),
+    // Columns that are blank for every shown row are hidden, so a narrow
+    // terminal is not spent on them.
+    let header = text.lines().find(|line| line.contains("TITLE")).unwrap();
+    assert_eq!(
+        header.trim_end(),
+        "ID  STATUS  PROJECT  UPDATED  TITLE",
         "{text}"
     );
-    let header = text.lines().find(|line| line.contains("TITLE")).unwrap();
-    for (left, right) in [
-        ("PR", "TAGS"),
-        ("TAGS", "FAILS"),
-        ("FAILS", "MODEL"),
-        ("MODEL", "HOST"),
-        ("HOST", "NOTE"),
-        ("NOTE", "BEAT"),
-        ("BEAT", "STALE"),
-        ("STALE", "ESCALATED"),
-        ("ESCALATED", "TITLE"),
+    for hidden in [
+        "FEATURE",
+        "PRI",
+        "PROG",
+        "TAGS",
+        "FAILS",
+        "STALE",
+        "ESCALATED",
     ] {
-        assert!(
-            header.find(left).unwrap() < header.find(right).unwrap(),
-            "{header}"
-        );
+        assert!(!header.contains(hidden), "{header}");
     }
     assert!(text.contains("Watch me"), "{text}");
     assert!(text.contains("recent changes\n  none yet"), "{text}");
@@ -1545,7 +1546,7 @@ fn log_and_artifact_commands_keep_a_per_task_log() {
     assert!(!rejected.status.success());
     let listed = run(bin().args(["--db", db_arg, "ls"]));
     let listed = String::from_utf8(listed.stdout).unwrap();
-    assert!(listed.contains("PRI  PROG  UPDATED"), "{listed}");
+    assert!(listed.contains("PROG  UPDATED"), "{listed}");
     assert!(listed.contains("  40%  "), "{listed}");
     let shown_progress = run(bin().args(["--db", db_arg, "show", &id_arg]));
     assert!(String::from_utf8(shown_progress.stdout)

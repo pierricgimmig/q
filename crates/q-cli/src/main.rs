@@ -2239,134 +2239,212 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
     render_task_rows_painted(rows, Paint::plain(), false)
 }
 
-fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> String {
-    // The ACTIVITY column appears only while some agent has reported one,
-    // so a quiet queue keeps the compact table.
-    let with_activity = rows.iter().any(|row| !row.activity.is_empty());
-    let mut headers = vec![
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TAGS",
-    ];
-    if wide {
-        headers.extend([
-            "FAILS",
-            "MODEL",
-            "HOST",
-            "NOTE",
-            "BEAT",
-            "STALE",
-            "ESCALATED",
-        ]);
-    }
-    headers.push("TITLE");
-    let mut align_right = vec![true, false, false, false, true, true, false, false, false];
-    if wide {
-        align_right.extend([true, false, false, false, false, false, false]);
-    }
-    align_right.push(false);
-    let mut widths: Vec<usize> = vec![
-        column_width("ID", rows.iter().map(|row| row.id.as_str())),
-        column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
-        column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
-        column_width("PROJECT", rows.iter().map(|row| row.project.as_str())),
-        column_width("PRI", rows.iter().map(|row| row.priority.as_str())),
-        column_width("PROG", rows.iter().map(|row| row.progress.as_str())),
-        column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
-        column_width("PR", rows.iter().map(|row| pr_cell(row, paint))),
-        column_width("TAGS", rows.iter().map(|row| row.tags.as_str())),
-    ];
-    if wide {
-        widths.extend([
-            column_width("FAILS", rows.iter().map(|row| row.fails.as_str())),
-            column_width("MODEL", rows.iter().map(|row| row.model.as_str())),
-            column_width("HOST", rows.iter().map(|row| row.host.as_str())),
-            column_width("NOTE", rows.iter().map(|row| row.note.as_str())),
-            column_width("BEAT", rows.iter().map(|row| row.beat.as_str())),
-            column_width("STALE", rows.iter().map(|row| row.stale.as_str())),
-            column_width("ESCALATED", rows.iter().map(|row| row.escalated.as_str())),
-        ]);
-    }
-    widths.push(column_width(
-        "TITLE",
-        rows.iter().map(|row| row.title.as_str()),
-    ));
-    let stale_style = Style::new()
+/// One column of the task table. `fixed` columns always show; the others
+/// appear only when some row has a real value, so a narrow terminal is not
+/// spent on columns that are blank for every task in view.
+struct TaskColumn {
+    header: &'static str,
+    align_right: bool,
+    fixed: bool,
+    /// Values that count as empty for this column, besides the blank string.
+    placeholders: &'static [&'static str],
+}
+
+const TASK_COLUMNS: &[TaskColumn] = &[
+    TaskColumn {
+        header: "ID",
+        align_right: true,
+        fixed: true,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "STATUS",
+        align_right: false,
+        fixed: true,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "FEATURE",
+        align_right: false,
+        fixed: false,
+        placeholders: &[UNASSIGNED_PROJECT],
+    },
+    TaskColumn {
+        header: "PROJECT",
+        align_right: false,
+        fixed: false,
+        placeholders: &[UNASSIGNED_PROJECT],
+    },
+    TaskColumn {
+        header: "PRI",
+        align_right: true,
+        fixed: false,
+        placeholders: &["0"],
+    },
+    TaskColumn {
+        header: "PROG",
+        align_right: true,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "UPDATED",
+        align_right: false,
+        fixed: true,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "PR",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "TAGS",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "FAILS",
+        align_right: true,
+        fixed: false,
+        placeholders: &["0"],
+    },
+    TaskColumn {
+        header: "MODEL",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "HOST",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "NOTE",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "BEAT",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "STALE",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "ESCALATED",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "TITLE",
+        align_right: false,
+        fixed: true,
+        placeholders: &[],
+    },
+    TaskColumn {
+        header: "ACTIVITY",
+        align_right: false,
+        fixed: false,
+        placeholders: &[],
+    },
+];
+
+/// Columns that only the wide (`q top`) table considers.
+const WIDE_ONLY: &[&str] = &[
+    "FAILS",
+    "MODEL",
+    "HOST",
+    "NOTE",
+    "BEAT",
+    "STALE",
+    "ESCALATED",
+];
+
+/// A row's cells in `TASK_COLUMNS` order: text, style, and an optional link.
+fn task_cells(row: &TaskListRow, paint: Paint) -> Vec<(&str, Style, Option<&str>)> {
+    let dim = style::dim_style();
+    let status = style::status_style(&row.status);
+    let stale = Style::new()
         .bold()
         .fg_color(Some(anstyle::AnsiColor::Red.into()));
-    if with_activity {
-        headers.push("ACTIVITY");
-        align_right.push(false);
-        widths.push(column_width(
-            "ACTIVITY",
-            rows.iter().map(|row| row.activity.as_str()),
-        ));
-    }
-    let header_styles = vec![style::dim_style(); headers.len()];
+    vec![
+        (row.id.as_str(), dim, None),
+        (row.status.as_str(), status, None),
+        (row.feature.as_str(), dim, None),
+        (row.project.as_str(), dim, None),
+        (row.priority.as_str(), dim, None),
+        (row.progress.as_str(), status, None),
+        (row.updated.as_str(), dim, None),
+        (pr_cell(row, paint), Style::new(), row.pr_url.as_deref()),
+        (row.tags.as_str(), dim, None),
+        (row.fails.as_str(), dim, None),
+        (row.model.as_str(), dim, None),
+        (row.host.as_str(), dim, None),
+        (row.note.as_str(), Style::new(), None),
+        (row.beat.as_str(), dim, None),
+        (row.stale.as_str(), stale, None),
+        (
+            row.escalated.as_str(),
+            style::status_style("escalated"),
+            None,
+        ),
+        (row.title.as_str(), style::bold_style(), None),
+        (row.activity.as_str(), Style::new(), None),
+    ]
+}
+
+fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> String {
+    let table: Vec<Vec<(&str, Style, Option<&str>)>> =
+        rows.iter().map(|row| task_cells(row, paint)).collect();
+    let shown: Vec<usize> = TASK_COLUMNS
+        .iter()
+        .enumerate()
+        .filter(|(index, column)| {
+            if !wide && WIDE_ONLY.contains(&column.header) {
+                return false;
+            }
+            column.fixed
+                || table.iter().any(|cells| {
+                    let text = cells[*index].0;
+                    !text.is_empty() && !column.placeholders.contains(&text)
+                })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let headers: Vec<&str> = shown.iter().map(|&i| TASK_COLUMNS[i].header).collect();
+    let align_right: Vec<bool> = shown.iter().map(|&i| TASK_COLUMNS[i].align_right).collect();
+    let widths: Vec<usize> = shown
+        .iter()
+        .map(|&i| column_width(TASK_COLUMNS[i].header, table.iter().map(|cells| cells[i].0)))
+        .collect();
+    let header_styles = vec![style::dim_style(); shown.len()];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
         &headers,
         &header_styles,
-        &vec![None; headers.len()],
+        &vec![None; shown.len()],
         &widths,
         &align_right,
         paint,
     ));
-    for row in rows {
-        let mut cells = vec![
-            row.id.as_str(),
-            row.status.as_str(),
-            row.feature.as_str(),
-            row.project.as_str(),
-            row.priority.as_str(),
-            row.progress.as_str(),
-            row.updated.as_str(),
-            pr_cell(row, paint),
-            row.tags.as_str(),
-        ];
-        if wide {
-            cells.extend([
-                row.fails.as_str(),
-                row.model.as_str(),
-                row.host.as_str(),
-                row.note.as_str(),
-                row.beat.as_str(),
-                row.stale.as_str(),
-                row.escalated.as_str(),
-            ]);
-        }
-        cells.push(row.title.as_str());
-        if with_activity {
-            cells.push(row.activity.as_str());
-        }
-        let mut styles = vec![
-            style::dim_style(),
-            style::status_style(&row.status),
-            style::dim_style(),
-            style::dim_style(),
-            style::dim_style(),
-            style::status_style(&row.status),
-            style::dim_style(),
-            Style::new(),
-            style::dim_style(),
-        ];
-        if wide {
-            styles.extend([
-                style::dim_style(),
-                style::dim_style(),
-                style::dim_style(),
-                Style::new(),
-                style::dim_style(),
-                stale_style,
-                style::status_style("escalated"),
-            ]);
-        }
-        styles.push(style::bold_style());
-        if with_activity {
-            styles.push(Style::new());
-        }
-        let mut links = vec![None; cells.len()];
-        links[7] = row.pr_url.as_deref();
+    for cells in &table {
+        let texts: Vec<&str> = shown.iter().map(|&i| cells[i].0).collect();
+        let styles: Vec<Style> = shown.iter().map(|&i| cells[i].1).collect();
+        let links: Vec<Option<&str>> = shown.iter().map(|&i| cells[i].2).collect();
         lines.push(format_task_line(
-            &cells,
+            &texts,
             &styles,
             &links,
             &widths,
@@ -3081,10 +3159,53 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
- 4  held    (none)   alpha      0        3m ago             Keep the held item
- 2  ready   (none)   beta       1        1h ago             Compare encodings
- 1  held    (none)   (none)     0        2d ago             Unassigned capture"
+ID  STATUS  PROJECT  PRI  UPDATED  TITLE
+ 4  held    alpha      0  3m ago   Keep the held item
+ 2  ready   beta       1  1h ago   Compare encodings
+ 1  held    (none)     0  2d ago   Unassigned capture"
+        );
+    }
+
+    #[test]
+    fn empty_columns_are_hidden_and_fixed_ones_stay() {
+        let mut row = TaskListRow {
+            id: "7".into(),
+            status: "ready".into(),
+            feature: "(none)".into(),
+            project: "(none)".into(),
+            priority: "0".into(),
+            progress: String::new(),
+            updated: "just now".into(),
+            pr_url: None,
+            tags: String::new(),
+            fails: String::new(),
+            model: String::new(),
+            host: String::new(),
+            note: String::new(),
+            beat: String::new(),
+            stale: String::new(),
+            escalated: String::new(),
+            title: "Bare".into(),
+            activity: String::new(),
+        };
+        let bare = render_task_rows(std::slice::from_ref(&row));
+        assert_eq!(
+            bare.lines().next().unwrap().trim_end(),
+            "ID  STATUS  UPDATED   TITLE"
+        );
+        row.priority = "2".into();
+        row.feature = "Rollout".into();
+        let some = render_task_rows(std::slice::from_ref(&row));
+        assert_eq!(
+            some.lines().next().unwrap().trim_end(),
+            "ID  STATUS  FEATURE  PRI  UPDATED   TITLE"
+        );
+        // Wide-only columns never show in the ls table even when set.
+        row.fails = "3".into();
+        assert!(!render_task_rows(std::slice::from_ref(&row)).contains("FAILS"));
+        assert!(
+            render_task_rows_painted(std::slice::from_ref(&row), Paint::plain(), true)
+                .contains("FAILS")
         );
     }
 
@@ -3112,11 +3233,11 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
         };
         let plain = render_task_rows(std::slice::from_ref(&row));
         assert!(
-            plain.contains("UPDATED  PR                        TAGS  TITLE"),
+            plain.contains("UPDATED  PR                        TITLE"),
             "{plain}"
         );
         assert!(
-            plain.contains("1h ago   https://example.com/pr/9        Shipped"),
+            plain.contains("1h ago   https://example.com/pr/9  Shipped"),
             "{plain}"
         );
         let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color(), false);
@@ -3125,11 +3246,20 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             "{color:?}"
         );
         let visible = anstream::adapter::strip_str(&color).to_string();
-        assert!(visible.contains("UPDATED  PR  TAGS  TITLE"), "{visible}");
-        assert!(visible.contains("1h ago   PR        Shipped"), "{visible}");
+        assert!(visible.contains("UPDATED  PR  TITLE"), "{visible}");
+        assert!(visible.contains("1h ago   PR  Shipped"), "{visible}");
         row.pr_url = None;
         let none = render_task_rows(std::slice::from_ref(&row));
-        assert!(none.contains("1h ago             Shipped"), "{none}");
+        assert!(none.contains("1h ago   Shipped"), "{none}");
+        assert!(
+            !none
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .any(|column| column == "PR"),
+            "PR column hides without a link: {none}"
+        );
     }
 
     #[test]
@@ -3169,6 +3299,8 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
         };
         let table = render_task_rows_painted(std::slice::from_ref(&row), Paint::plain(), true);
         let header = table.lines().next().unwrap();
+        // The blank ESCALATED column is hidden; the rest keep their order.
+        assert!(!header.contains("ESCALATED"), "{header}");
         for (left, right) in [
             ("TAGS", "FAILS"),
             ("FAILS", "MODEL"),
@@ -3176,8 +3308,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             ("HOST", "NOTE"),
             ("NOTE", "BEAT"),
             ("BEAT", "STALE"),
-            ("STALE", "ESCALATED"),
-            ("ESCALATED", "TITLE"),
+            ("STALE", "TITLE"),
         ] {
             assert!(
                 header.find(left).unwrap() < header.find(right).unwrap(),
