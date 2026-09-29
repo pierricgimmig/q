@@ -1513,7 +1513,7 @@ async fn run_top(
 ) -> Result<(), CliError> {
     let mut previous: Option<std::collections::HashMap<i64, TaskSummary>> = None;
     let mut changes: std::collections::VecDeque<TopChange> = std::collections::VecDeque::new();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
     // The guard restores the terminal when it drops: on quit, on error, and
     // while unwinding from a panic. The last frame stays on screen so the
     // final state is still readable.
@@ -1529,16 +1529,18 @@ async fn run_top(
             &mut previous,
             &mut changes,
         )?;
-        if options.keys {
+        let bytes = if options.screen {
             // Raw mode turns off output post-processing, so a bare newline
             // no longer returns the carriage.
-            print!("\x1b[H\x1b[2J{}", raw_line_endings(&frame));
-        } else if options.screen {
-            print!("\x1b[H\x1b[2J{frame}");
+            screen_frame(&frame, options.keys)
         } else {
-            print!("{frame}");
-        }
-        stdout.flush()?;
+            frame.clone()
+        };
+        // One write and one flush per frame: a line-buffered print! would
+        // hand the terminal the frame in pieces, which is what flickers.
+        let mut out = stdout.lock();
+        out.write_all(bytes.as_bytes())?;
+        out.flush()?;
         if options.once {
             return Ok(());
         }
@@ -1560,6 +1562,32 @@ async fn run_top(
             return Ok(());
         }
     }
+}
+
+/// Begin and end of synchronized output (DEC private mode 2026). A terminal
+/// that supports it holds the frame and swaps it in at once; others ignore
+/// the sequences.
+const SYNC_BEGIN: &str = "\x1b[?2026h";
+const SYNC_END: &str = "\x1b[?2026l";
+
+/// A frame redrawn in place without clearing the screen first. The cursor
+/// goes home, every line is overwritten and cleared to its end, and whatever
+/// an earlier, taller frame left below is erased once at the end. Clearing
+/// the whole screen before drawing is what made the old frames flicker: the
+/// terminal showed blank between the clear and the repaint.
+fn screen_frame(frame: &str, raw: bool) -> String {
+    let newline = if raw { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(frame.len() + 64);
+    out.push_str(SYNC_BEGIN);
+    out.push_str("\x1b[H");
+    for line in frame.lines() {
+        out.push_str(line.trim_end_matches('\r'));
+        out.push_str("\x1b[K");
+        out.push_str(newline);
+    }
+    out.push_str("\x1b[J");
+    out.push_str(SYNC_END);
+    out
 }
 
 /// Terminal state `q top` changes for the duration of the run: the hidden
@@ -1652,21 +1680,6 @@ fn is_top_quit_key(key: &KeyEvent) -> bool {
         KeyCode::Esc => true,
         _ => false,
     }
-}
-
-/// Turn `\n` into `\r\n` for a raw-mode terminal without doubling a
-/// carriage return that is already there.
-fn raw_line_endings(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
-    let mut previous = None;
-    for ch in text.chars() {
-        if ch == '\n' && previous != Some('\r') {
-            out.push('\r');
-        }
-        out.push(ch);
-        previous = Some(ch);
-    }
-    out
 }
 
 /// Fetch the queue, record what changed since the last frame, and render.
@@ -2933,8 +2946,8 @@ impl From<std::io::Error> for CliError {
 mod tests {
     use super::{
         capture_line, display_project, format_list_title, heartbeat_cells, is_top_quit_key,
-        raw_line_endings, render_task_rows, render_task_rows_painted, render_tree,
-        render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
+        render_task_rows, render_task_rows_painted, render_tree, render_tree_with, screen_frame,
+        truncate_chars, TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2990,11 +3003,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_line_endings_add_carriage_returns_once() {
-        assert_eq!(raw_line_endings("a\nb\n"), "a\r\nb\r\n");
-        assert_eq!(raw_line_endings("a\r\nb"), "a\r\nb");
-        assert_eq!(raw_line_endings("\n\n"), "\r\n\r\n");
-        assert_eq!(raw_line_endings("no newline"), "no newline");
+    fn screen_frames_overwrite_in_place_instead_of_clearing() {
+        let out = screen_frame("a\nbb\n\nc\n", false);
+        assert!(out.starts_with("\x1b[?2026h\x1b[H"), "{out:?}");
+        assert!(out.ends_with("\x1b[J\x1b[?2026l"), "{out:?}");
+        assert!(!out.contains("\x1b[2J"), "no full-screen clear: {out:?}");
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[Ha\x1b[K\nbb\x1b[K\n\x1b[K\nc\x1b[K\n\x1b[J\x1b[?2026l"
+        );
+        let raw = screen_frame("a\nb\n", true);
+        assert!(raw.contains("a\x1b[K\r\nb\x1b[K\r\n"), "{raw:?}");
+        assert!(!raw.contains("\n\n"), "{raw:?}");
     }
 
     #[test]
