@@ -461,8 +461,11 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Atomically claim one eligible ready task.
+    /// Atomically claim one eligible ready task, or a specific one by id.
     Claim {
+        /// Claim this task instead of the best eligible one. It must be ready
+        /// and pass the same filters; otherwise the command fails and says why.
+        id: Option<i64>,
         /// Worker id recorded on the claim.
         #[arg(long)]
         agent: String,

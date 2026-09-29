@@ -263,6 +263,7 @@ Titles use the same 64-character ellipsis as `q ls`. Status words use the same c
 ```bash
 q claim --agent codex-local-01 --model opus --tag rust
 q claim --agent claude-local-01 --repo github.com/acme/profiler-core --json
+q claim 184 --agent claude-local-01 --json
 q heartbeat 184 --claim-token TOKEN
 q note 184 "running tests" --claim-token TOKEN
 q fail 184 "tests failed" --claim-token TOKEN
@@ -282,6 +283,8 @@ q artifact 7
 ```json
 {"found": false, "reason": "no_eligible_ready_tasks"}
 ```
+
+`q claim ID` (MCP `queue_claim_next` with `task_id`) claims that task instead of the best-ranked one. The same rules apply: the task must be ready and pass every filter of the claim. A targeted claim that cannot proceed is an error rather than `found: false`, so the agent learns why: `not found` for a missing id, `cannot move from held to claimed` for a task that is not ready, and `not eligible for this claim: ...` naming the failed rule (risk above `--max-risk`, a missing capability, a dependency not done, the project's `max_parallel_jobs`, and so on).
 
 Default lease is 30 minutes (minimum 1 minute, maximum 24 hours), measured from the last heartbeat. Heartbeat extends only a matching, unexpired token. `block`, `release`, `fail`, `note`, and `complete` of claimed or in-progress work require that token. A matching claim is retired rather than deleted, so branch and worktree history stay in the database.
 

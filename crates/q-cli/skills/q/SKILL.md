@@ -30,7 +30,7 @@ A specialized agent claims only tagged work: `q claim --agent ID --tag rust` (re
 - After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [ready] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
 - Only a human releases held work with `q ready ID` (or several at once: `q ready 11 12 13`) or takes ready work back with `q hold ID`. There is no MCP ready or hold tool. Do not mark held work ready yourself, and do not treat a captured task as permission to start it in the current session; claim it.
 - Completion is still gated after a claim: `high` and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept.
-- Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, escalate, fail, note, release, and log.
+- Claim at most one task. `q claim --agent ID` takes the best eligible ready task. To work on a specific task, for example one the user pointed at, claim it by id: `q claim 184 --agent ID` (MCP `queue_claim_next` with `task_id`). That task must be ready and pass the same filters (risk, capabilities, pool, dependencies, project cap); otherwise the claim fails and the error says why, for example `cannot move from held to claimed` or `not eligible for this claim: risk high is above the claim's maximum medium`. Never bypass that by editing the task. Keep the opaque claim token and send it with heartbeat, start, block, complete, escalate, fail, note, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
 - When you open a pull request for a task, reference the task as `(Q task#184)` in the title or the first line of the body, and attach the PR with `--artifact pr=URL` on `q log` or `q complete`. Never write `Closes q task #184`: closing is not what happens, and a bare `#184` makes GitHub link an unrelated issue.
 - Report progress, starting right after `q start`: `q log ID --progress 10 --claim-token TOKEN` (MCP `queue_log` with `progress`), then again at each milestone (plan made, code written, tests green, PR open), optionally with a message. The `PROG` column in `q top` and `q ls` stays blank until you do, and humans rely on it to see that work is moving. `q claim` and `q start` print the exact command. Use your honest estimate; do not report 100, completing the task sets that.
@@ -64,6 +64,7 @@ q tree 184
 q tree --feature "Cross-repo rollout"
 q add --tag rust "Fix the parser"
 q claim --agent codex-local-01 --capability rust --tag rust --model opus --json
+q claim 184 --agent codex-local-01 --json
 q heartbeat 184 --claim-token TOKEN
 q note 184 "running tests" --claim-token TOKEN
 q fail 184 "tests failed" --claim-token TOKEN
@@ -131,7 +132,7 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 - `queue_list` — list bounded summaries. Omits `done` and `cancelled` unless `status` is set or `include_terminal` / `all` is true. Optional `feature` filters by id or unique title
 - `queue_get` — fetch one task, its claim, artifacts, and recent events
 - `queue_tree` — dependency tree for `task_id`, or a forest for `feature` (id or unique title). Children must be done first
-- `queue_claim_next` — atomically claim one eligible ready task, or return no work. Optional `tags` (every tag must match), `max_failures`, `agent_model`, and `agent_host`
+- `queue_claim_next` — atomically claim one eligible ready task, or return no work. With `task_id`, claim that task instead; it must be ready and eligible, or the call is a domain error. Optional `tags` (every tag must match), `max_failures`, `agent_model`, and `agent_host`
 - `queue_fail` — release the claim, record an optional `note`, increment the failure count, and return the task to ready. For a genuine execution failure
 - `queue_escalate` — release the claim and park the task as `escalated` with a required `reason`, when it is too big or you lack the tools or context. A human returns it with `q ready`
 - `queue_note` — append a short status `message` to a claimed task
@@ -148,7 +149,7 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 - `queue_delete` — hard-delete a task (`task_id`, optional `force`). Unlike cancel, the row and its events are removed
 - `queue_ready` and `queue_reopen` — only offered to human tokens over `q serve` (chat connectors signed in as a person). A stdio session or an agent token never sees them.
 
-`queue_claim_next` takes `agent_id`, `capabilities`, `allowed_repos`, `allowed_projects`, `allowed_kinds`, `maximum_risk`, `lease_minutes`, `agent_pool`, `agent_model`, `agent_host`, `tags`, and `max_failures`. On stdio, a missing model falls back to `Q_AGENT_MODEL` and a missing host to this machine. Over `q serve`, only the values the client sends are stored. `queue_list` takes the same `tags` filter as `q ls --tag`. Unknown argument keys are rejected. Invalid arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError` true.
+`queue_claim_next` takes `agent_id`, optional `task_id` (or `id`), `capabilities`, `allowed_repos`, `allowed_projects`, `allowed_kinds`, `maximum_risk`, `lease_minutes`, `agent_pool`, `agent_model`, `agent_host`, `tags`, and `max_failures`. On stdio, a missing model falls back to `Q_AGENT_MODEL` and a missing host to this machine. Over `q serve`, only the values the client sends are stored. `queue_list` takes the same `tags` filter as `q ls --tag`. Unknown argument keys are rejected. Invalid arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError` true.
 
 ## Install
 

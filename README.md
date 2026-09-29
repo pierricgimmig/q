@@ -29,7 +29,8 @@ q ready 5                    # the human gate: only a person can do this
 ```
 
 An agent claims. One transaction picks one eligible task, leases it, and hands
-back a token. No work is not an error.
+back a token. No work is not an error. `q claim 2 --agent claude-01` claims
+that task in particular, under the same rules.
 
 ```bash
 q claim --agent claude-01 --json

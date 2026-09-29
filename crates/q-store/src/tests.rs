@@ -559,6 +559,78 @@ fn claims_prefer_higher_priority_then_older_tasks() {
 }
 
 #[test]
+fn claim_by_id_takes_that_task_even_when_another_ranks_first() {
+    let (queue, _) = queue();
+    let urgent = capture(&queue, "urgent");
+    let wanted = capture(&queue, "wanted");
+    make_ready(&queue, urgent);
+    make_ready(&queue, wanted);
+    let mut edit = EditRequest::empty(actor());
+    edit.priority = Some(100);
+    queue.edit(urgent, edit).unwrap();
+
+    let mut request = ClaimRequest::new("agent-a");
+    request.task_id = Some(wanted);
+    let outcome = queue.claim_next(request).unwrap();
+    assert!(outcome.found);
+    assert_eq!(outcome.task.as_ref().unwrap().task.id, wanted);
+    assert_eq!(queue.get(wanted).unwrap().task.status, TaskStatus::Claimed);
+    assert_eq!(queue.get(urgent).unwrap().task.status, TaskStatus::Ready);
+
+    // The same id again names the agent that holds it.
+    let mut again = ClaimRequest::new("agent-b");
+    again.task_id = Some(wanted);
+    match queue.claim_next(again).unwrap_err() {
+        QueueError::Conflict(message) => {
+            assert!(message.contains("already claimed by agent-a"), "{message}")
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn claim_by_id_explains_missing_held_and_ineligible_tasks() {
+    let (queue, _) = queue();
+    let held = capture(&queue, "held");
+    let risky = capture_with(&queue, "risky", RiskLevel::High, None);
+    make_ready(&queue, risky);
+
+    let mut missing = ClaimRequest::new("agent-a");
+    missing.task_id = Some(9999);
+    assert!(matches!(
+        queue.claim_next(missing).unwrap_err(),
+        QueueError::NotFound(9999)
+    ));
+
+    let mut gated = ClaimRequest::new("agent-a");
+    gated.task_id = Some(held);
+    assert!(matches!(
+        queue.claim_next(gated).unwrap_err(),
+        QueueError::InvalidTransition {
+            from: TaskStatus::Held,
+            to: TaskStatus::Claimed
+        }
+    ));
+
+    let mut too_risky = ClaimRequest::new("agent-a");
+    too_risky.task_id = Some(risky);
+    match queue.claim_next(too_risky).unwrap_err() {
+        QueueError::Conflict(message) => {
+            assert!(message.contains("not eligible"), "{message}");
+            assert!(message.contains("risk high"), "{message}");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(queue.get(risky).unwrap().task.status, TaskStatus::Ready);
+
+    let mut raised = ClaimRequest::new("agent-a");
+    raised.task_id = Some(risky);
+    raised.maximum_risk = RiskLevel::High;
+    let outcome = queue.claim_next(raised).unwrap();
+    assert_eq!(outcome.task.unwrap().task.id, risky);
+}
+
+#[test]
 fn capabilities_and_unfinished_dependencies_block_selection() {
     let (queue, _) = queue();
     let dependency = capture(&queue, "dependency");

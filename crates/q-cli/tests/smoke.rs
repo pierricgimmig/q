@@ -224,6 +224,65 @@ fn mcp_stdio_is_protocol_clean() {
 }
 
 #[test]
+fn claim_accepts_a_task_id_and_explains_a_refusal() {
+    let db = temp_root("claim-by-id").join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let urgent = run(bin().args(["--db", db_arg, "--json", "--priority", "10", "Urgent"]));
+    let urgent: Value = serde_json::from_slice(&urgent.stdout).unwrap();
+    let wanted = run(bin().args(["--db", db_arg, "--json", "Wanted"]));
+    let wanted = serde_json::from_slice::<Value>(&wanted.stdout).unwrap()["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let held = run(bin().args(["--db", db_arg, "--json", "-w", "Held"]));
+    let held = serde_json::from_slice::<Value>(&held.stdout).unwrap()["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+
+    let claimed = run(bin().args([
+        "--db",
+        db_arg,
+        "claim",
+        &wanted,
+        "--agent",
+        "codex-local-01",
+        "--json",
+    ]));
+    let claimed: Value = serde_json::from_slice(&claimed.stdout).unwrap();
+    assert_eq!(claimed["found"], true);
+    assert_eq!(claimed["task"]["id"].as_i64().unwrap().to_string(), wanted);
+    assert_eq!(claimed["task"]["status"], "claimed");
+    let shown = run(bin().args(["--db", db_arg, "show", "--json", &urgent["id"].to_string()]));
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(
+        shown["status"], "ready",
+        "the higher-priority task is untouched"
+    );
+
+    let refused = bin()
+        .args(["--db", db_arg, "claim", &held, "--agent", "codex-local-01"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot move from held to claimed"),
+        "{stderr}"
+    );
+
+    let missing = bin()
+        .args(["--db", db_arg, "claim", "9999", "--agent", "codex-local-01"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8(missing.stderr).unwrap();
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    let _ = fs::remove_dir_all(db.parent().unwrap());
+}
+
+#[test]
 fn delete_removes_the_task_unless_an_active_claim_blocks_it() {
     let db = temp_root("delete").join("queue.db");
     let db_arg = db.to_str().unwrap();

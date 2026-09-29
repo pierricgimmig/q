@@ -599,6 +599,8 @@ fn queue_claim_next(
         args,
         &[
             "agent_id",
+            "task_id",
+            "id",
             "capabilities",
             "allowed_repos",
             "allowed_projects",
@@ -614,6 +616,10 @@ fn queue_claim_next(
     )?;
     let agent_id = required_string(args, "agent_id")?;
     let mut request = ClaimRequest::new(agent_id);
+    request.task_id = match optional_i64(args, "task_id")? {
+        Some(id) => Some(id),
+        None => optional_i64(args, "id")?,
+    };
     request.capabilities = optional_string_array(args, "capabilities")?;
     request.allowed_repos = optional_string_array(args, "allowed_repos")?;
     request.allowed_projects = optional_string_array(args, "allowed_projects")?;
@@ -1179,12 +1185,14 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
         ),
         tool(
             "queue_claim_next",
-            "Atomically claim one eligible ready task, or return found=false when none are eligible.",
+            "Atomically claim one eligible ready task, or return found=false when none are eligible. Pass task_id to claim that task instead; it must be ready and pass the same filters, or the call fails and says why.",
             json!({
                 "type": "object",
                 "required": ["agent_id"],
                 "properties": {
                     "agent_id": {"type": "string"},
+                    "task_id": {"type": "integer"},
+                    "id": {"type": "integer"},
                     "capabilities": {"type": "array", "items": {"type": "string"}},
                     "allowed_repos": {"type": "array", "items": {"type": "string"}},
                     "allowed_projects": {"type": "array", "items": {"type": "string"}},
@@ -1570,6 +1578,69 @@ mod tests {
         ] {
             assert!(names.iter().any(|candidate| candidate == name), "{name}");
         }
+    }
+
+    #[test]
+    fn queue_claim_next_takes_a_task_id() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let first = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "first", "priority": 10}}),
+        );
+        let first = tool_body(&first)["id"].as_i64().unwrap();
+        let second = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "second"}}),
+        );
+        let second = tool_body(&second)["id"].as_i64().unwrap();
+
+        let claimed = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-7", "task_id": second}}),
+        );
+        assert_eq!(claimed["result"]["isError"], false, "{claimed}");
+        let body = tool_body(&claimed);
+        assert_eq!(body["found"], true);
+        assert_eq!(body["task"]["id"], second);
+
+        // Asking for it again is a domain error, not a silent found=false.
+        let again = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-8", "id": second}}),
+        );
+        assert_eq!(again["result"]["isError"], true, "{again}");
+        let text = again["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("already claimed by bot-7"), "{text}");
+
+        // The higher-priority task is still there for an untargeted claim.
+        let next = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-8"}}),
+        );
+        assert_eq!(tool_body(&next)["task"]["id"], first);
     }
 
     #[test]
