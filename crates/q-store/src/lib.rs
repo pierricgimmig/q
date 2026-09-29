@@ -48,7 +48,7 @@ FROM features";
 
 const CLAIM_SELECT: &str = "\
 SELECT id, task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at, \
-branch, worktree_path, released_at, release_reason, agent_model, agent_host \
+branch, worktree_path, released_at, release_reason, agent_model, agent_host, activity \
 FROM claims";
 
 const EVENT_SELECT: &str = "\
@@ -368,6 +368,7 @@ fn map_claim(row: &rusqlite::Row<'_>, now: &str) -> rusqlite::Result<Claim> {
         release_reason: row.get(10)?,
         agent_model: blank_to_none(row.get(11)?),
         agent_host: blank_to_none(row.get(12)?),
+        activity: row.get(13)?,
         active: released.is_none() && lease_expires_at.as_str() > now,
     })
 }
@@ -1292,7 +1293,8 @@ impl QueueService for Queue {
                      AND TRIM(json_extract(e.payload_json, '$.message')) != '' \
                    ORDER BY e.id DESC LIMIT 1 \
                  ) END, \
-                 tasks.escalated_reason, tasks.escalated_by, tasks.escalated_at \
+                 tasks.escalated_reason, tasks.escalated_by, tasks.escalated_at, \
+                 active_claim.activity \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
                  LEFT JOIN claims active_claim ON active_claim.id = ( \
@@ -1357,6 +1359,7 @@ impl QueueService for Queue {
                     let heartbeat: Option<String> = row.get(20)?;
                     let note: Option<String> = row.get(21)?;
                     let escalated_at: Option<String> = row.get(24)?;
+                    let activity: Option<String> = row.get(25)?;
                     Ok(TaskSummary {
                         id: row.get(0)?,
                         public_id: parse_uuid(1, &public_id)?,
@@ -1382,6 +1385,15 @@ impl QueueService for Queue {
                             .map(|value| parse_time(24, value))
                             .transpose()?,
                         pr_url: row.get(15)?,
+                        activity: activity.clone(),
+                        // The activity is as old as the heartbeat that set it.
+                        activity_at: match activity {
+                            Some(_) => heartbeat
+                                .as_deref()
+                                .map(|value| parse_time(20, value))
+                                .transpose()?,
+                            None => None,
+                        },
                         project: row.get(7)?,
                         repo: row.get(8)?,
                         agent_pool: row.get(9)?,
@@ -2015,6 +2027,16 @@ impl QueueService for Queue {
     }
 
     fn heartbeat(&self, request: HeartbeatRequest) -> Result<Claim, QueueError> {
+        let activity = request
+            .activity
+            .as_deref()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                text.chars()
+                    .take(q_core::ACTIVITY_MAX_CHARS)
+                    .collect::<String>()
+            });
         let lease = match request.lease {
             Some(lease) => lease_or_default(lease)?,
             None => default_lease(),
@@ -2028,8 +2050,9 @@ impl QueueService for Queue {
         let claim = require_active_claim(&tx, request.task_id, &request.claim_token, &now)?;
         let expires = format_timestamp(add_lease(now_dt, lease)?);
         tx.execute(
-            "UPDATE claims SET heartbeat_at = ?, lease_expires_at = ? WHERE id = ?",
-            params![now, expires, claim.id],
+            "UPDATE claims SET heartbeat_at = ?, lease_expires_at = ?, \
+             activity = COALESCE(?, activity) WHERE id = ?",
+            params![now, expires, activity, claim.id],
         )
         .db()?;
         insert_event(

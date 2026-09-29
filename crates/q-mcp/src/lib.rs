@@ -710,7 +710,10 @@ fn queue_heartbeat(
     ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
-    expect_keys(args, &["task_id", "id", "claim_token", "lease_minutes"])?;
+    expect_keys(
+        args,
+        &["task_id", "id", "claim_token", "lease_minutes", "activity"],
+    )?;
     let lease = match optional_u64(args, "lease_minutes")? {
         Some(minutes) => Some(q_core::lease_from_minutes(minutes).map_err(ToolFailure::from)?),
         None => None,
@@ -719,6 +722,7 @@ fn queue_heartbeat(
         task_id: required_task_id(args)?,
         claim_token: required_string(args, "claim_token")?,
         lease,
+        activity: optional_string(args, "activity")?,
         actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(claim).unwrap_or(Value::Null))
@@ -1265,14 +1269,15 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
         ),
         tool(
             "queue_heartbeat",
-            "Extend a claim lease. Requires the task id and matching claim token.",
+            "Extend a claim lease. Requires the task id and matching claim token. Pass activity to say what you are doing right now; q top shows it live.",
             json!({
                 "type": "object",
                 "required": ["task_id", "claim_token"],
                 "properties": {
                     "task_id": {"type": "integer"},
                     "claim_token": {"type": "string"},
-                    "lease_minutes": {"type": "integer"}
+                    "lease_minutes": {"type": "integer"},
+                    "activity": {"type": "string", "description": "Current activity, for example the tool call just started"}
                 },
                 "additionalProperties": false
             }),

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What the Agents Are Doing</title>
+<meta name="description" content="How q gets real-time introspection into working agents from what they already produce: the task log, the claim's activity line, and the harness transcript.">
+<style>
+  :root { color-scheme: light dark; --bg: #fbfaf7; --fg: #1f2328; --muted: #6a6f76; --line: #e3e1da; --accent: #0b6e4f; --code: #f1efe8; --card: #f6f4ee; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #14161a; --fg: #e6e4df; --muted: #9aa0a6; --line: #2b2f36; --accent: #5cc4a0; --code: #1d2026; --card: #1a1d22; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 Georgia, "Times New Roman", serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 48px 16px 96px; }
+  h1 { font-size: 2.2rem; line-height: 1.15; margin: 0 0 8px; }
+  h2 { font-size: 1.35rem; margin: 40px 0 12px; }
+  .kicker { color: var(--muted); font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; text-transform: uppercase; letter-spacing: .08em; }
+  .lede { font-size: 1.15rem; color: var(--muted); margin: 0 0 32px; }
+  pre, code { font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 600 13px/1.4 ui-sans-serif, system-ui, sans-serif; color: var(--muted); }
+  .lanes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 20px 0; }
+  .lane { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  .lane b { display: block; color: var(--accent); margin-bottom: 4px; }
+  .note { border-left: 3px solid var(--accent); padding: 4px 14px; color: var(--muted); }
+  @media (max-width: 640px) { .lanes { grid-template-columns: 1fr; } h1 { font-size: 1.7rem; } }
+  .st-ready { color: #1a7f37; } .st-prog { color: #0a7ea4; } .st-done { color: #2da44e; } .dim { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+<p class="kicker">q · design note</p>
+<h1>What the Agents Are Doing</h1>
+<p class="lede">Four agents on four tasks. The queue knows who claimed what and the percent each one last reported. It does not know whether the agent that has been quiet for six minutes is running a build or is stuck. This note is about closing that gap with what the agents already produce, and it ships the first piece.</p>
+
+<h2>The gap</h2>
+<p>With one agent you watch its terminal. With several you watch <code>q top</code>: a table of statuses, a <code>PROG</code> column with the percent each agent last reported, a <code>PR</code> link once one exists, and a list of recent changes. That answers <em>where the work stands</em>. It does not answer <em>what is happening right now</em>, which is the question you actually have when a row has not moved in a while.</p>
+<p>Progress is self-reported and coarse. An agent that reports 40 percent and then spends twenty minutes on one command looks the same as one that crashed. The queue needs a signal that is cheap enough to be sent constantly and honest enough to be trusted.</p>
+
+<h2>What q already records</h2>
+<p>Every task carries an append-only, timestamped, actor-attributed log. The queue writes the state changes itself: <code>task_claimed</code> with the agent id, <code>task_started</code> with the branch, <code>task_completed</code> with the summary. The agent adds to it on purpose with <code>q log ID "…"</code>, <code>--progress 40</code>, and artifacts; <code>--attach report=PATH</code> stores a report's text in the database so it outlives the file. Call this lane <strong>intent</strong>: what the agent says it is about to do, what it found, what it decided.</p>
+<p>Intent is the right thing to ask an agent to write. It is the wrong place to get the record of what happened, because that record already exists and nobody had to ask for it.</p>
+
+<h2>What the harness writes without being asked</h2>
+<p>Claude Code keeps a JSONL transcript of every session as it runs, one record per line: each tool call with its name, its input and the one-line description the agent gave it, each result paired to its call by id, each model reply with token counts, and a flag on everything a sub-agent does. Codex keeps the same in its session rollouts with a different shape. Both are timestamped to the millisecond.</p>
+<p>Claude Code also has hooks. <code>PreToolUse</code> and <code>PostToolUse</code> run a command with a JSON event on stdin: the session id, the transcript path, the tool name and its input. They are the push form of the same record, and they fire at exactly the moment you want to know about: the start of a tool call.</p>
+<p>An earlier prototype on the Orbit side read a full transcript and posted it to Orbit's timeline: 1,419 records from one session, 173 tool calls drawn as spans, and a finding that one agent spent 74 percent of its working time in the model while its sibling on the same codebase spent 72 percent waiting on tools. That difference is invisible from a status table, and it is the difference between an agent that needs a faster model and one that needs a faster build. Call this lane <strong>action</strong>.</p>
+
+<h2>The design: three lanes, one place to look</h2>
+<div class="lanes">
+  <div class="lane"><b>intent · the task log</b>notes, progress, artifacts, state changes. Written by the agent, on purpose. Already in q.</div>
+  <div class="lane"><b>action · the claim's activity</b>the tool call in flight, from the harness hook. Written by a script, constantly. This note ships it.</div>
+  <div class="lane"><b>machine · the processes</b>the build, the tests, the benchmark: Orbit attached, or <code>q exec</code> spans. Bridge in q PRs #26 and #27.</div>
+</div>
+<p>The cheapest join between intent and action is one field on the claim. A claim already has a heartbeat, and a heartbeat already carries a timestamp. Give it a line of text:</p>
+<pre><code>q heartbeat 184 --claim-token $T --activity "Bash: cargo test --workspace"</code></pre>
+<p>The queue stores the line on the claim, trims it to 120 characters, and stamps it with the heartbeat time. <code>q top</code> and <code>q ls</code> grow an <code>ACTIVITY</code> column only while some agent has reported one, so a quiet queue keeps its compact table. <code>q show</code> prints it with its age. Over MCP, <code>queue_heartbeat</code> takes the same <code>activity</code> field. A heartbeat without one keeps the previous line, so an agent that only refreshes its lease does not erase what it said.</p>
+<pre><code>ID  STATUS       FEATURE  PROJECT  PRI  PROG  UPDATED   PR  TITLE                 ACTIVITY
+ 3  <span class="st-prog">in_progress</span>  (none)   q          0   40%  just now      Port the encoder      Bash: cargo test --workspace (8s)
+ 5  <span class="st-prog">in_progress</span>  (none)   q          0   10%  2m ago        Fit q top to the term  Read crates/q-cli/src/main.rs (6m)
+ 2  <span class="st-ready">ready</span>        (none)   q          1        1h ago        Compare encodings
+ 9  <span class="st-done">done</span>         (none)   q          0  100%  5m ago    PR  Ship the parser</code></pre>
+<p>Read the second row again. Ten percent, last note two minutes ago, and its last activity was a file read six minutes ago. That is a stall you can see without opening anything, and it is exactly the case the status table could not show.</p>
+
+<h2>Filling it in for free</h2>
+<p>The agent does not have to remember to send it. <code>tools/hooks/q-activity.sh</code> is a Claude Code <code>PreToolUse</code> hook: it reads the event from stdin, turns it into <code>Bash: cargo test --workspace</code> or <code>Read crates/q-cli/src/main.rs</code>, and sends a heartbeat for the claim named by <code>Q_TASK_ID</code> and <code>Q_CLAIM_TOKEN</code>, or by a two-line <code>.q-claim</code> file in the working directory, against the default database, a <code>Q_SERVER_URL</code> server, or the file in <code>Q_DB</code>. With nothing set it exits quietly, so it is safe to install globally.</p>
+<pre><code>{ "hooks": { "PreToolUse": [ { "hooks": [
+    { "type": "command", "command": "/absolute/path/to/q/tools/hooks/q-activity.sh" }
+] } ] } }</code></pre>
+<p>What leaves the session is the tool name and the agent's own description of the call, cut at 120 characters. Command output, file contents and prompt text stay in the transcript. Every heartbeat also refreshes the lease, so an agent that is busy never expires; one that has gone silent is visible both by its stale activity and, eventually, by its expired claim.</p>
+
+<h2>What is proposed, not yet built</h2>
+<p><strong>The transcript on the claim.</strong> The hook event includes <code>transcript_path</code>, the one thing a queue cannot discover on its own. <code>q start --transcript PATH</code> would let a bridge such as <code>q orbit</code> tail the full action lane under the agent's thread: every tool call as a span, the model's turns between them, sub-agents on their own threads, intent notes as marks over the spans that were running when they were written. The activity line is the thin version of this; the transcript is the full one, and both use the same join.</p>
+<p><strong>Following a task live.</strong> <code>q log ID --follow</code> would print new entries as they land, the way <code>tail -f</code> does, for the times you want one task's story rather than the whole table.</p>
+<p><strong>Silence as a signal.</strong> <code>q top</code> could colour an activity older than the agent's usual gap, so a stall stands out before anyone reads the age.</p>
+<p><strong>A Codex reader.</strong> Codex writes the same facts in a different shape. Its hook story is thinner, so the transcript tailer above matters more there.</p>
+
+<h2>Honest notes</h2>
+<p class="note">Activity is still reported by something on the agent's machine. The hook makes it automatic, not authoritative: a harness with no hooks reports nothing, and a stale line means either a long tool call or a dead session; the age tells you which to check. Progress remains the agent's own estimate. The measurements quoted from the Orbit prototype are from two real sessions on one machine; they show the shape of the data, not a benchmark.</p>
+<p class="dim">Written for q task 29. The activity field, the hook, and the <code>ACTIVITY</code> column ship in the same pull request as this note.</p>
+</main>
+</body>
+</html>
