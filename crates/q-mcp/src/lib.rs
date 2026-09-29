@@ -273,6 +273,7 @@ fn dispatch_tool(
         "queue_cancel" => queue_cancel(queue, ctx, args),
         "queue_claim_next" => queue_claim_next(queue, ctx, args),
         "queue_fail" => queue_fail(queue, ctx, args),
+        "queue_escalate" => queue_escalate(queue, ctx, args),
         "queue_note" => queue_note(queue, ctx, args),
         "queue_heartbeat" => queue_heartbeat(queue, ctx, args),
         "queue_start" => queue_start(queue, ctx, args),
@@ -661,6 +662,23 @@ fn queue_fail(
         task_id: required_task_id(args)?,
         claim_token: required_string(args, "claim_token")?,
         note: optional_string(args, "note")?.or(optional_string(args, "message")?),
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
+}
+
+fn queue_escalate(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id", "claim_token", "reason", "message"])?;
+    let task = queue.escalate(q_core::EscalateRequest {
+        task_id: required_task_id(args)?,
+        claim_token: required_string(args, "claim_token")?,
+        reason: optional_string(args, "reason")?
+            .or(optional_string(args, "message")?)
+            .unwrap_or_default(),
         actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(task).unwrap_or(Value::Null))
@@ -1070,7 +1088,7 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                 "properties": {
                     "status": {
                         "type": "string",
-                        "description": "held, ready, claimed, in_progress, review, blocked, done, or cancelled."
+                        "description": "held, ready, claimed, in_progress, review, blocked, escalated, done, or cancelled."
                     },
                     "project": {"type": "string"},
                     "repo": {"type": "string"},
@@ -1205,6 +1223,20 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "task_id": {"type": "integer"},
                     "claim_token": {"type": "string"},
                     "note": {"type": "string", "description": "Optional short failure note stored on the event."}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_escalate",
+            "Release the claim and park the task as escalated for a human to review. Use this when the task is too big or you lack the tools or context. It is not claimable again until a human marks it ready. reason is required. A genuine execution failure uses queue_fail.",
+            json!({
+                "type": "object",
+                "required": ["task_id", "claim_token", "reason"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "claim_token": {"type": "string"},
+                    "reason": {"type": "string", "description": "Why this task needs a human before another agent tries it."}
                 },
                 "additionalProperties": false
             }),
@@ -2405,5 +2437,118 @@ mod tests {
             .collect();
         assert!(names.contains(&"queue_fail"), "{names:?}");
         assert!(names.contains(&"queue_note"), "{names:?}");
+    }
+
+    #[test]
+    fn escalate_releases_the_claim_until_a_human_marks_it_ready() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let captured = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "too big"}}),
+        ));
+        let id = captured["id"].as_i64().unwrap();
+        let claimed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot"}}),
+        ));
+        assert_eq!(claimed["task"]["id"], id);
+        let token = claimed["claim"]["token"].as_str().unwrap();
+        let escalated = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_escalate", "arguments": {
+                "task_id": id,
+                "claim_token": token,
+                "reason": "missing the schema"
+            }}),
+        ));
+        assert_eq!(escalated["status"], "escalated");
+        assert_eq!(escalated["escalated_reason"], "missing the schema");
+        assert_eq!(escalated["escalated_by"], "agent:bot");
+        assert!(escalated.get("escalated_at").is_some());
+        assert!(escalated.get("failure_count").is_none());
+
+        let none = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-2"}}),
+        ));
+        assert_eq!(none["found"], false);
+        let listed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_list", "arguments": {"status": "escalated"}}),
+        ));
+        assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["tasks"][0]["id"], id);
+        assert_eq!(listed["tasks"][0]["escalated_by"], "agent:bot");
+
+        let denied = call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_ready", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(denied["error"]["code"], -32602);
+
+        let tools = call(&mut session, &queue, "tools/list", 8, json!({}));
+        let names: Vec<_> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"queue_escalate"), "{names:?}");
+
+        let mut human = Session::new(std::env::temp_dir())
+            .with_actor(Actor::human(Some("pierric".into())))
+            .with_human_tools(true);
+        call(
+            &mut human,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let ready = tool_body(&call(
+            &mut human,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_ready", "arguments": {"task_id": id}}),
+        ));
+        assert_eq!(ready["task"]["status"], "ready");
+        assert!(ready["task"].get("escalated_reason").is_none());
+        assert!(ready["task"].get("escalated_by").is_none());
+        let again = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            9,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot-3"}}),
+        ));
+        assert_eq!(again["found"], true);
+        assert_eq!(again["task"]["id"], id);
     }
 }

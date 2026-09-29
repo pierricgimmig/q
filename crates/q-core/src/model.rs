@@ -24,6 +24,9 @@ pub enum TaskStatus {
     InProgress,
     Review,
     Blocked,
+    /// A worker released the claim because the task is too big or they lack
+    /// the tools or context. Not claimable until a human runs `ready`.
+    Escalated,
     Done,
     Cancelled,
 }
@@ -37,6 +40,7 @@ impl TaskStatus {
             Self::InProgress => "in_progress",
             Self::Review => "review",
             Self::Blocked => "blocked",
+            Self::Escalated => "escalated",
             Self::Done => "done",
             Self::Cancelled => "cancelled",
         }
@@ -50,10 +54,11 @@ impl TaskStatus {
             "in_progress" => Ok(Self::InProgress),
             "review" => Ok(Self::Review),
             "blocked" => Ok(Self::Blocked),
+            "escalated" => Ok(Self::Escalated),
             "done" => Ok(Self::Done),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             other => Err(QueueError::InvalidInput(format!(
-                "unknown status '{other}' (expected held, ready, claimed, in_progress, review, blocked, done, cancelled)"
+                "unknown status '{other}' (expected held, ready, claimed, in_progress, review, blocked, escalated, done, cancelled)"
             ))),
         }
     }
@@ -299,6 +304,15 @@ pub struct Task {
     /// every requested tag. Comparison is case-insensitive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Why the last worker escalated. Set only while status is `escalated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_reason: Option<String>,
+    /// `agent:<id>` of the worker who escalated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_by: Option<String>,
+    /// When the task was escalated.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "ts_opt")]
+    pub escalated_at: Option<OffsetDateTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,6 +359,15 @@ pub struct TaskSummary {
     /// See [`Task::tags`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// See [`Task::escalated_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_reason: Option<String>,
+    /// See [`Task::escalated_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_by: Option<String>,
+    /// See [`Task::escalated_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "ts_opt")]
+    pub escalated_at: Option<OffsetDateTime>,
     /// Model name on the active claim, when the worker sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
@@ -586,6 +609,7 @@ pub struct StatusCounts {
     pub in_progress: i64,
     pub review: i64,
     pub blocked: i64,
+    pub escalated: i64,
     pub done: i64,
     pub cancelled: i64,
 }
@@ -901,6 +925,19 @@ pub struct FailRequest {
     pub actor: Actor,
 }
 
+/// Release the claim and park the task as `escalated` for a human to review.
+///
+/// Use this when the task is too big or the worker lacks the tools or context.
+/// The task is not claimable again until a human runs `ready`. `reason` is
+/// required. A genuine execution failure uses [`FailRequest`] instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalateRequest {
+    pub task_id: i64,
+    pub claim_token: String,
+    pub reason: String,
+    pub actor: Actor,
+}
+
 /// Append a short status line to a claimed task.
 ///
 /// The claim token must match. The line is a `task_note` event and becomes
@@ -1031,6 +1068,9 @@ mod tests {
             progress: None,
             failure_count: 0,
             tags: Vec::new(),
+            escalated_reason: None,
+            escalated_by: None,
+            escalated_at: None,
             project: Some("profiler-core".into()),
             repo: Some("github.com/acme/profiler-core".into()),
             capture_path: "/tmp/profiler-core/crates/trace".into(),

@@ -405,6 +405,80 @@ fn http_and_mcp_claim_filter_tags_and_keep_the_client_host() {
 }
 
 #[test]
+fn http_escalate_is_not_claimable_until_a_human_marks_it_ready() {
+    use q_core::EscalateRequest;
+
+    let server = Server::start(Some(auth()));
+    let human = server.client(Some(HUMAN_SECRET));
+    let agent = server.client(Some(AGENT_SECRET));
+
+    let mut task = capture("too big for the agent", Actor::human(None));
+    task.hold = false;
+    let task = human.capture(task).unwrap();
+    let claimed = agent.claim_next(ClaimRequest::new("vps-agent")).unwrap();
+    assert!(claimed.found);
+    let token = claimed.claim.unwrap().token;
+
+    let escalated = agent
+        .escalate(EscalateRequest {
+            task_id: task.id,
+            claim_token: token,
+            reason: "needs a human design".into(),
+            actor: Actor::agent("vps-agent"),
+        })
+        .unwrap();
+    assert_eq!(escalated.status, TaskStatus::Escalated);
+    assert_eq!(
+        escalated.escalated_reason.as_deref(),
+        Some("needs a human design")
+    );
+    assert_eq!(escalated.escalated_by.as_deref(), Some("agent:vps-agent"));
+    assert!(escalated.escalated_at.is_some());
+    assert!(!agent.get(task.id).unwrap().claim.unwrap().active);
+
+    assert!(
+        !agent
+            .claim_next(ClaimRequest::new("vps-agent"))
+            .unwrap()
+            .found
+    );
+    let listed = agent
+        .list(ListFilter {
+            status: Some(TaskStatus::Escalated),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, task.id);
+
+    let forbidden = agent
+        .mark_ready(ReadyRequest {
+            task_id: task.id,
+            actor: Actor::agent("vps-agent"),
+        })
+        .unwrap_err();
+    assert!(forbidden.to_string().contains("forbidden"), "{forbidden}");
+    assert_eq!(
+        human.get(task.id).unwrap().task.status,
+        TaskStatus::Escalated
+    );
+
+    let ready = human
+        .mark_ready(ReadyRequest {
+            task_id: task.id,
+            actor: Actor::human(None),
+        })
+        .unwrap();
+    assert_eq!(ready.task.status, TaskStatus::Ready);
+    assert_eq!(ready.task.escalated_reason, None);
+    assert_eq!(ready.task.escalated_by, None);
+    assert_eq!(ready.task.escalated_at, None);
+    let again = agent.claim_next(ClaimRequest::new("vps-agent")).unwrap();
+    assert!(again.found);
+    assert_eq!(again.task.unwrap().task.id, task.id);
+}
+
+#[test]
 fn serve_sweep_releases_an_expired_lease() {
     let path = temp_db();
     let queue = Queue::open(&path).unwrap();

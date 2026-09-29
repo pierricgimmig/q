@@ -136,6 +136,9 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     if current < 4 {
         apply_v4(&tx, &applied_at)?;
     }
+    if current < 5 {
+        apply_v5(&tx, &applied_at)?;
+    }
     // Additive column checks run on every open, independent of the version
     // row. A database migrated by another branch can already sit above the
     // version a step is gated on, as `apply_v2` guards `feature_id` too.
@@ -143,6 +146,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), QueueError> {
     ensure_task_progress(&tx)?;
     ensure_claim_identity(&tx)?;
     ensure_task_failures_and_tags(&tx)?;
+    ensure_escalation(&tx)?;
     tx.commit()
         .map_err(|err| QueueError::Database(err.to_string()))?;
     Ok(())
@@ -252,6 +256,28 @@ fn ensure_claim_identity(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueErro
     if !column_exists(tx, "claims", "agent_host")? {
         tx.execute_batch("ALTER TABLE claims ADD COLUMN agent_host TEXT;")
             .map_err(|err| QueueError::Database(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// v5: escalation reason, who, and when. The status itself is just a text value.
+fn apply_v5(tx: &rusqlite::Transaction<'_>, applied_at: &str) -> Result<(), QueueError> {
+    ensure_escalation(tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+        params![applied_at],
+    )
+    .map_err(|err| QueueError::Database(err.to_string()))?;
+    Ok(())
+}
+
+/// Add escalation columns when they are missing.
+fn ensure_escalation(tx: &rusqlite::Transaction<'_>) -> Result<(), QueueError> {
+    for column in ["escalated_reason", "escalated_by", "escalated_at"] {
+        if !column_exists(tx, "tasks", column)? {
+            tx.execute_batch(&format!("ALTER TABLE tasks ADD COLUMN {column} TEXT;"))
+                .map_err(|err| QueueError::Database(err.to_string()))?;
+        }
     }
     Ok(())
 }

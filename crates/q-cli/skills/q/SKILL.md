@@ -12,10 +12,12 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture ready
 Say **start the q worker** to run this loop. There is no `q work` command: you do the work, and `q` only tracks it.
 
 1. Claim one ready task with `q claim --agent ID` (MCP `queue_claim_next`). That claim is the mutual-exclusion step and it is atomic. Do not list tasks and then claim by id. If the claim finds nothing, another agent took the only eligible task or the queue is empty: wait about 30 seconds and try again.
-2. Do that one task. Do not claim a second task while this one is open, and do not abandon a claim without `q complete`, `q fail`, or `q release`.
+2. Do that one task. Do not claim a second task while this one is open, and do not abandon a claim without `q complete`, `q escalate`, `q fail`, or `q release`.
 3. While you work, heartbeat about every minute: `q heartbeat ID --claim-token TOKEN` (MCP `queue_heartbeat`). Heartbeat refreshes the lease, which starts at 30 minutes. `q top` flags a worker whose last heartbeat is older than 2 minutes (`--stale-after`) as stale. A claim with no heartbeat until the lease ends is released back to ready, locally on the next `q claim` or `q top`, and on `q serve` by the background sweep.
 4. Post a short note at meaningful steps: `q note ID "running tests" --claim-token TOKEN` (MCP `queue_note`). `q top` shows the latest note on the active task. `q show` lists the notes.
-5. When the work is done, `q complete ID --claim-token TOKEN`. If you cannot finish it, `q fail ID "optional note" --claim-token TOKEN`. Fail releases the claim, records the note on a `task_failed` event, increments the failure count, and returns the task to **ready** so another agent can take it. Then start the next cycle.
+5. When the work is done, `q complete ID --claim-token TOKEN`. If the task is too big, or you lack the tools or context to do it, `q escalate ID "why" --claim-token TOKEN` (MCP `queue_escalate`). Escalate releases the claim and parks the task as **escalated**. It is not claimable again until a human reviews it and runs `q ready ID`. Do not escalate by failing: `q fail` is only for a genuine execution failure, and it returns the task to ready so another agent can try. Then start the next cycle.
+
+Escalated work is a human queue. Review it with `q ls --escalated` or `q top --escalated`. `q show` prints the reason, who escalated, and when. `q ready` (human-only on `q serve`) sends it back to ready.
 
 A specialized agent claims only tagged work: `q claim --agent ID --tag rust` (repeat `--tag`; MCP and HTTP `tags`). The task must carry every tag. Omit the filter to take any eligible task. Set tags at capture with `q add --tag rust` or later with `q edit ID --tag rust`. `--max-failures N` skips tasks that have already failed at least N times; omit it for no cap.
 
@@ -28,7 +30,7 @@ A specialized agent claims only tagged work: `q claim --agent ID --tag rust` (re
 - After every capture, tell the user in one line what was added: the task id, status, and title, for example `captured #184 [ready] Benchmark trace encoding variants`. The CLI prints this line itself without `--json` (after a blank line, with a long title truncated with an ellipsis); with `--json` or MCP `queue_capture`, relay it from the result. Never add a task silently.
 - Only a human releases held work with `q ready ID` (or several at once: `q ready 11 12 13`) or takes ready work back with `q hold ID`. There is no MCP ready or hold tool. Do not mark held work ready yourself, and do not treat a captured task as permission to start it in the current session; claim it.
 - Completion is still gated after a claim: `high` and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept.
-- Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, fail, note, release, and log.
+- Claim at most one task. Keep the opaque claim token and send it with heartbeat, start, block, complete, escalate, fail, note, release, and log.
 - Keep the task's log current while you work. `q log ID "message" --claim-token TOKEN` (MCP `queue_log`) records a timestamped, agent-attributed note: what you are about to do, what you found, what you decided. Publish reports with `--attach report=PATH` (MCP artifact `content`) so the text is stored in the database, and link PRs with `--artifact pr=URL`. Every state change is logged automatically with your agent id. `q log ID` prints the log.
 - When you open a pull request for a task, reference the task as `(Q task#184)` in the title or the first line of the body, and attach the PR with `--artifact pr=URL` on `q log` or `q complete`. Never write `Closes q task #184`: closing is not what happens, and a bare `#184` makes GitHub link an unrelated issue.
 - Report progress, starting right after `q start`: `q log ID --progress 10 --claim-token TOKEN` (MCP `queue_log` with `progress`), then again at each milestone (plan made, code written, tests green, PR open), optionally with a message. The `PROG` column in `q top` and `q ls` stays blank until you do, and humans rely on it to see that work is moving. `q claim` and `q start` print the exact command. Use your honest estimate; do not report 100, completing the task sets that.
@@ -92,14 +94,15 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 | Command | What it does |
 |---|---|
 | `q "title"` / `q add TITLE` | Capture. `--hold` (`-w`, `--wait`), `--kind`, `--priority`, `--risk`, `--body`, `--body-file PATH`, `-e`/`--edit`, `--capability` (repeatable), `--agent-pool`, `--depends-on IDS`, `--feature ID\|TITLE`, `--tag` (repeatable). |
-| `q ls` (`list`) | Table of open tasks. `--status`, `--kind`, `--feature`, `--tag` (every tag must match), `-a`/`--all`, `-n N`. Columns: id, status, feature, project, priority, `PROG`, updated, `PR` (a clickable link on a terminal, the URL when piped), `TAGS`, title. |
-| `q top` | Live view for humans: counts, table, recent changes. `-i SECONDS`, `--once`, `--stale-after SECONDS` (default 120), `--tag`, plus the other `q ls` filters. The wide table adds `FAILS`, `MODEL`, `HOST`, `NOTE`, `BEAT`, and `STALE`. A worker whose last heartbeat is older than the threshold is marked `stale`. `q`, Esc, or Ctrl-C quits. |
+| `q ls` (`list`) | Table of open tasks. `--status`, `--escalated`, `--kind`, `--feature`, `--tag` (every tag must match), `-a`/`--all`, `-n N`. Columns: id, status, feature, project, priority, `PROG`, updated, `PR` (a clickable link on a terminal, the URL when piped), `TAGS`, title. |
+| `q top` | Live view for humans: counts, table, recent changes. `-i SECONDS`, `--once`, `--stale-after SECONDS` (default 120), `--escalated`, `--tag`, plus the other `q ls` filters. The wide table adds `FAILS`, `MODEL`, `HOST`, `NOTE`, `BEAT`, `STALE`, and `ESCALATED` (who, when, and why). A worker whose last heartbeat is older than the threshold is marked `stale`. `q`, Esc, or Ctrl-C quits. |
 | `q show ID` | One task with body, acceptance criteria, claim, artifacts (with ids and stored sizes), recent events. |
 | `q tree ID` / `q tree --feature X` | What must be done first. |
 | `q edit ID` | `--title`, `--body`, `--body-file`, `-e`, `--kind`, `--priority`, `--risk`, `--capability`, `--agent-pool`, `--depends-on`, `--feature`, `--tag`, `--clear-tags`, `--clear-*`. With no flags, opens the editor on the body. |
 | `q ready IDS` / `q hold ID` | Human gate: release held or blocked work; take ready or blocked work back. |
 | `q claim --agent ID` | Claim one eligible ready task. `--capability` (repeatable), `--kind`, `--max-risk`, `--lease-minutes` (default 30), `--agent-pool`, `--model`, `--host`, `--tag` (every tag must match), `--max-failures N` (omit for no cap); global `--repo`/`--project` restrict the pool. Prints the token and the progress command. |
-| `q fail ID [NOTE] --claim-token T` | Release the claim, record the optional note, increment the failure count, and return the task to ready. |
+| `q fail ID [NOTE] --claim-token T` | Release the claim, record the optional note, increment the failure count, and return the task to ready. Use this for a genuine execution failure, not because the task is too big. |
+| `q escalate ID REASON --claim-token T` | Release the claim and park the task as `escalated` for a human. Not claimable until `q ready`. |
 | `q note ID MESSAGE --claim-token T` | Append a short status line to the claimed task. |
 | `q heartbeat ID --claim-token T` | Extend the lease (`--lease-minutes`, default 30). Send one about every minute while working. |
 | `q start ID --claim-token T` | Move to in_progress; `--branch` and `--worktree` are recorded on the claim. |
@@ -129,7 +132,8 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 - `queue_get` — fetch one task, its claim, artifacts, and recent events
 - `queue_tree` — dependency tree for `task_id`, or a forest for `feature` (id or unique title). Children must be done first
 - `queue_claim_next` — atomically claim one eligible ready task, or return no work. Optional `tags` (every tag must match), `max_failures`, `agent_model`, and `agent_host`
-- `queue_fail` — release the claim, record an optional `note`, increment the failure count, and return the task to ready
+- `queue_fail` — release the claim, record an optional `note`, increment the failure count, and return the task to ready. For a genuine execution failure
+- `queue_escalate` — release the claim and park the task as `escalated` with a required `reason`, when it is too big or you lack the tools or context. A human returns it with `q ready`
 - `queue_note` — append a short status `message` to a claimed task
 - `queue_heartbeat` — extend a lease with the task id and claim token. Send one about every minute while working
 - `queue_start` — mark a claim in progress and record a branch or worktree

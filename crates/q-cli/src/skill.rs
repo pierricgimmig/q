@@ -305,11 +305,13 @@ mod tests {
         assert!(text.contains("wait about 30 seconds"));
         assert!(text.contains("q heartbeat"));
         assert!(text.contains("q fail"));
+        assert!(text.contains("q escalate"));
         assert!(text.contains("q note"));
         assert!(text.contains("--tag"));
         assert!(text.contains("30 minutes"));
         assert!(text.contains("queue_claim_next"));
         assert!(text.contains("queue_fail"));
+        assert!(text.contains("queue_escalate"));
         assert!(text.contains("queue_note"));
     }
 

@@ -16,11 +16,11 @@ use q_core::{
     Actor, Artifact, ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
     Claim, ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest,
     CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
-    EditRequest, Event, FailRequest, Feature, HeartbeatRequest, HoldRequest, ListFilter,
-    LogRequest, NoteRequest, ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome,
-    ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition,
-    StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus, TaskSummary, TaskTree,
-    TreeQuery, TreeTask, LEASE_EXPIRED_REASON, NOTE_EVENT,
+    EditRequest, EscalateRequest, Event, FailRequest, Feature, HeartbeatRequest, HoldRequest,
+    ListFilter, LogRequest, NoteRequest, ProjectPolicy, QueueError, QueueService, QueueStatus,
+    ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus,
+    TaskSummary, TaskTree, TreeQuery, TreeTask, LEASE_EXPIRED_REASON, NOTE_EVENT,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -35,7 +35,8 @@ SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_captur
 tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.capture_path, \
 tasks.repo_relative_path, tasks.git_root, tasks.git_head, tasks.agent_pool, \
 tasks.required_capabilities_json, tasks.blocked_reason, tasks.created_at, tasks.updated_at, \
-tasks.feature_id, features.title, tasks.progress, tasks.failure_count, tasks.tags_json \
+tasks.feature_id, features.title, tasks.progress, tasks.failure_count, tasks.tags_json, \
+tasks.escalated_reason, tasks.escalated_by, tasks.escalated_at \
 FROM tasks \
 LEFT JOIN features ON features.id = tasks.feature_id";
 
@@ -232,6 +233,13 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         feature: row.get(21)?,
         failure_count: failure_count_from(row.get(23)?),
         tags: tags_from(row.get::<_, String>(24)?),
+        escalated_reason: blank_to_none(row.get(25)?),
+        escalated_by: blank_to_none(row.get(26)?),
+        escalated_at: row
+            .get::<_, Option<String>>(27)?
+            .as_deref()
+            .map(|value| parse_time(27, value))
+            .transpose()?,
         created_at: parse_time(18, &created_at)?,
         updated_at: parse_time(19, &updated_at)?,
     })
@@ -254,7 +262,16 @@ fn progress_from(value: Option<i64>) -> Option<u8> {
     value.map(|percent| percent.clamp(0, 100) as u8)
 }
 
-/// Store a progress percent (or clear it) and bump `updated_at`.
+/// Drop the escalation note once a human moves the task on.
+fn clear_escalation(conn: &Connection, id: i64) -> Result<(), QueueError> {
+    conn.execute(
+        "UPDATE tasks SET escalated_reason = NULL, escalated_by = NULL, escalated_at = NULL WHERE id = ?",
+        params![id],
+    )
+    .db()?;
+    Ok(())
+}
+
 fn set_progress(
     conn: &Connection,
     id: i64,
@@ -1218,7 +1235,8 @@ impl QueueService for Queue {
                      AND json_extract(e.payload_json, '$.message') IS NOT NULL \
                      AND TRIM(json_extract(e.payload_json, '$.message')) != '' \
                    ORDER BY e.id DESC LIMIT 1 \
-                 ) END \
+                 ) END, \
+                 tasks.escalated_reason, tasks.escalated_by, tasks.escalated_at \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
                  LEFT JOIN claims active_claim ON active_claim.id = ( \
@@ -1282,6 +1300,7 @@ impl QueueService for Queue {
                     let updated_at: String = row.get(11)?;
                     let heartbeat: Option<String> = row.get(20)?;
                     let note: Option<String> = row.get(21)?;
+                    let escalated_at: Option<String> = row.get(24)?;
                     Ok(TaskSummary {
                         id: row.get(0)?,
                         public_id: parse_uuid(1, &public_id)?,
@@ -1300,6 +1319,12 @@ impl QueueService for Queue {
                             .map(|value| parse_time(20, value))
                             .transpose()?,
                         latest_note: blank_to_none(note),
+                        escalated_reason: blank_to_none(row.get(22)?),
+                        escalated_by: blank_to_none(row.get(23)?),
+                        escalated_at: escalated_at
+                            .as_deref()
+                            .map(|value| parse_time(24, value))
+                            .transpose()?,
                         pr_url: row.get(15)?,
                         project: row.get(7)?,
                         repo: row.get(8)?,
@@ -1505,6 +1530,7 @@ impl QueueService for Queue {
             params![task.id],
         )
         .db()?;
+        clear_escalation(&tx, task.id)?;
         insert_event(
             &tx,
             Some(task.id),
@@ -1536,6 +1562,7 @@ impl QueueService for Queue {
             params![task.id],
         )
         .db()?;
+        clear_escalation(&tx, task.id)?;
         insert_event(
             &tx,
             Some(task.id),
@@ -1598,6 +1625,7 @@ impl QueueService for Queue {
         let task = load_task_in(&tx, request.task_id)?;
         ensure_transition(task.status, TaskStatus::Cancelled)?;
         set_status(&tx, task.id, task.status, TaskStatus::Cancelled, &now)?;
+        clear_escalation(&tx, task.id)?;
         insert_event(
             &tx,
             Some(task.id),
@@ -1843,6 +1871,51 @@ impl QueueService for Queue {
                 "to": "ready",
                 "failure_count": failures,
                 "note": note,
+            }),
+            &now,
+        )?;
+        tx.commit().db()?;
+        self.with_conn(|conn| load_task(conn, request.task_id))
+    }
+
+    fn escalate(&self, request: EscalateRequest) -> Result<Task, QueueError> {
+        let reason = request.reason.trim();
+        if reason.is_empty() {
+            return Err(QueueError::InvalidInput(
+                "escalation reason is required".into(),
+            ));
+        }
+        if reason.chars().count() > 500 {
+            return Err(QueueError::InvalidInput(
+                "escalation reason must be 500 characters or fewer".into(),
+            ));
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        ensure_transition(task.status, TaskStatus::Escalated)?;
+        let claim = require_active_claim(&tx, task.id, &request.claim_token, &now)?;
+        let who = format!("agent:{}", claim.agent_id);
+        set_status(&tx, task.id, task.status, TaskStatus::Escalated, &now)?;
+        tx.execute(
+            "UPDATE tasks SET escalated_reason = ?, escalated_by = ?, escalated_at = ? WHERE id = ?",
+            params![reason, &who, &now, task.id],
+        )
+        .db()?;
+        retire_claim(&tx, claim.id, &now)?;
+        insert_event(
+            &tx,
+            Some(task.id),
+            "task_escalated",
+            &Actor::agent(&claim.agent_id),
+            json!({
+                "from": task.status.as_str(),
+                "to": "escalated",
+                "reason": reason,
+                "agent_id": claim.agent_id,
             }),
             &now,
         )?;
@@ -2172,6 +2245,7 @@ impl QueueService for Queue {
                 TaskStatus::InProgress => counts.in_progress = count,
                 TaskStatus::Review => counts.review = count,
                 TaskStatus::Blocked => counts.blocked = count,
+                TaskStatus::Escalated => counts.escalated = count,
                 TaskStatus::Done => counts.done = count,
                 TaskStatus::Cancelled => counts.cancelled = count,
             }

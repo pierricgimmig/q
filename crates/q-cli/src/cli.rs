@@ -74,6 +74,7 @@ fn is_command(word: &str) -> bool {
             | "token"
             | "skill"
             | "fail"
+            | "escalate"
             | "note"
             | "help"
             | "done"
@@ -107,6 +108,7 @@ fn is_bool_flag(arg: &str) -> bool {
             | "--clear-agent-pool"
             | "--clear-feature"
             | "--clear-tags"
+            | "--escalated"
     )
 }
 
@@ -281,9 +283,12 @@ pub enum Commands {
     Ls {
         /// Show only this status. Includes done or cancelled when that status is named.
         ///
-        /// Statuses: held, ready, claimed, in_progress, review, blocked, done, cancelled.
-        #[arg(long, value_name = "STATUS")]
+        /// Statuses: held, ready, claimed, in_progress, review, blocked, escalated, done, cancelled.
+        #[arg(long, value_name = "STATUS", conflicts_with = "escalated")]
         status: Option<String>,
+        /// Show only tasks a worker escalated for human review.
+        #[arg(long)]
+        escalated: bool,
         /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
@@ -306,8 +311,11 @@ pub enum Commands {
         #[arg(short = 'i', long, default_value_t = 1.0, value_name = "SECONDS")]
         interval: f64,
         /// Show only this status. Includes done or cancelled when that status is named.
-        #[arg(long, value_name = "STATUS")]
+        #[arg(long, value_name = "STATUS", conflicts_with = "escalated")]
         status: Option<String>,
+        /// Show only tasks a worker escalated for human review.
+        #[arg(long)]
+        escalated: bool,
         /// implementation, research, review, benchmark, documentation, or other.
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
@@ -485,6 +493,20 @@ pub enum Commands {
         /// Skip tasks that have already failed this many times. Omit for no cap.
         #[arg(long, value_name = "N")]
         max_failures: Option<u32>,
+    },
+    /// Release the claim and park the task for a human. It is not claimable until `q ready`.
+    ///
+    /// Use this when the task is too big, or you lack the tools or context.
+    /// A genuine execution failure uses `q fail` instead. The reason is required.
+    Escalate {
+        /// Task id.
+        id: i64,
+        /// Why a human should look at this before another agent claims it.
+        #[arg(value_name = "REASON")]
+        reason: String,
+        /// Token printed by `q claim`.
+        #[arg(long)]
+        claim_token: String,
     },
     /// Release a claim, record an optional note, and return the task to ready.
     ///

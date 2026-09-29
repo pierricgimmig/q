@@ -1257,7 +1257,8 @@ fn top_once_prints_counts_table_and_changes() {
         ("HOST", "NOTE"),
         ("NOTE", "BEAT"),
         ("BEAT", "STALE"),
-        ("STALE", "TITLE"),
+        ("STALE", "ESCALATED"),
+        ("ESCALATED", "TITLE"),
     ] {
         assert!(
             header.find(left).unwrap() < header.find(right).unwrap(),
@@ -1942,6 +1943,122 @@ fn fail_note_tags_and_identity_round_trip_and_top_marks_stale() {
     assert!(skill.contains("start the q worker"), "{skill}");
     assert!(skill.contains("q fail"));
     assert!(skill.contains("q note"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn escalate_shows_in_top_and_ls_until_ready() {
+    let root = temp_root("escalate");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    let big: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "add", "Rewrite the planner"])).stdout,
+    )
+    .unwrap();
+    let id = big["id"].as_i64().unwrap();
+    let small: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "add", "Fix a typo"])).stdout,
+    )
+    .unwrap();
+    let small_id = small["id"].as_i64().unwrap();
+
+    let claimed: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db", db_arg, "--json", "claim", "--agent", "worker-1", "--model", "opus", "--host",
+            "worker-a",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(claimed["task"]["id"], id);
+    let token = claimed["claim"]["token"].as_str().unwrap();
+
+    let escalated: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "escalate",
+            &id.to_string(),
+            "too big",
+            "--claim-token",
+            token,
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(escalated["status"], "escalated");
+    assert_eq!(escalated["escalated_reason"], "too big");
+    assert_eq!(escalated["escalated_by"], "agent:worker-1");
+    assert!(escalated.get("escalated_at").is_some());
+
+    let shown =
+        String::from_utf8(run(bin().args(["--db", db_arg, "show", &id.to_string()])).stdout)
+            .unwrap();
+    assert!(shown.contains("escalated_reason: too big"), "{shown}");
+    assert!(shown.contains("escalated_by: agent:worker-1"), "{shown}");
+    assert!(shown.contains("escalated_at:"), "{shown}");
+
+    let filtered: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "ls", "--escalated"])).stdout,
+    )
+    .unwrap();
+    let ids: Vec<i64> = filtered["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![id]);
+
+    let top = String::from_utf8(run(bin().args(["--db", db_arg, "top", "--once"])).stdout).unwrap();
+    assert!(top.contains("ESCALATED"), "{top}");
+    assert!(top.contains("too big"), "{top}");
+    assert!(top.contains("agent:worker-1"), "{top}");
+    assert!(top.contains("escalated 1"), "{top}");
+
+    let missed: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "worker-2"])).stdout,
+    )
+    .unwrap();
+    assert_eq!(missed["found"], true);
+    assert_eq!(missed["task"]["id"], small_id);
+    let small_token = missed["claim"]["token"].as_str().unwrap();
+    run(bin().args([
+        "--db",
+        db_arg,
+        "release",
+        &small_id.to_string(),
+        "--claim-token",
+        small_token,
+    ]));
+
+    let ready: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "ready", &id.to_string()])).stdout,
+    )
+    .unwrap();
+    assert_eq!(ready["task"]["status"], "ready");
+    assert!(ready["task"].get("escalated_reason").is_none());
+    assert!(ready["task"].get("escalated_by").is_none());
+    let shown =
+        String::from_utf8(run(bin().args(["--db", db_arg, "show", &id.to_string()])).stdout)
+            .unwrap();
+    assert!(!shown.contains("escalated_reason:"), "{shown}");
+
+    let empty: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "ls", "--escalated"])).stdout,
+    )
+    .unwrap();
+    assert!(empty["tasks"].as_array().unwrap().is_empty());
+
+    let again: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "claim", "--agent", "worker-3"])).stdout,
+    )
+    .unwrap();
+    assert_eq!(again["found"], true);
+    assert_eq!(again["task"]["id"], id);
 
     let _ = fs::remove_dir_all(root);
 }

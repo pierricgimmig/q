@@ -150,6 +150,10 @@ impl QueueService for RemoteQueue {
         self.call("fail", &request)
     }
 
+    fn escalate(&self, request: q_core::EscalateRequest) -> Result<Task, QueueError> {
+        self.call("escalate", &request)
+    }
+
     fn note(&self, request: NoteRequest) -> Result<TaskDetail, QueueError> {
         self.call("note", &request)
     }

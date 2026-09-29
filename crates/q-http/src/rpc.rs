@@ -76,6 +76,11 @@ pub fn dispatch(
             stamp(&mut request.actor, principal);
             reply(queue.fail(request))
         }
+        "escalate" => {
+            let mut request: q_core::EscalateRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.escalate(request))
+        }
         "note" => {
             let mut request: NoteRequest = parse(body)?;
             stamp(&mut request.actor, principal);
@@ -241,6 +246,9 @@ mod tests {
                 unreachable!()
             }
             fn fail(&self, _: FailRequest) -> Result<q_core::Task, QueueError> {
+                unreachable!()
+            }
+            fn escalate(&self, _: q_core::EscalateRequest) -> Result<q_core::Task, QueueError> {
                 unreachable!()
             }
             fn note(&self, _: NoteRequest) -> Result<q_core::TaskDetail, QueueError> {

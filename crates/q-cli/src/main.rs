@@ -139,6 +139,7 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             feature,
             tag,
             stale_after,
+            escalated,
             once,
         } => {
             let (interval, limit, all, once) = (*interval, *limit, *all, *once);
@@ -151,9 +152,13 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             if !interval.is_finite() || interval < 0.1 {
                 return Err(CliError::message("--interval must be at least 0.1 seconds"));
             }
-            let status = match status {
-                Some(status) => Some(TaskStatus::parse(&status)?),
-                None => None,
+            let status = if *escalated {
+                Some(TaskStatus::Escalated)
+            } else {
+                match status {
+                    Some(status) => Some(TaskStatus::parse(&status)?),
+                    None => None,
+                }
             };
             let kind = match kind {
                 Some(kind) => Some(TaskKind::parse(&kind)?),
@@ -470,15 +475,20 @@ fn dispatch(
         }
         Commands::Ls {
             status,
+            escalated,
             kind,
             limit,
             all,
             feature,
             tag,
         } => {
-            let status = match status {
-                Some(status) => Some(TaskStatus::parse(&status)?),
-                None => None,
+            let status = if escalated {
+                Some(TaskStatus::Escalated)
+            } else {
+                match status {
+                    Some(status) => Some(TaskStatus::parse(&status)?),
+                    None => None,
+                }
             };
             let kind = match kind {
                 Some(kind) => Some(TaskKind::parse(&kind)?),
@@ -804,6 +814,25 @@ fn dispatch(
                     detail.task.status.as_str(),
                     &detail.task.title,
                 );
+            });
+            Ok(())
+        }
+        Commands::Escalate {
+            id,
+            reason,
+            claim_token,
+        } => {
+            let task = queue.escalate(q_core::EscalateRequest {
+                task_id: id,
+                claim_token,
+                reason,
+                actor: human_actor(),
+            })?;
+            emit(ui, &task, || {
+                confirm(ui, "escalated", task.id, task.status.as_str(), &task.title);
+                if let Some(reason) = &task.escalated_reason {
+                    println!("reason: {reason}");
+                }
             });
             Ok(())
         }
@@ -1768,6 +1797,7 @@ fn render_top_counts(status: &q_core::QueueStatus, paint: Paint) -> String {
         ("in_progress", counts.in_progress),
         ("review", counts.review),
         ("blocked", counts.blocked),
+        ("escalated", counts.escalated),
         ("done", counts.done),
         ("cancelled", counts.cancelled),
     ] {
@@ -1852,6 +1882,7 @@ fn print_status(backend: &Backend, status: &q_core::QueueStatus, paint: Paint) {
         ("in_progress", status.counts.in_progress),
         ("review", status.counts.review),
         ("blocked", status.counts.blocked),
+        ("escalated", status.counts.escalated),
         ("done", status.counts.done),
         ("cancelled", status.counts.cancelled),
     ] {
@@ -1935,6 +1966,13 @@ fn event_detail(event: &q_core::Event, paint: Paint) -> String {
     {
         parts.push(format!("failures {count}"));
     }
+    if event.event_type == "task_escalated" {
+        if let Some(reason) = field("reason") {
+            if !reason.is_empty() {
+                parts.push(reason.to_string());
+            }
+        }
+    }
     if let (Some(kind), Some(value)) = (field("kind"), field("value")) {
         let id = payload
             .get("artifact_id")
@@ -1987,6 +2025,8 @@ struct TaskListRow {
     beat: String,
     /// `stale` when the active heartbeat is older than the threshold.
     stale: String,
+    /// Who, when, and why, while the task is escalated. Blank otherwise.
+    escalated: String,
     title: String,
 }
 
@@ -2073,8 +2113,29 @@ fn task_list_row_with(
         },
         beat,
         stale,
+        escalated: escalation_cell(task, now, precise),
         title: format_list_title(&task.title),
     }
+}
+
+/// `agent:bot · 3s ago · too big`, or blank when the task is not escalated.
+fn escalation_cell(task: &TaskSummary, now: OffsetDateTime, precise: bool) -> String {
+    if task.status != TaskStatus::Escalated {
+        return String::new();
+    }
+    let who = task.escalated_by.as_deref().unwrap_or("-");
+    let when = match task.escalated_at {
+        Some(at) if precise => style::format_relative_precise(at, now),
+        Some(at) => style::format_relative(at, now),
+        None => "-".to_string(),
+    };
+    let reason = task
+        .escalated_reason
+        .as_deref()
+        .map(format_list_title)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "-".to_string());
+    truncate_chars(&format!("{who} · {when} · {reason}"), 48)
 }
 
 /// Heartbeat age, and `stale` when it is older than the threshold.
@@ -2154,12 +2215,20 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
         "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TAGS",
     ];
     if wide {
-        headers.extend(["FAILS", "MODEL", "HOST", "NOTE", "BEAT", "STALE"]);
+        headers.extend([
+            "FAILS",
+            "MODEL",
+            "HOST",
+            "NOTE",
+            "BEAT",
+            "STALE",
+            "ESCALATED",
+        ]);
     }
     headers.push("TITLE");
     let mut align_right = vec![true, false, false, false, true, true, false, false, false];
     if wide {
-        align_right.extend([true, false, false, false, false, false]);
+        align_right.extend([true, false, false, false, false, false, false]);
     }
     align_right.push(false);
     let mut widths: Vec<usize> = vec![
@@ -2181,6 +2250,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
             column_width("NOTE", rows.iter().map(|row| row.note.as_str())),
             column_width("BEAT", rows.iter().map(|row| row.beat.as_str())),
             column_width("STALE", rows.iter().map(|row| row.stale.as_str())),
+            column_width("ESCALATED", rows.iter().map(|row| row.escalated.as_str())),
         ]);
     }
     widths.push(column_width(
@@ -2220,6 +2290,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
                 row.note.as_str(),
                 row.beat.as_str(),
                 row.stale.as_str(),
+                row.escalated.as_str(),
             ]);
         }
         cells.push(row.title.as_str());
@@ -2242,6 +2313,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
                 Style::new(),
                 style::dim_style(),
                 stale_style,
+                style::status_style("escalated"),
             ]);
         }
         styles.push(style::bold_style());
@@ -2552,6 +2624,27 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
     };
     meta(paint, &format!("tags: {tags}"));
     meta(paint, &format!("failures: {}", task.failure_count));
+    if task.status == q_core::TaskStatus::Escalated {
+        meta(
+            paint,
+            &format!(
+                "escalated_reason: {}",
+                task.escalated_reason.as_deref().unwrap_or("-")
+            ),
+        );
+        meta(
+            paint,
+            &format!(
+                "escalated_by: {}",
+                task.escalated_by.as_deref().unwrap_or("-")
+            ),
+        );
+        let when = task
+            .escalated_at
+            .map(|at| format_timestamp(at))
+            .unwrap_or_else(|| "-".to_string());
+        meta(paint, &format!("escalated_at: {when}"));
+    }
     meta(
         paint,
         &format!("created_at: {}", format_timestamp(task.created_at)),
@@ -2809,6 +2902,7 @@ mod tests {
                 note: String::new(),
                 beat: String::new(),
                 stale: String::new(),
+                escalated: String::new(),
                 title: "Short".into(),
             },
             TaskListRow {
@@ -2827,6 +2921,7 @@ mod tests {
                 note: String::new(),
                 beat: String::new(),
                 stale: String::new(),
+                escalated: String::new(),
                 title: format_list_title(&long),
             },
         ];
@@ -2875,6 +2970,7 @@ mod tests {
                 note: String::new(),
                 beat: String::new(),
                 stale: String::new(),
+                escalated: String::new(),
                 title: "Keep the held item".into(),
             },
             TaskListRow {
@@ -2893,6 +2989,7 @@ mod tests {
                 note: String::new(),
                 beat: String::new(),
                 stale: String::new(),
+                escalated: String::new(),
                 title: "Compare encodings".into(),
             },
             TaskListRow {
@@ -2911,6 +3008,7 @@ mod tests {
                 note: String::new(),
                 beat: String::new(),
                 stale: String::new(),
+                escalated: String::new(),
                 title: "Unassigned capture".into(),
             },
         ];
@@ -2948,6 +3046,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             note: String::new(),
             beat: String::new(),
             stale: String::new(),
+            escalated: String::new(),
             title: "Shipped".into(),
         };
         let plain = render_task_rows(std::slice::from_ref(&row));
@@ -3003,6 +3102,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             note: "running tests".into(),
             beat: "3m ago".into(),
             stale: "stale".into(),
+            escalated: String::new(),
             title: "Fix the parser".into(),
         };
         let table = render_task_rows_painted(std::slice::from_ref(&row), Paint::plain(), true);
@@ -3014,7 +3114,8 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             ("HOST", "NOTE"),
             ("NOTE", "BEAT"),
             ("BEAT", "STALE"),
-            ("STALE", "TITLE"),
+            ("STALE", "ESCALATED"),
+            ("ESCALATED", "TITLE"),
         ] {
             assert!(
                 header.find(left).unwrap() < header.find(right).unwrap(),
@@ -3051,6 +3152,7 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
             note: String::new(),
             beat: String::new(),
             stale: String::new(),
+            escalated: String::new(),
             title: "Compare encodings".into(),
         }];
         let plain = render_task_rows(&rows);

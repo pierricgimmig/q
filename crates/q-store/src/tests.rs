@@ -9,10 +9,10 @@ use rusqlite::{params, Connection};
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
     CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
-    FailRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest, NoteRequest, ProjectPolicy,
-    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
-    StaleDisposition, StartRequest, TaskKind, TaskStatus, TreeQuery, LEASE_EXPIRED_REASON,
-    NO_ELIGIBLE_REASON,
+    EscalateRequest, FailRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
+    NoteRequest, ProjectPolicy, QueueError, QueueService, ReadyRequest, RecoverRequest,
+    ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, TaskKind, TaskStatus, TreeQuery,
+    LEASE_EXPIRED_REASON, NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -152,7 +152,7 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let feature_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
@@ -1598,7 +1598,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let rejected = conn.execute(
         "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
         params![task_id],
@@ -2007,7 +2007,7 @@ fn migration_v3_adds_artifact_content_and_keeps_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(queue.get(1).unwrap().artifacts.len(), 2);
 }
 
@@ -2021,7 +2021,7 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
     conn.execute_batch(
         "ALTER TABLE artifacts DROP COLUMN content;
          INSERT INTO schema_migrations (version, applied_at)
-         VALUES (5, '2026-09-24T00:00:00Z'), (6, '2026-09-24T00:00:00Z');",
+         VALUES (6, '2026-09-24T00:00:00Z'), (7, '2026-09-24T00:00:00Z');",
     )
     .unwrap();
     let before: i64 = conn
@@ -2057,7 +2057,7 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 6, "foreign version rows are left alone");
+    assert_eq!(version, 7, "foreign version rows are left alone");
 }
 
 #[test]
@@ -2367,5 +2367,139 @@ fn migration_v4_keeps_old_claims_and_defaults_failures_and_tags() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
+}
+
+#[test]
+fn escalate_parks_the_task_until_a_human_marks_it_ready() {
+    let (queue, _) = queue();
+    let id = capture(&queue, "too big");
+    make_ready(&queue, id);
+    let other = capture(&queue, "small");
+    make_ready(&queue, other);
+    let token = claim(&queue, "agent-a").claim.unwrap().token;
+    queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: None,
+            progress: Some(40),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+
+    let empty = queue.escalate(EscalateRequest {
+        task_id: id,
+        claim_token: token.clone(),
+        reason: "   ".into(),
+        actor: actor(),
+    });
+    assert!(matches!(empty, Err(QueueError::InvalidInput(_))));
+    let huge = "x".repeat(501);
+    let too_long = queue.escalate(EscalateRequest {
+        task_id: id,
+        claim_token: token.clone(),
+        reason: huge,
+        actor: actor(),
+    });
+    assert!(matches!(too_long, Err(QueueError::InvalidInput(_))));
+
+    let escalated = queue
+        .escalate(EscalateRequest {
+            task_id: id,
+            claim_token: token,
+            reason: "needs a design review".into(),
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(escalated.status, TaskStatus::Escalated);
+    assert_eq!(
+        escalated.escalated_reason.as_deref(),
+        Some("needs a design review")
+    );
+    assert_eq!(escalated.escalated_by.as_deref(), Some("agent:agent-a"));
+    assert!(escalated.escalated_at.is_some());
+    assert_eq!(escalated.progress, Some(40));
+    assert_eq!(escalated.failure_count, 0);
+    assert!(!queue.get(id).unwrap().claim.unwrap().active);
+    let event = queue
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "task_escalated")
+        .unwrap();
+    assert_eq!(event.actor_type, "agent");
+    assert_eq!(event.actor_id.as_deref(), Some("agent-a"));
+    assert_eq!(event.payload["to"], "escalated");
+    assert_eq!(event.payload["reason"], "needs a design review");
+
+    let listed = queue
+        .list(ListFilter {
+            status: Some(TaskStatus::Escalated),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(
+        listed[0].escalated_reason.as_deref(),
+        Some("needs a design review")
+    );
+    assert_eq!(listed[0].escalated_by.as_deref(), Some("agent:agent-a"));
+    assert!(listed[0].escalated_at.is_some());
+
+    let next = claim(&queue, "agent-b");
+    assert!(next.found);
+    assert_eq!(next.task.unwrap().task.id, other);
+
+    let parked = capture(&queue, "cancel me");
+    make_ready(&queue, parked);
+    let parked_token = claim(&queue, "agent-c").claim.unwrap().token;
+    queue
+        .escalate(EscalateRequest {
+            task_id: parked,
+            claim_token: parked_token,
+            reason: "missing the repo".into(),
+            actor: actor(),
+        })
+        .unwrap();
+    let cancelled = queue
+        .cancel(CancelRequest {
+            task_id: parked,
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert_eq!(cancelled.escalated_reason, None);
+    assert_eq!(cancelled.escalated_by, None);
+    assert_eq!(cancelled.escalated_at, None);
+
+    let unclaimed = capture(&queue, "still ready");
+    make_ready(&queue, unclaimed);
+    let rejected = queue.escalate(EscalateRequest {
+        task_id: unclaimed,
+        claim_token: "nope".into(),
+        reason: "no claim".into(),
+        actor: actor(),
+    });
+    assert!(matches!(
+        rejected,
+        Err(QueueError::InvalidTransition { .. })
+    ));
+
+    let ready = queue
+        .mark_ready(ReadyRequest {
+            task_id: id,
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(ready.task.status, TaskStatus::Ready);
+    assert_eq!(ready.task.escalated_reason, None);
+    assert_eq!(ready.task.escalated_by, None);
+    assert_eq!(ready.task.escalated_at, None);
+    assert_eq!(ready.task.progress, Some(40));
+    let again = claim(&queue, "agent-d");
+    assert!(again.found);
+    assert_eq!(again.task.unwrap().task.id, id);
 }
