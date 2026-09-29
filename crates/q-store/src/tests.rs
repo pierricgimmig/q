@@ -9,9 +9,10 @@ use rusqlite::{params, Connection};
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest,
     CompleteRequest, CreateFeatureRequest, DeleteRequest, EditFeatureRequest, EditRequest,
-    HeartbeatRequest, HoldRequest, ListFilter, LogRequest, ProjectPolicy, QueueError, QueueService,
-    ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel, StaleDisposition, StartRequest,
-    TaskKind, TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
+    FailRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest, NoteRequest, ProjectPolicy,
+    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, RiskLevel,
+    StaleDisposition, StartRequest, TaskKind, TaskStatus, TreeQuery, LEASE_EXPIRED_REASON,
+    NO_ELIGIBLE_REASON,
 };
 
 use super::{open_connection, Queue};
@@ -82,6 +83,7 @@ fn capture_with(queue: &Queue, title: &str, risk: RiskLevel, policy: Option<Proj
             actor: actor(),
             context_source: Some("test".into()),
             hold: true,
+            tags: vec![],
         })
         .unwrap()
         .id
@@ -150,7 +152,7 @@ fn fresh_database_enables_wal_foreign_keys_and_busy_timeout() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let feature_column: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'feature_id'",
@@ -281,7 +283,7 @@ fn expired_claims_are_recovered_with_events_and_can_be_reclaimed() {
     assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Ready);
     let events = queue.events(id).unwrap();
     assert!(events.iter().any(|event| {
-        event.event_type == "task_recovered" && event.payload.get("reason").is_none()
+        event.event_type == "task_recovered" && event.payload["reason"] == LEASE_EXPIRED_REASON
     }));
     assert!(queue.get(id).unwrap().claim.unwrap().branch.is_none());
 
@@ -302,7 +304,7 @@ fn claim_recovers_expired_work_inside_the_claim_transaction() {
     assert_eq!(second.claim.unwrap().agent_id, "agent-b");
     let events = queue.events(id).unwrap();
     assert!(events.iter().any(|event| {
-        event.event_type == "task_recovered" && event.payload.get("reason").is_none()
+        event.event_type == "task_recovered" && event.payload["reason"] == LEASE_EXPIRED_REASON
     }));
     assert!(
         events
@@ -628,6 +630,7 @@ fn project_cap_limits_active_claims() {
             actor: actor(),
             context_source: None,
             hold: true,
+            tags: vec![],
         })
         .unwrap();
     let second = queue
@@ -651,6 +654,7 @@ fn project_cap_limits_active_claims() {
             actor: actor(),
             context_source: None,
             hold: true,
+            tags: vec![],
         })
         .unwrap();
     for id in [first.id, second.id] {
@@ -775,6 +779,7 @@ fn delete_removes_held_and_ready_tasks_and_cascades_dependents() {
             feature: None,
             limit: 100,
             include_terminal: false,
+            tags: vec![],
         })
         .unwrap();
     assert!(listed.iter().all(|task| task.id != held));
@@ -821,6 +826,7 @@ fn delete_removes_held_and_ready_tasks_and_cascades_dependents() {
             feature: None,
             limit: 100,
             include_terminal: false,
+            tags: vec![],
         })
         .unwrap();
     assert!(listed.is_empty());
@@ -955,6 +961,7 @@ fn empty_claim_is_success_and_list_filters() {
             feature: None,
             limit: 10,
             include_terminal: false,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -986,6 +993,7 @@ fn capture_named(queue: &Queue, title: &str, project: Option<&str>) -> i64 {
             actor: actor(),
             context_source: Some("test".into()),
             hold: true,
+            tags: vec![],
         })
         .unwrap()
         .id
@@ -1052,6 +1060,7 @@ fn listed(
             feature: None,
             limit,
             include_terminal,
+            tags: vec![],
         })
         .unwrap()
         .into_iter()
@@ -1149,6 +1158,7 @@ fn list_hides_terminal_statuses_and_sorts_by_project_then_updated_at() {
             feature: None,
             limit: 100,
             include_terminal: true,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(
@@ -1187,6 +1197,7 @@ fn capture_in(
             actor: actor(),
             context_source: Some("test".into()),
             hold: true,
+            tags: vec![],
         })
         .unwrap()
         .id
@@ -1202,6 +1213,7 @@ fn feature_ids(queue: &Queue, feature: Option<&str>, include_terminal: bool) -> 
             feature: feature.map(str::to_string),
             limit: 100,
             include_terminal,
+            tags: vec![],
         })
         .unwrap()
         .into_iter()
@@ -1314,6 +1326,7 @@ fn features_group_tasks_across_repos_and_resolve_by_id_or_title() {
         actor: actor(),
         context_source: None,
         hold: false,
+        tags: vec![],
     });
     assert!(matches!(ambiguous, Err(QueueError::Conflict(_))));
 
@@ -1443,6 +1456,7 @@ fn capture_defaults_to_ready_and_hold_keeps_it_out_of_the_pool() {
             actor: actor(),
             context_source: None,
             hold: false,
+            tags: vec![],
         })
         .unwrap();
     assert_eq!(ready.status, TaskStatus::Ready);
@@ -1584,7 +1598,7 @@ fn migration_v2_adds_features_and_clears_feature_id_on_delete() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let rejected = conn.execute(
         "UPDATE tasks SET feature_id = 99999 WHERE id = ?1",
         params![task_id],
@@ -1993,7 +2007,7 @@ fn migration_v3_adds_artifact_content_and_keeps_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(queue.get(1).unwrap().artifacts.len(), 2);
 }
 
@@ -2007,7 +2021,7 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
     conn.execute_batch(
         "ALTER TABLE artifacts DROP COLUMN content;
          INSERT INTO schema_migrations (version, applied_at)
-         VALUES (4, '2026-09-24T00:00:00Z'), (5, '2026-09-24T00:00:00Z');",
+         VALUES (5, '2026-09-24T00:00:00Z'), (6, '2026-09-24T00:00:00Z');",
     )
     .unwrap();
     let before: i64 = conn
@@ -2043,7 +2057,7 @@ fn artifact_content_column_is_added_even_when_the_version_is_ahead() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 5, "foreign version rows are left alone");
+    assert_eq!(version, 6, "foreign version rows are left alone");
 }
 
 #[test]
@@ -2148,4 +2162,210 @@ fn list_carries_the_newest_pr_artifact() {
     );
     let open = rows.iter().find(|task| task.id == other).unwrap();
     assert_eq!(open.pr_url, None);
+}
+
+fn set_tags(queue: &Queue, id: i64, tags: &[&str]) {
+    let mut edit = EditRequest::empty(actor());
+    edit.tags = Some(tags.iter().map(|tag| (*tag).to_string()).collect());
+    queue.edit(id, edit).unwrap();
+}
+
+#[test]
+fn fail_returns_to_ready_increments_the_count_and_can_be_capped() {
+    let (queue, _) = queue();
+    let id = capture(&queue, "try again");
+    make_ready(&queue, id);
+    let token = claim(&queue, "agent-a").claim.unwrap().token;
+    queue
+        .log(LogRequest {
+            task_id: id,
+            claim_token: Some(token.clone()),
+            message: None,
+            progress: Some(40),
+            artifacts: vec![],
+            actor: actor(),
+        })
+        .unwrap();
+
+    let failed = queue
+        .fail(FailRequest {
+            task_id: id,
+            claim_token: token,
+            note: Some("tests failed".into()),
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(failed.status, TaskStatus::Ready);
+    assert_eq!(failed.failure_count, 1);
+    assert_eq!(failed.progress, None);
+    assert!(!queue.get(id).unwrap().claim.unwrap().active);
+    let event = queue
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event_type == "task_failed")
+        .unwrap();
+    assert_eq!(event.payload["to"], "ready");
+    assert_eq!(event.payload["failure_count"], 1);
+    assert_eq!(event.payload["note"], "tests failed");
+
+    let again = claim(&queue, "agent-b");
+    assert!(again.found);
+    queue
+        .fail(FailRequest {
+            task_id: id,
+            claim_token: again.claim.unwrap().token,
+            note: None,
+            actor: actor(),
+        })
+        .unwrap();
+    assert_eq!(queue.get(id).unwrap().task.failure_count, 2);
+
+    let mut capped = ClaimRequest::new("agent-c");
+    capped.max_failures = Some(2);
+    assert!(!queue.claim_next(capped).unwrap().found);
+    let mut zero = ClaimRequest::new("agent-d");
+    zero.max_failures = Some(0);
+    assert!(matches!(
+        queue.claim_next(zero).unwrap_err(),
+        QueueError::InvalidInput(_)
+    ));
+    assert!(claim(&queue, "agent-e").found);
+}
+
+#[test]
+fn tags_filter_claims_and_lists_and_notes_follow_the_active_claim() {
+    let (queue, _) = queue();
+    let rust = capture(&queue, "parser");
+    let docs = capture(&queue, "guide");
+    set_tags(&queue, rust, &["Rust", "db"]);
+    set_tags(&queue, docs, &["docs"]);
+    make_ready(&queue, rust);
+    make_ready(&queue, docs);
+
+    let listed = queue
+        .list(ListFilter {
+            tags: vec!["rust".into()],
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, rust);
+    assert_eq!(listed[0].tags, vec!["Rust".to_string(), "db".to_string()]);
+
+    let mut only_rust = ClaimRequest::new("agent-rust");
+    only_rust.agent_model = Some("opus".into());
+    only_rust.agent_host = Some("worker-a".into());
+    only_rust.tags = vec!["rust".into(), "DB".into()];
+    let outcome = queue.claim_next(only_rust).unwrap();
+    assert!(outcome.found);
+    assert_eq!(outcome.task.unwrap().task.id, rust);
+    let claim = outcome.claim.unwrap();
+    assert_eq!(claim.agent_model.as_deref(), Some("opus"));
+    assert_eq!(claim.agent_host.as_deref(), Some("worker-a"));
+    let stored = queue.get(rust).unwrap().claim.unwrap();
+    assert_eq!(stored.agent_model.as_deref(), Some("opus"));
+    assert_eq!(stored.agent_host.as_deref(), Some("worker-a"));
+
+    let mut still_rust = ClaimRequest::new("agent-other");
+    still_rust.tags = vec!["rust".into()];
+    assert!(!queue.claim_next(still_rust).unwrap().found);
+
+    queue
+        .note(NoteRequest {
+            task_id: rust,
+            claim_token: claim.token.clone(),
+            message: "running tests".into(),
+            actor: actor(),
+        })
+        .unwrap();
+    queue
+        .note(NoteRequest {
+            task_id: rust,
+            claim_token: claim.token.clone(),
+            message: "writing the report".into(),
+            actor: actor(),
+        })
+        .unwrap();
+    let detail = queue.get(rust).unwrap();
+    let notes: Vec<_> = detail
+        .events
+        .iter()
+        .filter(|event| event.event_type == q_core::NOTE_EVENT)
+        .filter_map(|event| event.payload["message"].as_str())
+        .collect();
+    assert_eq!(notes, vec!["running tests", "writing the report"]);
+    let row = queue
+        .list(ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == rust)
+        .unwrap();
+    assert_eq!(row.latest_note.as_deref(), Some("writing the report"));
+    assert_eq!(row.agent_model.as_deref(), Some("opus"));
+    assert_eq!(row.failure_count, 0);
+
+    queue
+        .release(ReleaseRequest {
+            task_id: rust,
+            claim_token: claim.token,
+            actor: actor(),
+        })
+        .unwrap();
+    let released = queue
+        .list(ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|task| task.id == rust)
+        .unwrap();
+    assert_eq!(released.latest_note, None);
+    assert_eq!(released.agent_model, None);
+    assert_eq!(released.agent_host, None);
+}
+
+#[test]
+fn migration_v4_keeps_old_claims_and_defaults_failures_and_tags() {
+    let path = temp_db();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(super::schema::SCHEMA_V1).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+         );
+         INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-01-01T00:00:00Z');
+         INSERT INTO tasks (
+            public_id, title, original_capture, status, kind, priority, risk, capture_path,
+            required_capabilities_json, created_at, updated_at
+         ) VALUES (
+            '018f1a7e-7b6a-7c10-8000-0000000000a4', 'legacy claim', 'legacy claim', 'claimed',
+            'implementation', 0, 'low', '/tmp', '[]', '2026-01-01T00:00:00Z',
+            '2026-01-01T00:00:00Z'
+         );
+         INSERT INTO claims (
+            task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at
+         ) VALUES (
+            1, 'old-agent', 'legacy-token', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+            '2099-01-01T00:00:00Z'
+         );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let queue = Queue::open(&path).unwrap();
+    let detail = queue.get(1).unwrap();
+    assert_eq!(detail.task.failure_count, 0);
+    assert!(detail.task.tags.is_empty());
+    let claim = detail.claim.unwrap();
+    assert_eq!(claim.agent_id, "old-agent");
+    assert!(claim.agent_model.is_none());
+    assert!(claim.agent_host.is_none());
+    assert!(claim.active);
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 4);
 }

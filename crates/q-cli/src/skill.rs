@@ -298,6 +298,21 @@ mod tests {
         assert!(home.join(".claude/skills/q/SKILL.md").is_file());
     }
 
+    #[test]
+    fn skill_starts_the_worker_loop() {
+        let text = SKILL_MARKDOWN;
+        assert!(text.contains("start the q worker"), "{text}");
+        assert!(text.contains("wait about 30 seconds"));
+        assert!(text.contains("q heartbeat"));
+        assert!(text.contains("q fail"));
+        assert!(text.contains("q note"));
+        assert!(text.contains("--tag"));
+        assert!(text.contains("30 minutes"));
+        assert!(text.contains("queue_claim_next"));
+        assert!(text.contains("queue_fail"));
+        assert!(text.contains("queue_note"));
+    }
+
     /// Every subcommand the binary accepts must be explained in the skill,
     /// including nested ones such as `q feature ls` and `q project init`.
     #[test]

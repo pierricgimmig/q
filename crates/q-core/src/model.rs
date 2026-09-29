@@ -288,9 +288,17 @@ pub struct Task {
     pub priority: i32,
     pub risk: RiskLevel,
     /// Percent complete, 0 to 100, as last reported by the working agent.
-    /// Set to 100 on completion and cleared on reopen.
+    /// Set to 100 on completion and cleared on reopen or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
+    /// How many times an agent has failed this task. It stays ready so
+    /// another agent can claim it. Omitted from JSON when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub failure_count: u32,
+    /// Free-form labels. A claim or list filter matches when the task has
+    /// every requested tag. Comparison is case-insensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +339,24 @@ pub struct TaskSummary {
     /// Percent complete as last reported. See [`Task::progress`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
+    /// See [`Task::failure_count`].
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub failure_count: u32,
+    /// See [`Task::tags`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Model name on the active claim, when the worker sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// Hostname on the active claim, when the worker sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_host: Option<String>,
+    /// Last heartbeat of the active claim. Absent when nothing holds the task.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "ts_opt")]
+    pub heartbeat_at: Option<OffsetDateTime>,
+    /// Latest note on the active claim. Absent after the claim is released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_note: Option<String>,
     /// Value of the newest `pr` artifact, usually the pull request URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
@@ -371,7 +397,18 @@ pub struct Claim {
     pub released_at: Option<OffsetDateTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_reason: Option<String>,
+    /// Model the worker reported. Absent when the worker did not send one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// Hostname the worker reported. Absent when the worker did not send one.
+    /// A remote claim stores the client's value, not the server's hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_host: Option<String>,
     pub active: bool,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 mod ts_opt {
@@ -504,6 +541,12 @@ pub struct ClaimLease {
     #[serde(with = "ts")]
     pub lease_expires_at: OffsetDateTime,
     pub agent_id: String,
+    /// See [`Claim::agent_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// See [`Claim::agent_host`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +636,9 @@ pub struct CaptureRequest {
     /// claimable pool until a human runs `ready`. Defaults to false.
     #[serde(default)]
     pub hold: bool,
+    /// Labels stored on the task. Commas inside one entry are split.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Filters for [`crate::QueueService::list`].
@@ -617,6 +663,9 @@ pub struct ListFilter {
     pub limit: u32,
     /// Include `done` and `cancelled` when `status` is unset.
     pub include_terminal: bool,
+    /// Keep tasks that carry every one of these tags. Empty means unrestricted.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Default for ListFilter {
@@ -629,6 +678,7 @@ impl Default for ListFilter {
             feature: None,
             limit: 100,
             include_terminal: false,
+            tags: Vec::new(),
         }
     }
 }
@@ -651,6 +701,11 @@ pub struct EditRequest {
     pub clear_repo: bool,
     pub clear_agent_pool: bool,
     pub clear_feature: bool,
+    /// Replace tags. `Some(empty)` clears them, same as [`Self::clear_tags`].
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub clear_tags: bool,
     pub actor: Actor,
 }
 
@@ -672,6 +727,8 @@ impl EditRequest {
             clear_repo: false,
             clear_agent_pool: false,
             clear_feature: false,
+            tags: None,
+            clear_tags: false,
             actor,
         }
     }
@@ -692,6 +749,8 @@ impl EditRequest {
             || self.clear_repo
             || self.clear_agent_pool
             || self.clear_feature
+            || self.tags.is_some()
+            || self.clear_tags
     }
 }
 
@@ -797,6 +856,18 @@ pub struct ClaimRequest {
     pub agent_pool: Option<String>,
     pub maximum_risk: RiskLevel,
     pub lease: Duration,
+    /// Model name supplied by the worker. Not detected by the server.
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    /// Hostname supplied by the worker. Not detected by the server.
+    #[serde(default)]
+    pub agent_host: Option<String>,
+    /// Skip tasks whose failure count is at least this. Unset means no cap.
+    #[serde(default)]
+    pub max_failures: Option<u32>,
+    /// Claim only tasks that carry every one of these tags. Empty is unrestricted.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl ClaimRequest {
@@ -810,8 +881,36 @@ impl ClaimRequest {
             agent_pool: None,
             maximum_risk: RiskLevel::Medium,
             lease: crate::default_lease(),
+            agent_model: None,
+            agent_host: None,
+            max_failures: None,
+            tags: Vec::new(),
         }
     }
+}
+
+/// Release a claim and put the task back to ready so another agent can take it.
+///
+/// `note` is optional. The failure count on the task increments by one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailRequest {
+    pub task_id: i64,
+    pub claim_token: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub actor: Actor,
+}
+
+/// Append a short status line to a claimed task.
+///
+/// The claim token must match. The line is a `task_note` event and becomes
+/// the latest note `q top` shows while the claim is active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteRequest {
+    pub task_id: i64,
+    pub claim_token: String,
+    pub message: String,
+    pub actor: Actor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -930,6 +1029,8 @@ mod tests {
             priority: 10,
             risk: RiskLevel::Low,
             progress: None,
+            failure_count: 0,
+            tags: Vec::new(),
             project: Some("profiler-core".into()),
             repo: Some("github.com/acme/profiler-core".into()),
             capture_path: "/tmp/profiler-core/crates/trace".into(),
@@ -979,12 +1080,16 @@ mod tests {
                 token: "opaque-token".into(),
                 lease_expires_at: datetime!(2026-09-22 0:45:00 UTC),
                 agent_id: "codex-local-01".into(),
+                agent_model: Some("opus".into()),
+                agent_host: Some("worker-a".into()),
             }),
         };
         let value = serde_json::to_value(&found).unwrap();
         assert_eq!(value["found"], true);
         assert!(value.get("reason").is_none());
         assert_eq!(value["claim"]["token"], "opaque-token");
+        assert_eq!(value["claim"]["agent_model"], "opus");
+        assert_eq!(value["claim"]["agent_host"], "worker-a");
         assert_eq!(value["claim"]["lease_expires_at"], "2026-09-22T00:45:00Z");
         assert_eq!(value["task"]["acceptance_criteria"][0], "Compare encodings");
         assert_eq!(value["task"]["repo"], "github.com/acme/profiler-core");

@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use q_core::{
     Actor, ArtifactInput, BlockRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, ListFilter, LogRequest, QueueError,
-    QueueService, ReleaseRequest, RiskLevel, StartRequest, TaskKind, TaskStatus, TreeQuery,
-    NO_ELIGIBLE_REASON,
+    CreateFeatureRequest, DeleteRequest, FailRequest, HeartbeatRequest, ListFilter, LogRequest,
+    NoteRequest, QueueError, QueueService, ReleaseRequest, RiskLevel, StartRequest, TaskKind,
+    TaskStatus, TreeQuery, NO_ELIGIBLE_REASON,
 };
 use q_project::{discover, DiscoverOptions};
 use serde_json::{json, Map, Value};
@@ -34,6 +34,10 @@ pub struct ToolContext {
     /// remote token holder must not be able to run discovery (git, config
     /// files) against arbitrary directories on the server.
     pub confine_capture_path: bool,
+    /// Fill a missing model from `Q_AGENT_MODEL` and a missing host from this
+    /// machine. True for stdio `q mcp` on the worker. False for `q serve`,
+    /// which records the host and model the remote client sent.
+    pub record_local_identity: bool,
 }
 
 pub struct Session {
@@ -50,6 +54,7 @@ impl Session {
                 actor: Actor::agent("mcp"),
                 human_tools: false,
                 confine_capture_path: false,
+                record_local_identity: true,
             },
         }
     }
@@ -76,6 +81,13 @@ impl Session {
     /// Only accept a `capture_path` inside the session's base directory.
     pub fn confined(mut self) -> Self {
         self.ctx.confine_capture_path = true;
+        self
+    }
+
+    /// This session is running on `q serve`, not on the worker's machine.
+    /// Claim identity is whatever the client sent.
+    pub fn remote(mut self) -> Self {
+        self.ctx.record_local_identity = false;
         self
     }
 
@@ -259,7 +271,9 @@ fn dispatch_tool(
         "queue_ready" => queue_ready(queue, ctx, args),
         "queue_reopen" => queue_reopen(queue, ctx, args),
         "queue_cancel" => queue_cancel(queue, ctx, args),
-        "queue_claim_next" => queue_claim_next(queue, args),
+        "queue_claim_next" => queue_claim_next(queue, ctx, args),
+        "queue_fail" => queue_fail(queue, ctx, args),
+        "queue_note" => queue_note(queue, ctx, args),
         "queue_heartbeat" => queue_heartbeat(queue, ctx, args),
         "queue_start" => queue_start(queue, ctx, args),
         "queue_block" => queue_block(queue, ctx, args),
@@ -339,6 +353,8 @@ fn queue_edit(
             "clear_repo",
             "clear_agent_pool",
             "clear_feature",
+            "tags",
+            "clear_tags",
         ],
     )?;
     let task_id = required_task_id(args)?;
@@ -368,6 +384,10 @@ fn queue_edit(
     request.clear_repo = optional_bool(args, "clear_repo")?;
     request.clear_agent_pool = optional_bool(args, "clear_agent_pool")?;
     request.clear_feature = optional_bool(args, "clear_feature")?;
+    if args.contains_key("tags") {
+        request.tags = Some(optional_string_array(args, "tags")?);
+    }
+    request.clear_tags = optional_bool(args, "clear_tags")?;
     if !request.has_changes() {
         return Err(ToolFailure::Invalid("no fields to change".into()));
     }
@@ -424,6 +444,7 @@ fn queue_capture(
             "agent_pool",
             "feature",
             "hold",
+            "tags",
         ],
     )?;
     let title = required_string(args, "title")?;
@@ -469,6 +490,7 @@ fn queue_capture(
             .ok()
             .and_then(|value| value.as_str().map(str::to_string)),
         hold: optional_bool(args, "hold")?,
+        tags: optional_string_array(args, "tags")?,
     })?;
     serde_json::to_value(task).map_err(|err| ToolFailure::Invalid(err.to_string()))
 }
@@ -485,6 +507,7 @@ fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Val
             "include_terminal",
             "all",
             "feature",
+            "tags",
         ],
     )?;
     let status = match optional_string(args, "status")? {
@@ -507,6 +530,7 @@ fn queue_list(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Val
         feature: optional_feature(args)?,
         limit,
         include_terminal,
+        tags: optional_string_array(args, "tags")?,
     })?;
     Ok(json!({ "tasks": tasks }))
 }
@@ -567,6 +591,7 @@ fn queue_get(queue: &dyn QueueService, args: &Map<String, Value>) -> Result<Valu
 
 fn queue_claim_next(
     queue: &dyn QueueService,
+    ctx: &ToolContext,
     args: &Map<String, Value>,
 ) -> Result<Value, ToolFailure> {
     expect_keys(
@@ -580,6 +605,10 @@ fn queue_claim_next(
             "maximum_risk",
             "lease_minutes",
             "agent_pool",
+            "agent_model",
+            "agent_host",
+            "tags",
+            "max_failures",
         ],
     )?;
     let agent_id = required_string(args, "agent_id")?;
@@ -599,11 +628,57 @@ fn queue_claim_next(
         request.lease = q_core::lease_from_minutes(minutes).map_err(ToolFailure::from)?;
     }
     request.agent_pool = optional_string(args, "agent_pool")?;
+    request.agent_model = optional_string(args, "agent_model")?;
+    request.agent_host = optional_string(args, "agent_host")?;
+    request.tags = optional_string_array(args, "tags")?;
+    request.max_failures = match optional_u64(args, "max_failures")? {
+        Some(value) => Some(
+            u32::try_from(value)
+                .map_err(|_| ToolFailure::Invalid("max_failures does not fit in u32".into()))?,
+        ),
+        None => None,
+    };
+    if ctx.record_local_identity {
+        let (model, host) =
+            q_core::local_worker_identity(request.agent_model.clone(), request.agent_host.clone());
+        request.agent_model = model;
+        request.agent_host = host;
+    }
     let outcome = queue.claim_next(request)?;
     if !outcome.found {
         debug_assert_eq!(outcome.reason.as_deref(), Some(NO_ELIGIBLE_REASON));
     }
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+fn queue_fail(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id", "claim_token", "note", "message"])?;
+    let task = queue.fail(FailRequest {
+        task_id: required_task_id(args)?,
+        claim_token: required_string(args, "claim_token")?,
+        note: optional_string(args, "note")?.or(optional_string(args, "message")?),
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
+}
+
+fn queue_note(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id", "claim_token", "message"])?;
+    let detail = queue.note(NoteRequest {
+        task_id: required_task_id(args)?,
+        claim_token: required_string(args, "claim_token")?,
+        message: required_string(args, "message")?,
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(detail).unwrap_or(Value::Null))
 }
 
 fn queue_heartbeat(
@@ -974,6 +1049,11 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "capabilities": {"type": "array", "items": {"type": "string"}},
                     "dependencies": {"type": "array", "items": {"type": "integer"}},
                     "agent_pool": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Labels stored on the task. A later claim can filter on them."
+                    },
                     "feature": {
                         "description": "Feature id or unique title. The task keeps its own repo and project.",
                         "anyOf": [{"type": "string"}, {"type": "integer"}]
@@ -1007,6 +1087,11 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "feature": {
                         "description": "Feature id or unique title.",
                         "anyOf": [{"type": "string"}, {"type": "integer"}]
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keep tasks that carry every one of these tags."
                     }
                 },
                 "additionalProperties": false
@@ -1088,7 +1173,52 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "allowed_kinds": {"type": "array", "items": {"type": "string"}},
                     "maximum_risk": {"type": "string", "enum": ["low", "medium", "high", "external_action"]},
                     "lease_minutes": {"type": "integer"},
-                    "agent_pool": {"type": "string"}
+                    "agent_pool": {"type": "string"},
+                    "agent_model": {
+                        "type": "string",
+                        "description": "Model name recorded on the claim. Stdio sessions fall back to Q_AGENT_MODEL."
+                    },
+                    "agent_host": {
+                        "type": "string",
+                        "description": "Hostname recorded on the claim. Stdio sessions detect this machine when omitted. A q serve session stores only what the client sends."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Claim only tasks that carry every one of these tags. Omit to leave tag filtering unrestricted."
+                    },
+                    "max_failures": {
+                        "type": "integer",
+                        "description": "Skip tasks that have already failed this many times. Omit for no cap."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_fail",
+            "Release the claim and return the task to ready so another agent can take it. Increments the task's failure count. note is optional.",
+            json!({
+                "type": "object",
+                "required": ["task_id", "claim_token"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "claim_token": {"type": "string"},
+                    "note": {"type": "string", "description": "Optional short failure note stored on the event."}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "queue_note",
+            "Append a short status line to a claimed task. q top shows the latest note while the claim is active.",
+            json!({
+                "type": "object",
+                "required": ["task_id", "claim_token", "message"],
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "claim_token": {"type": "string"},
+                    "message": {"type": "string"}
                 },
                 "additionalProperties": false
             }),
@@ -1232,7 +1362,13 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
                     "clear_project": {"type": "boolean"},
                     "clear_repo": {"type": "boolean"},
                     "clear_agent_pool": {"type": "boolean"},
-                    "clear_feature": {"type": "boolean"}
+                    "clear_feature": {"type": "boolean"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replace the task's tags. An empty array clears them."
+                    },
+                    "clear_tags": {"type": "boolean"}
                 },
                 "additionalProperties": false
             }),
@@ -1592,6 +1728,7 @@ mod tests {
                 actor: Actor::agent("mcp"),
                 context_source: None,
                 hold: true,
+                tags: vec![],
             })
             .unwrap();
         queue
@@ -2139,5 +2276,134 @@ mod tests {
             capture_tool["inputSchema"]["properties"]["hold"]["type"],
             "boolean"
         );
+    }
+
+    #[test]
+    fn claim_tags_identity_fail_and_notes_round_trip() {
+        let queue = temp_queue();
+        let mut session = Session::new(std::env::temp_dir());
+        call(
+            &mut session,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let rust = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_capture", "arguments": {"title": "parser", "tags": ["rust"]}}),
+        ));
+        let docs = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_capture", "arguments": {"title": "guide", "tags": ["docs"]}}),
+        ));
+        let claimed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_claim_next", "arguments": {
+                "agent_id": "bot",
+                "tags": ["Rust"],
+                "agent_model": "opus"
+            }}),
+        ));
+        assert_eq!(claimed["found"], true);
+        assert_eq!(claimed["task"]["id"], rust["id"]);
+        assert_eq!(claimed["claim"]["agent_model"], "opus");
+        assert!(
+            !claimed["claim"]["agent_host"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "stdio fills the local hostname: {claimed}"
+        );
+        let token = claimed["claim"]["token"].as_str().unwrap();
+        let noted = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_note", "arguments": {
+                "task_id": rust["id"],
+                "claim_token": token,
+                "message": "running tests"
+            }}),
+        ));
+        assert!(noted["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "task_note"
+                && event["payload"]["message"] == "running tests"));
+        let failed = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            6,
+            json!({"name": "queue_fail", "arguments": {
+                "task_id": rust["id"],
+                "claim_token": token,
+                "note": "tests failed"
+            }}),
+        ));
+        assert_eq!(failed["status"], "ready");
+        assert_eq!(failed["failure_count"], 1);
+        let skipped = tool_body(&call(
+            &mut session,
+            &queue,
+            "tools/call",
+            7,
+            json!({"name": "queue_claim_next", "arguments": {
+                "agent_id": "bot-2",
+                "tags": ["rust"],
+                "max_failures": 1
+            }}),
+        ));
+        assert_eq!(skipped["found"], false);
+
+        let mut remote = Session::new(std::env::temp_dir()).remote();
+        call(
+            &mut remote,
+            &queue,
+            "initialize",
+            1,
+            json!({"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        let remote_claim = tool_body(&call(
+            &mut remote,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_claim_next", "arguments": {
+                "agent_id": "remote-bot",
+                "tags": ["docs"]
+            }}),
+        ));
+        assert_eq!(remote_claim["task"]["id"], docs["id"]);
+        assert!(
+            remote_claim["claim"].get("agent_host").is_none(),
+            "{remote_claim}"
+        );
+        assert!(
+            remote_claim["claim"].get("agent_model").is_none(),
+            "{remote_claim}"
+        );
+
+        let tools = call(&mut session, &queue, "tools/list", 8, json!({}));
+        let names: Vec<_> = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"queue_fail"), "{names:?}");
+        assert!(names.contains(&"queue_note"), "{names:?}");
     }
 }

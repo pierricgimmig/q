@@ -30,6 +30,18 @@ impl Server {
     /// blocking `ureq` client can run on the test thread.
     fn start(auth: Option<AuthConfig>) -> Self {
         let queue: Arc<dyn QueueService> = Arc::new(Queue::open(temp_db()).unwrap());
+        Self::start_on(
+            queue,
+            auth,
+            std::time::Duration::from_secs(q_core::DEFAULT_LEASE_SWEEP_SECS),
+        )
+    }
+
+    fn start_on(
+        queue: Arc<dyn QueueService>,
+        auth: Option<AuthConfig>,
+        sweep: std::time::Duration,
+    ) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
         let (ready, started) = std::sync::mpsc::channel::<String>();
         let thread = std::thread::spawn(move || {
@@ -41,7 +53,8 @@ impl Server {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 ready.send(format!("http://{addr}")).unwrap();
-                let options = ServerOptions::local(auth.map(TokenStore::fixed));
+                let mut options = ServerOptions::local(auth.map(TokenStore::fixed));
+                options.sweep_interval = sweep;
                 serve_on(queue, listener, options, async move {
                     let _ = stopped.await;
                 })
@@ -103,6 +116,7 @@ fn capture(title: &str, actor: Actor) -> CaptureRequest {
         context_source: None,
         // Tests exercise the human gate, so captures start held.
         hold: true,
+        tags: vec![],
     }
 }
 
@@ -302,6 +316,131 @@ fn tokens_gate_access_and_roles() {
 
     let reopened = agent.reopen(task.id, Actor::human(None)).unwrap_err();
     assert!(reopened.to_string().contains("forbidden"), "{reopened}");
+}
+
+#[test]
+fn http_and_mcp_claim_filter_tags_and_keep_the_client_host() {
+    use q_core::{FailRequest, NoteRequest};
+    use serde_json::{json, Value};
+
+    let server = Server::start(None);
+    let queue = server.client(None);
+    let mut rust = capture("parser", Actor::human(None));
+    rust.hold = false;
+    rust.tags = vec!["rust".into()];
+    let rust = queue.capture(rust).unwrap();
+    let mut docs = capture("guide", Actor::human(None));
+    docs.hold = false;
+    docs.tags = vec!["docs".into()];
+    let docs = queue.capture(docs).unwrap();
+
+    let mut request = ClaimRequest::new("remote-agent");
+    request.agent_model = Some("opus".into());
+    request.agent_host = Some("remote-worker-host".into());
+    request.tags = vec!["Rust".into()];
+    let claimed = queue.claim_next(request).unwrap();
+    assert!(claimed.found);
+    assert_eq!(claimed.task.unwrap().task.id, rust.id);
+    let lease = claimed.claim.unwrap();
+    assert_eq!(lease.agent_host.as_deref(), Some("remote-worker-host"));
+    assert_eq!(lease.agent_model.as_deref(), Some("opus"));
+    let stored = queue.get(rust.id).unwrap().claim.unwrap();
+    assert_eq!(stored.agent_host.as_deref(), Some("remote-worker-host"));
+    assert_ne!(
+        stored.agent_host.as_deref(),
+        q_core::local_hostname().as_deref()
+    );
+
+    let noted = queue
+        .note(NoteRequest {
+            task_id: rust.id,
+            claim_token: lease.token.clone(),
+            message: "running tests".into(),
+            actor: Actor::agent("remote-agent"),
+        })
+        .unwrap();
+    assert!(noted.events.iter().any(|event| {
+        event.event_type == q_core::NOTE_EVENT && event.payload["message"] == "running tests"
+    }));
+    let listed = queue
+        .list(ListFilter {
+            tags: vec!["rust".into()],
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].latest_note.as_deref(), Some("running tests"));
+
+    let failed = queue
+        .fail(FailRequest {
+            task_id: rust.id,
+            claim_token: lease.token,
+            note: Some("tests failed".into()),
+            actor: Actor::agent("remote-agent"),
+        })
+        .unwrap();
+    assert_eq!(failed.status, TaskStatus::Ready);
+    assert_eq!(failed.failure_count, 1);
+
+    let response = ureq::post(&format!("{}/mcp", server.url))
+        .set("Accept", "application/json, text/event-stream")
+        .send_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "queue_claim_next",
+                "arguments": {"agent_id": "mcp-remote", "tags": ["docs"]}
+            }
+        }))
+        .unwrap();
+    let body: Value = response.into_json().unwrap();
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let mcp_claim: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(mcp_claim["task"]["id"], docs.id);
+    assert!(
+        mcp_claim["claim"].get("agent_host").is_none(),
+        "HTTP MCP must not stamp the server hostname: {mcp_claim}"
+    );
+}
+
+#[test]
+fn serve_sweep_releases_an_expired_lease() {
+    let path = temp_db();
+    let queue = Queue::open(&path).unwrap();
+    let mut task = capture("expired", Actor::human(None));
+    task.hold = false;
+    let task = queue.capture(task).unwrap();
+    let claimed = queue.claim_next(ClaimRequest::new("agent-1")).unwrap();
+    assert!(claimed.found);
+    drop(queue);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE claims SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE task_id = ?1 AND released_at IS NULL",
+        rusqlite::params![task.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let service: Arc<dyn QueueService> = Arc::new(Queue::open(&path).unwrap());
+    let server = Server::start_on(service, None, std::time::Duration::from_millis(50));
+    let client = server.client(None);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let detail = client.get(task.id).unwrap();
+        if detail.task.status == TaskStatus::Ready {
+            assert!(detail.events.iter().any(|event| {
+                event.event_type == "task_recovered"
+                    && event.payload["reason"] == q_core::LEASE_EXPIRED_REASON
+            }));
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sweep did not release the claim"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 #[test]

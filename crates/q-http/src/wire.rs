@@ -24,6 +24,8 @@ pub const METHODS: &[&str] = &[
     "cancel",
     "delete",
     "claim_next",
+    "fail",
+    "note",
     "heartbeat",
     "start",
     "complete",

@@ -942,6 +942,7 @@ dependencies = [
  "q-mcp",
  "q-project",
  "q-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "time",

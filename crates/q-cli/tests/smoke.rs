@@ -1245,9 +1245,25 @@ fn top_once_prints_counts_table_and_changes() {
     assert!(text.contains("held 0  ready 1  claimed 0"), "{text}");
     assert!(text.contains("claims 0 active, 0 expired"), "{text}");
     assert!(
-        text.contains("ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE"),
+        text.contains("TAGS") && text.contains("STALE") && text.contains("Watch me"),
         "{text}"
     );
+    let header = text.lines().find(|line| line.contains("TITLE")).unwrap();
+    for (left, right) in [
+        ("PR", "TAGS"),
+        ("TAGS", "FAILS"),
+        ("FAILS", "MODEL"),
+        ("MODEL", "HOST"),
+        ("HOST", "NOTE"),
+        ("NOTE", "BEAT"),
+        ("BEAT", "STALE"),
+        ("STALE", "TITLE"),
+    ] {
+        assert!(
+            header.find(left).unwrap() < header.find(right).unwrap(),
+            "{header}"
+        );
+    }
     assert!(text.contains("Watch me"), "{text}");
     assert!(text.contains("recent changes\n  none yet"), "{text}");
     assert!(
@@ -1749,5 +1765,233 @@ fn claim_and_start_print_the_progress_command() {
         &token,
     ]));
     assert!(serde_json::from_slice::<Value>(&json.stdout).is_ok());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn fail_note_tags_and_identity_round_trip_and_top_marks_stale() {
+    let root = temp_root("worker");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+
+    let rust = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "add",
+        "--tag",
+        "rust",
+        "--tag",
+        "db",
+        "Fix the parser",
+    ]));
+    let rust_task: Value = serde_json::from_slice(&rust.stdout).unwrap();
+    assert_eq!(rust_task["status"], "ready");
+    assert_eq!(rust_task["tags"], serde_json::json!(["rust", "db"]));
+    let rust_id = rust_task["id"].as_i64().unwrap();
+
+    let docs = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "add",
+        "--tag",
+        "docs",
+        "Write the guide",
+    ]));
+    let docs_id = serde_json::from_slice::<Value>(&docs.stdout).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let listed = run(bin().args(["--db", db_arg, "--json", "ls", "--tag", "rust"]));
+    let tasks = serde_json::from_slice::<Value>(&listed.stdout).unwrap();
+    let ids: Vec<i64> = tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![rust_id]);
+
+    let plain = String::from_utf8(run(bin().args(["--db", db_arg, "ls"])).stdout).unwrap();
+    assert!(plain.contains("TAGS"), "{plain}");
+    assert!(plain.contains("rust,db"), "{plain}");
+
+    let claim = run(bin().args([
+        "--db", db_arg, "--json", "claim", "--agent", "worker-1", "--model", "opus", "--host",
+        "worker-a", "--tag", "rust",
+    ]));
+    let claim: Value = serde_json::from_slice(&claim.stdout).unwrap();
+    assert_eq!(claim["found"], true);
+    assert_eq!(claim["task"]["id"], rust_id);
+    assert_eq!(claim["claim"]["agent_model"], "opus");
+    assert_eq!(claim["claim"]["agent_host"], "worker-a");
+    let token = claim["claim"]["token"].as_str().unwrap().to_string();
+
+    let missed: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db", db_arg, "--json", "claim", "--agent", "worker-2", "--tag", "rust",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(missed["found"], false);
+
+    run(bin().args([
+        "--db",
+        db_arg,
+        "note",
+        &rust_id.to_string(),
+        "running tests",
+        "--claim-token",
+        &token,
+    ]));
+    let shown =
+        String::from_utf8(run(bin().args(["--db", db_arg, "show", &rust_id.to_string()])).stdout)
+            .unwrap();
+    assert!(shown.contains("notes:"), "{shown}");
+    assert!(shown.contains("running tests"), "{shown}");
+    assert!(shown.contains("model: opus"), "{shown}");
+    assert!(shown.contains("host: worker-a"), "{shown}");
+    assert!(shown.contains("tags: rust, db"), "{shown}");
+    assert!(shown.contains("failures: 0"), "{shown}");
+
+    let top = String::from_utf8(
+        run(bin().args(["--db", db_arg, "top", "--once", "--stale-after", "0"])).stdout,
+    )
+    .unwrap();
+    assert!(top.contains("opus"), "{top}");
+    assert!(top.contains("worker-a"), "{top}");
+    assert!(top.contains("running tests"), "{top}");
+    assert!(top.contains("stale"), "{top}");
+
+    let failed: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "fail",
+            &rust_id.to_string(),
+            "tests failed",
+            "--claim-token",
+            &token,
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(failed["status"], "ready");
+    assert_eq!(failed["failure_count"], 1);
+
+    let again: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "claim",
+            "--agent",
+            "worker-3",
+            "--host",
+            "other-box",
+            "--model",
+            "haiku",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(again["found"], true);
+    assert_eq!(again["task"]["id"], rust_id);
+    let token3 = again["claim"]["token"].as_str().unwrap().to_string();
+    run(bin().args([
+        "--db",
+        db_arg,
+        "release",
+        &rust_id.to_string(),
+        "--claim-token",
+        &token3,
+    ]));
+    let capped: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "claim",
+            "--agent",
+            "worker-4",
+            "--max-failures",
+            "1",
+            "--tag",
+            "rust",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(capped["found"], false);
+
+    let detected: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db", db_arg, "--json", "claim", "--agent", "worker-5", "--tag", "docs", "--model",
+            "opus",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(detected["task"]["id"], docs_id);
+    assert!(!detected["claim"]["agent_host"].as_str().unwrap().is_empty());
+
+    let skill = String::from_utf8(run(bin().args(["skill"])).stdout).unwrap();
+    assert!(skill.contains("start the q worker"), "{skill}");
+    assert!(skill.contains("q fail"));
+    assert!(skill.contains("q note"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn top_releases_a_claim_whose_lease_expired() {
+    let root = temp_root("lease");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let added: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "add", "Stale lease"])).stdout,
+    )
+    .unwrap();
+    let id = added["id"].as_i64().unwrap();
+    let claimed: Value = serde_json::from_slice(
+        &run(bin().args([
+            "--db", db_arg, "--json", "claim", "--agent", "worker", "--host", "box", "--model",
+            "opus",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(claimed["task"]["id"], id);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE claims SET lease_expires_at = '2000-01-01T00:00:00Z', heartbeat_at = '2000-01-01T00:00:00Z' WHERE task_id = ?1 AND released_at IS NULL",
+        rusqlite::params![id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let top = String::from_utf8(run(bin().args(["--db", db_arg, "top", "--once"])).stdout).unwrap();
+    assert!(top.contains("ready 1"), "{top}");
+    assert!(top.contains("claimed 0"), "{top}");
+    let row = top
+        .lines()
+        .find(|line| line.contains("Stale lease"))
+        .unwrap();
+    assert!(row.contains("ready"), "{row}");
+    assert!(!row.contains("claimed"), "{row}");
+
+    let shown: Value = serde_json::from_slice(
+        &run(bin().args(["--db", db_arg, "--json", "show", &id.to_string()])).stdout,
+    )
+    .unwrap();
+    assert_eq!(shown["status"], "ready");
+    let events = shown["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| {
+        event["event_type"] == "task_recovered" && event["payload"]["reason"] == "lease_expired"
+    }));
+
     let _ = fs::remove_dir_all(root);
 }

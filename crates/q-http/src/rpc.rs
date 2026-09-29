@@ -2,9 +2,9 @@
 
 use q_core::{
     Actor, ActorKind, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest, CompleteRequest,
-    CreateFeatureRequest, DeleteRequest, HeartbeatRequest, HoldRequest, ListFilter, LogRequest,
-    QueueError, QueueService, ReadyRequest, RecoverRequest, ReleaseRequest, StartRequest,
-    TreeQuery,
+    CreateFeatureRequest, DeleteRequest, FailRequest, HeartbeatRequest, HoldRequest, ListFilter,
+    LogRequest, NoteRequest, QueueError, QueueService, ReadyRequest, RecoverRequest,
+    ReleaseRequest, StartRequest, TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -70,6 +70,16 @@ pub fn dispatch(
         "claim_next" => {
             let request: ClaimRequest = parse(body)?;
             reply(queue.claim_next(request))
+        }
+        "fail" => {
+            let mut request: FailRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.fail(request))
+        }
+        "note" => {
+            let mut request: NoteRequest = parse(body)?;
+            stamp(&mut request.actor, principal);
+            reply(queue.note(request))
         }
         "heartbeat" => {
             let mut request: HeartbeatRequest = parse(body)?;
@@ -228,6 +238,12 @@ mod tests {
                 unreachable!()
             }
             fn claim_next(&self, _: ClaimRequest) -> Result<q_core::ClaimOutcome, QueueError> {
+                unreachable!()
+            }
+            fn fail(&self, _: FailRequest) -> Result<q_core::Task, QueueError> {
+                unreachable!()
+            }
+            fn note(&self, _: NoteRequest) -> Result<q_core::TaskDetail, QueueError> {
                 unreachable!()
             }
             fn heartbeat(&self, _: HeartbeatRequest) -> Result<q_core::Claim, QueueError> {

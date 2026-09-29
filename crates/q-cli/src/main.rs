@@ -137,6 +137,8 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             limit,
             all,
             feature,
+            tag,
+            stale_after,
             once,
         } => {
             let (interval, limit, all, once) = (*interval, *limit, *all, *once);
@@ -165,6 +167,7 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 feature,
                 limit: TOP_FETCH_LIMIT,
                 include_terminal: true,
+                tags: split_caps(tag.clone()),
             };
             let screen = io::stdout().is_terminal() && !once;
             let options = TopOptions {
@@ -174,6 +177,7 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
                 once,
                 screen,
                 keys: screen && io::stdin().is_terminal(),
+                stale_after: std::time::Duration::from_secs(*stale_after),
             };
             let (queue, backend) = open_service(&cli)?;
             run_top(queue.as_ref(), &backend, &filter, &options, &ui).await
@@ -182,7 +186,17 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             bind,
             auth,
             public_url,
-        } => serve(&cli, bind, auth.as_deref(), public_url.as_deref()).await,
+            sweep_interval,
+        } => {
+            serve(
+                &cli,
+                bind,
+                auth.as_deref(),
+                public_url.as_deref(),
+                *sweep_interval,
+            )
+            .await
+        }
         Commands::Token { command } => token_command(&cli, command, &ui),
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
@@ -233,6 +247,7 @@ async fn serve(
     bind: &str,
     auth: Option<&Path>,
     public_url: Option<&str>,
+    sweep_secs: u64,
 ) -> Result<(), CliError> {
     if cli.server.is_some() {
         return Err(CliError::message(
@@ -300,6 +315,7 @@ async fn serve(
         public_url: Some(public),
         signing_key,
         base_dir: base_dir(cli.directory.as_deref())?,
+        sweep_interval: std::time::Duration::from_secs(sweep_secs),
     };
     q_http::serve_on(queue, listener, options, async {
         let _ = tokio::signal::ctrl_c().await;
@@ -405,6 +421,7 @@ fn dispatch(
             agent_pool,
             depends_on,
             feature,
+            tag,
             hold,
         } => {
             let context = resolve_context(directory, repo, project)?;
@@ -443,6 +460,7 @@ fn dispatch(
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_string)),
                 hold,
+                tags: split_caps(tag.clone()),
             })?;
             let id = task.id;
             emit(ui, &task, || {
@@ -456,6 +474,7 @@ fn dispatch(
             limit,
             all,
             feature,
+            tag,
         } => {
             let status = match status {
                 Some(status) => Some(TaskStatus::parse(&status)?),
@@ -473,6 +492,7 @@ fn dispatch(
                 feature,
                 limit,
                 include_terminal: all,
+                tags: split_caps(tag.clone()),
             })?;
             emit(ui, &serde_json::json!({"tasks": tasks}), || {
                 print_task_list(&tasks, ui.out);
@@ -509,6 +529,8 @@ fn dispatch(
             clear_agent_pool,
             feature,
             clear_feature,
+            tag,
+            clear_tags,
         } => {
             let mut request = EditRequest::empty(human_actor());
             request.title = title;
@@ -536,6 +558,10 @@ fn dispatch(
             request.clear_agent_pool = clear_agent_pool;
             request.feature = feature;
             request.clear_feature = clear_feature;
+            if !tag.is_empty() {
+                request.tags = Some(split_caps(tag));
+            }
+            request.clear_tags = clear_tags;
             if edit {
                 let seed = match request.body.take() {
                     Some(body) => body,
@@ -650,8 +676,17 @@ fn dispatch(
             max_risk,
             lease_minutes,
             agent_pool,
+            model,
+            host,
+            tag,
+            max_failures,
         } => {
             let mut request = ClaimRequest::new(agent);
+            let (model, host) = q_core::local_worker_identity(model, host);
+            request.agent_model = model;
+            request.agent_host = host;
+            request.tags = split_caps(tag);
+            request.max_failures = max_failures;
             request.capabilities = split_caps(capability);
             for kind in kind {
                 request.allowed_kinds.push(TaskKind::parse(&kind)?);
@@ -768,6 +803,43 @@ fn dispatch(
                     detail.task.id,
                     detail.task.status.as_str(),
                     &detail.task.title,
+                );
+            });
+            Ok(())
+        }
+        Commands::Fail {
+            id,
+            note,
+            claim_token,
+        } => {
+            let task = queue.fail(q_core::FailRequest {
+                task_id: id,
+                claim_token,
+                note,
+                actor: human_actor(),
+            })?;
+            emit(ui, &task, || {
+                confirm(ui, "failed", task.id, task.status.as_str(), &task.title);
+                println!("failures: {}", task.failure_count);
+            });
+            Ok(())
+        }
+        Commands::Note {
+            id,
+            message,
+            claim_token,
+        } => {
+            let detail = queue.note(q_core::NoteRequest {
+                task_id: id,
+                claim_token,
+                message: message.clone(),
+                actor: human_actor(),
+            })?;
+            emit(ui, &detail, || {
+                println!(
+                    "noted {} {}",
+                    ui.out.dim(&format!("#{}", detail.task.id)),
+                    ui.out.bold(&message)
                 );
             });
             Ok(())
@@ -1361,6 +1433,8 @@ struct TopOptions {
     /// Put the terminal in raw mode so typed keys are not echoed and `q`
     /// quits. Off when stdin or stdout is not a terminal; Ctrl-C quits then.
     keys: bool,
+    /// Heartbeat older than this is flagged stale. The lease sweep is separate.
+    stale_after: std::time::Duration,
 }
 
 /// One line in the recent-changes list, with the time it was noticed.
@@ -1572,6 +1646,12 @@ fn top_frame(
     previous: &mut Option<std::collections::HashMap<i64, TaskSummary>>,
     changes: &mut std::collections::VecDeque<TopChange>,
 ) -> Result<String, CliError> {
+    // Same recovery `q claim` and `q serve` use, so an expired lease does not
+    // sit in the table as in progress until something else happens to claim.
+    queue.recover_stale(q_core::RecoverRequest {
+        to: None,
+        actor: q_core::Actor::system(),
+    })?;
     let status = queue.status()?;
     let tasks = queue.list(filter.clone())?;
     let now = OffsetDateTime::now_utc();
@@ -1614,7 +1694,11 @@ fn top_frame(
     if visible.is_empty() {
         out.push_str("no tasks\n");
     } else {
-        out.push_str(&render_task_table_precise(&visible, paint));
+        out.push_str(&render_task_table_precise(
+            &visible,
+            paint,
+            options.stale_after,
+        ));
         out.push('\n');
     }
     out.push_str(&format!("\n{}\n", paint.bold("recent changes")));
@@ -1840,8 +1924,16 @@ fn event_detail(event: &q_core::Event, paint: Paint) -> String {
     if let Some(percent) = payload.get("progress").and_then(|value| value.as_u64()) {
         parts.push(format!("progress {percent}%"));
     }
-    if let Some(message) = field("message") {
-        parts.push(message.split_whitespace().collect::<Vec<_>>().join(" "));
+    if let Some(message) = field("message").or_else(|| field("note")) {
+        if !message.is_empty() {
+            parts.push(message.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+    if let Some(count) = payload
+        .get("failure_count")
+        .and_then(|value| value.as_u64())
+    {
+        parts.push(format!("failures {count}"));
     }
     if let (Some(kind), Some(value)) = (field("kind"), field("value")) {
         let id = payload
@@ -1886,6 +1978,15 @@ struct TaskListRow {
     updated: String,
     /// Newest `pr` artifact value. Shown as a clickable `PR` on a terminal.
     pr_url: Option<String>,
+    tags: String,
+    /// Blank when the task has never failed.
+    fails: String,
+    model: String,
+    host: String,
+    note: String,
+    beat: String,
+    /// `stale` when the active heartbeat is older than the threshold.
+    stale: String,
     title: String,
 }
 
@@ -1898,32 +1999,45 @@ fn print_task_list(tasks: &[TaskSummary], paint: Paint) {
 }
 
 /// The table as `q top` draws it: ages tick by the second.
-fn render_task_table_precise(tasks: &[TaskSummary], paint: Paint) -> String {
+fn render_task_table_precise(
+    tasks: &[TaskSummary],
+    paint: Paint,
+    stale_after: std::time::Duration,
+) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<TaskListRow> = tasks
         .iter()
-        .map(|task| task_list_row_with(task, now, true))
+        .map(|task| task_list_row_with(task, now, true, Some(stale_after)))
         .collect();
-    render_task_rows_painted(&rows, paint)
+    render_task_rows_painted(&rows, paint, true)
 }
 
 fn render_task_table(tasks: &[TaskSummary], paint: Paint) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<TaskListRow> = tasks.iter().map(|task| task_list_row(task, now)).collect();
-    render_task_rows_painted(&rows, paint)
+    render_task_rows_painted(&rows, paint, false)
 }
 
 fn task_list_row(task: &TaskSummary, now: OffsetDateTime) -> TaskListRow {
-    task_list_row_with(task, now, false)
+    task_list_row_with(task, now, false, None)
 }
 
 /// `precise` shows ages to the second (`12s ago`) for a live view.
-fn task_list_row_with(task: &TaskSummary, now: OffsetDateTime, precise: bool) -> TaskListRow {
+/// `stale_after` flags an active heartbeat older than that. `None` leaves the
+/// stale cell blank (`q ls` does not flag workers).
+fn task_list_row_with(
+    task: &TaskSummary,
+    now: OffsetDateTime,
+    precise: bool,
+    stale_after: Option<std::time::Duration>,
+) -> TaskListRow {
     let updated = if precise {
         style::format_relative_precise(task.updated_at, now)
     } else {
         style::format_relative(task.updated_at, now)
     };
+    let active = task.heartbeat_at.is_some();
+    let (beat, stale) = heartbeat_cells(task.heartbeat_at, now, precise, stale_after);
     TaskListRow {
         id: task.id.to_string(),
         status: task.status.to_string(),
@@ -1933,8 +2047,63 @@ fn task_list_row_with(task: &TaskSummary, now: OffsetDateTime, precise: bool) ->
         progress: format_progress(task.progress),
         updated,
         pr_url: task.pr_url.clone(),
+        tags: truncate_chars(&task.tags.join(","), 32),
+        fails: if task.failure_count == 0 {
+            String::new()
+        } else {
+            task.failure_count.to_string()
+        },
+        model: if active {
+            task.agent_model.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+        host: if active {
+            task.agent_host.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+        note: if active {
+            task.latest_note
+                .as_deref()
+                .map(|text| truncate_chars(&format_list_title(text), 40))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        beat,
+        stale,
         title: format_list_title(&task.title),
     }
+}
+
+/// Heartbeat age, and `stale` when it is older than the threshold.
+fn heartbeat_cells(
+    heartbeat_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+    precise: bool,
+    stale_after: Option<std::time::Duration>,
+) -> (String, String) {
+    let Some(at) = heartbeat_at else {
+        return (String::new(), String::new());
+    };
+    let beat = if precise {
+        style::format_relative_precise(at, now)
+    } else {
+        style::format_relative(at, now)
+    };
+    let stale = match stale_after {
+        Some(limit) => {
+            let age = now.unix_timestamp().saturating_sub(at.unix_timestamp());
+            if age >= i64::try_from(limit.as_secs()).unwrap_or(i64::MAX) {
+                "stale".to_string()
+            } else {
+                String::new()
+            }
+        }
+        None => String::new(),
+    };
+    (beat, stale)
 }
 
 const PR_LABEL: &str = "PR";
@@ -1977,15 +2146,23 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 fn render_task_rows(rows: &[TaskListRow]) -> String {
-    render_task_rows_painted(rows, Paint::plain())
+    render_task_rows_painted(rows, Paint::plain(), false)
 }
 
-fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
-    let headers = [
-        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TITLE",
+fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> String {
+    let mut headers = vec![
+        "ID", "STATUS", "FEATURE", "PROJECT", "PRI", "PROG", "UPDATED", "PR", "TAGS",
     ];
-    let align_right = [true, false, false, false, true, true, false, false, false];
-    let widths = [
+    if wide {
+        headers.extend(["FAILS", "MODEL", "HOST", "NOTE", "BEAT", "STALE"]);
+    }
+    headers.push("TITLE");
+    let mut align_right = vec![true, false, false, false, true, true, false, false, false];
+    if wide {
+        align_right.extend([true, false, false, false, false, false]);
+    }
+    align_right.push(false);
+    let mut widths: Vec<usize> = vec![
         column_width("ID", rows.iter().map(|row| row.id.as_str())),
         column_width("STATUS", rows.iter().map(|row| row.status.as_str())),
         column_width("FEATURE", rows.iter().map(|row| row.feature.as_str())),
@@ -1994,21 +2171,59 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
         column_width("PROG", rows.iter().map(|row| row.progress.as_str())),
         column_width("UPDATED", rows.iter().map(|row| row.updated.as_str())),
         column_width("PR", rows.iter().map(|row| pr_cell(row, paint))),
-        column_width("TITLE", rows.iter().map(|row| row.title.as_str())),
+        column_width("TAGS", rows.iter().map(|row| row.tags.as_str())),
     ];
-    let header_styles = [style::dim_style(); 9];
-    let no_links = [None; 9];
+    if wide {
+        widths.extend([
+            column_width("FAILS", rows.iter().map(|row| row.fails.as_str())),
+            column_width("MODEL", rows.iter().map(|row| row.model.as_str())),
+            column_width("HOST", rows.iter().map(|row| row.host.as_str())),
+            column_width("NOTE", rows.iter().map(|row| row.note.as_str())),
+            column_width("BEAT", rows.iter().map(|row| row.beat.as_str())),
+            column_width("STALE", rows.iter().map(|row| row.stale.as_str())),
+        ]);
+    }
+    widths.push(column_width(
+        "TITLE",
+        rows.iter().map(|row| row.title.as_str()),
+    ));
+    let stale_style = Style::new()
+        .bold()
+        .fg_color(Some(anstyle::AnsiColor::Red.into()));
+    let header_styles = vec![style::dim_style(); headers.len()];
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_task_line(
         &headers,
         &header_styles,
-        &no_links,
+        &vec![None; headers.len()],
         &widths,
         &align_right,
         paint,
     ));
     for row in rows {
-        let styles = [
+        let mut cells = vec![
+            row.id.as_str(),
+            row.status.as_str(),
+            row.feature.as_str(),
+            row.project.as_str(),
+            row.priority.as_str(),
+            row.progress.as_str(),
+            row.updated.as_str(),
+            pr_cell(row, paint),
+            row.tags.as_str(),
+        ];
+        if wide {
+            cells.extend([
+                row.fails.as_str(),
+                row.model.as_str(),
+                row.host.as_str(),
+                row.note.as_str(),
+                row.beat.as_str(),
+                row.stale.as_str(),
+            ]);
+        }
+        cells.push(row.title.as_str());
+        let mut styles = vec![
             style::dim_style(),
             style::status_style(&row.status),
             style::dim_style(),
@@ -2017,22 +2232,23 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint) -> String {
             style::status_style(&row.status),
             style::dim_style(),
             Style::new(),
-            style::bold_style(),
+            style::dim_style(),
         ];
-        let mut links = [None; 9];
+        if wide {
+            styles.extend([
+                style::dim_style(),
+                style::dim_style(),
+                style::dim_style(),
+                Style::new(),
+                style::dim_style(),
+                stale_style,
+            ]);
+        }
+        styles.push(style::bold_style());
+        let mut links = vec![None; cells.len()];
         links[7] = row.pr_url.as_deref();
         lines.push(format_task_line(
-            &[
-                row.id.as_str(),
-                row.status.as_str(),
-                row.feature.as_str(),
-                row.project.as_str(),
-                row.priority.as_str(),
-                row.progress.as_str(),
-                row.updated.as_str(),
-                pr_cell(row, paint),
-                row.title.as_str(),
-            ],
+            &cells,
             &styles,
             &links,
             &widths,
@@ -2329,6 +2545,13 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
     if let Some(pool) = &task.agent_pool {
         meta(paint, &format!("agent_pool: {pool}"));
     }
+    let tags = if task.tags.is_empty() {
+        "-".to_string()
+    } else {
+        task.tags.join(", ")
+    };
+    meta(paint, &format!("tags: {tags}"));
+    meta(paint, &format!("failures: {}", task.failure_count));
     meta(
         paint,
         &format!("created_at: {}", format_timestamp(task.created_at)),
@@ -2363,6 +2586,14 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
         meta(
             paint,
             &format!(
+                "model: {}  host: {}",
+                claim.agent_model.as_deref().unwrap_or("-"),
+                claim.agent_host.as_deref().unwrap_or("-"),
+            ),
+        );
+        meta(
+            paint,
+            &format!(
                 "lease_expires_at: {}",
                 format_timestamp(claim.lease_expires_at)
             ),
@@ -2390,6 +2621,29 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
                 "- {} {}: {value}{stored}",
                 paint.dim(&format!("#{}", artifact.id)),
                 artifact.kind,
+            );
+        }
+    }
+    let notes: Vec<&q_core::Event> = detail
+        .events
+        .iter()
+        .filter(|event| event.event_type == q_core::NOTE_EVENT)
+        .filter(|event| {
+            event
+                .payload
+                .get("message")
+                .and_then(|value| value.as_str())
+                .is_some_and(|message| !message.trim().is_empty())
+        })
+        .collect();
+    if !notes.is_empty() {
+        println!("\n{}", paint.bold("notes:"));
+        for event in notes {
+            let message = event.payload["message"].as_str().unwrap_or_default();
+            println!(
+                "  {}  {}",
+                paint.dim(&format_timestamp(event.created_at)),
+                message
             );
         }
     }
@@ -2452,9 +2706,9 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_line, display_project, format_list_title, is_top_quit_key, raw_line_endings,
-        render_task_rows, render_task_rows_painted, render_tree, render_tree_with, truncate_chars,
-        TaskListRow, TITLE_MAX_CHARS,
+        capture_line, display_project, format_list_title, heartbeat_cells, is_top_quit_key,
+        raw_line_endings, render_task_rows, render_task_rows_painted, render_tree,
+        render_tree_with, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2548,6 +2802,13 @@ mod tests {
                 progress: "".into(),
                 updated: "2026-09-22T20:00:00Z".into(),
                 pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
                 title: "Short".into(),
             },
             TaskListRow {
@@ -2559,6 +2820,13 @@ mod tests {
                 progress: "".into(),
                 updated: "2026-09-22T19:00:00Z".into(),
                 pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
                 title: format_list_title(&long),
             },
         ];
@@ -2600,6 +2868,13 @@ mod tests {
                 progress: "".into(),
                 updated: "3m ago".into(),
                 pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
                 title: "Keep the held item".into(),
             },
             TaskListRow {
@@ -2611,6 +2886,13 @@ mod tests {
                 progress: "".into(),
                 updated: "1h ago".into(),
                 pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
                 title: "Compare encodings".into(),
             },
             TaskListRow {
@@ -2622,6 +2904,13 @@ mod tests {
                 progress: "".into(),
                 updated: "2d ago".into(),
                 pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
                 title: "Unassigned capture".into(),
             },
         ];
@@ -2634,10 +2923,10 @@ mod tests {
         assert_eq!(
             shown,
             "\
-ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
- 4  held    (none)   alpha      0        3m ago       Keep the held item
- 2  ready   (none)   beta       1        1h ago       Compare encodings
- 1  held    (none)   (none)     0        2d ago       Unassigned capture"
+ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TAGS  TITLE
+ 4  held    (none)   alpha      0        3m ago             Keep the held item
+ 2  ready   (none)   beta       1        1h ago             Compare encodings
+ 1  held    (none)   (none)     0        2d ago             Unassigned capture"
         );
     }
 
@@ -2652,28 +2941,96 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
             progress: "100%".into(),
             updated: "1h ago".into(),
             pr_url: Some("https://example.com/pr/9".into()),
+            tags: String::new(),
+            fails: String::new(),
+            model: String::new(),
+            host: String::new(),
+            note: String::new(),
+            beat: String::new(),
+            stale: String::new(),
             title: "Shipped".into(),
         };
         let plain = render_task_rows(std::slice::from_ref(&row));
         assert!(
-            plain.contains("UPDATED  PR                        TITLE"),
+            plain.contains("UPDATED  PR                        TAGS  TITLE"),
             "{plain}"
         );
         assert!(
-            plain.contains("1h ago   https://example.com/pr/9  Shipped"),
+            plain.contains("1h ago   https://example.com/pr/9        Shipped"),
             "{plain}"
         );
-        let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color());
+        let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color(), false);
         assert!(
             color.contains("\x1b]8;;https://example.com/pr/9\x1b\\"),
             "{color:?}"
         );
         let visible = anstream::adapter::strip_str(&color).to_string();
-        assert!(visible.contains("UPDATED  PR  TITLE"), "{visible}");
-        assert!(visible.contains("1h ago   PR  Shipped"), "{visible}");
+        assert!(visible.contains("UPDATED  PR  TAGS  TITLE"), "{visible}");
+        assert!(visible.contains("1h ago   PR        Shipped"), "{visible}");
         row.pr_url = None;
         let none = render_task_rows(std::slice::from_ref(&row));
-        assert!(none.contains("1h ago       Shipped"), "{none}");
+        assert!(none.contains("1h ago             Shipped"), "{none}");
+    }
+
+    #[test]
+    fn top_table_flags_stale_heartbeats_and_shows_identity_notes_and_fails() {
+        use time::OffsetDateTime;
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let old = OffsetDateTime::from_unix_timestamp(1_700_000_000 - 180).unwrap();
+        let recent = OffsetDateTime::from_unix_timestamp(1_700_000_000 - 30).unwrap();
+        let limit = std::time::Duration::from_secs(120);
+        let (beat, stale) = heartbeat_cells(Some(old), now, true, Some(limit));
+        assert_eq!(stale, "stale");
+        assert!(beat.contains("ago"), "{beat}");
+        let (_, fresh) = heartbeat_cells(Some(recent), now, true, Some(limit));
+        assert!(fresh.is_empty(), "{fresh}");
+        let (_, unflagged) = heartbeat_cells(Some(old), now, false, None);
+        assert!(unflagged.is_empty());
+
+        let row = TaskListRow {
+            id: "7".into(),
+            status: "in_progress".into(),
+            feature: "(none)".into(),
+            project: "alpha".into(),
+            priority: "0".into(),
+            progress: "40%".into(),
+            updated: "3m ago".into(),
+            pr_url: None,
+            tags: "rust".into(),
+            fails: "2".into(),
+            model: "opus".into(),
+            host: "worker-a".into(),
+            note: "running tests".into(),
+            beat: "3m ago".into(),
+            stale: "stale".into(),
+            title: "Fix the parser".into(),
+        };
+        let table = render_task_rows_painted(std::slice::from_ref(&row), Paint::plain(), true);
+        let header = table.lines().next().unwrap();
+        for (left, right) in [
+            ("TAGS", "FAILS"),
+            ("FAILS", "MODEL"),
+            ("MODEL", "HOST"),
+            ("HOST", "NOTE"),
+            ("NOTE", "BEAT"),
+            ("BEAT", "STALE"),
+            ("STALE", "TITLE"),
+        ] {
+            assert!(
+                header.find(left).unwrap() < header.find(right).unwrap(),
+                "{header}"
+            );
+        }
+        assert!(table.contains("opus"), "{table}");
+        assert!(table.contains("worker-a"), "{table}");
+        assert!(table.contains("running tests"), "{table}");
+        assert!(table.contains("stale"), "{table}");
+        assert!(table.contains("  2  "), "{table}");
+        let colored = render_task_rows_painted(std::slice::from_ref(&row), Paint::color(), true);
+        assert!(colored.contains("\u{1b}["));
+        assert!(anstream::adapter::strip_str(&colored)
+            .to_string()
+            .contains("stale"));
     }
 
     #[test]
@@ -2687,10 +3044,17 @@ ID  STATUS  FEATURE  PROJECT  PRI  PROG  UPDATED  PR  TITLE
             progress: "".into(),
             updated: "3m ago".into(),
             pr_url: None,
+            tags: String::new(),
+            fails: String::new(),
+            model: String::new(),
+            host: String::new(),
+            note: String::new(),
+            beat: String::new(),
+            stale: String::new(),
             title: "Compare encodings".into(),
         }];
         let plain = render_task_rows(&rows);
-        let colored = render_task_rows_painted(&rows, crate::style::Paint::color());
+        let colored = render_task_rows_painted(&rows, crate::style::Paint::color(), false);
         assert!(colored.contains('\u{1b}'));
         assert_eq!(anstream::adapter::strip_str(&colored).to_string(), plain);
         assert!(colored.contains("32"));

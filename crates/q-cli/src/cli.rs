@@ -73,6 +73,8 @@ fn is_command(word: &str) -> bool {
             | "serve"
             | "token"
             | "skill"
+            | "fail"
+            | "note"
             | "help"
             | "done"
             | "rm"
@@ -104,6 +106,7 @@ fn is_bool_flag(arg: &str) -> bool {
             | "--clear-repo"
             | "--clear-agent-pool"
             | "--clear-feature"
+            | "--clear-tags"
     )
 }
 
@@ -151,6 +154,12 @@ fn is_value_flag(arg: &str) -> bool {
             | "--set-repo"
             | "--feature"
             | "--color"
+            | "--tag"
+            | "--model"
+            | "--host"
+            | "--max-failures"
+            | "--stale-after"
+            | "--sweep-interval"
     )
 }
 
@@ -257,6 +266,9 @@ pub enum Commands {
         /// Feature id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Label stored on the task. Repeatable. Commas are split.
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Vec<String>,
         /// Keep the task held, out of the claimable pool, until `q ready ID`.
         ///
         /// Use this for work that needs a human look before an agent may
@@ -284,6 +296,9 @@ pub enum Commands {
         /// Show only tasks in this feature. Id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Keep tasks that carry every one of these tags. Repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Vec<String>,
     },
     /// Watch the queue. Redraws counts, the task table, and recent changes; press q to quit.
     Top {
@@ -305,6 +320,12 @@ pub enum Commands {
         /// Show only tasks in this feature. Id or unique title.
         #[arg(long, value_name = "ID|TITLE")]
         feature: Option<String>,
+        /// Keep tasks that carry every one of these tags. Repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Vec<String>,
+        /// Flag a worker whose last heartbeat is older than this many seconds. Default 120.
+        #[arg(long, default_value_t = q_core::DEFAULT_STALE_HEARTBEAT_SECS, value_name = "SECONDS")]
+        stale_after: u64,
         /// Draw one frame and exit instead of refreshing.
         #[arg(long)]
         once: bool,
@@ -380,6 +401,12 @@ pub enum Commands {
         /// Detach the task from its feature.
         #[arg(long)]
         clear_feature: bool,
+        /// Replace tags. Repeatable. Commas are split. An empty value is ignored; use --clear-tags.
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Vec<String>,
+        /// Remove every tag.
+        #[arg(long)]
+        clear_tags: bool,
     },
     /// Move one or more tasks to ready so agents may claim them. Releases held work.
     ///
@@ -440,12 +467,49 @@ pub enum Commands {
         /// Default medium. High and external_action are excluded unless raised explicitly.
         #[arg(long, default_value = "medium")]
         max_risk: String,
-        /// Lease length. Default 45. Minimum 1, maximum 1440.
+        /// Lease length in minutes, measured from the last heartbeat. Default 30. Minimum 1, maximum 1440.
         #[arg(long)]
         lease_minutes: Option<u64>,
         /// Only claim a task in this pool.
         #[arg(long, value_name = "POOL")]
         agent_pool: Option<String>,
+        /// Model name recorded on the claim. Falls back to $Q_AGENT_MODEL.
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        /// Hostname recorded on the claim. Defaults to this machine. $Q_AGENT_HOST overrides that.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Claim only tasks that carry every one of these tags. Repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Vec<String>,
+        /// Skip tasks that have already failed this many times. Omit for no cap.
+        #[arg(long, value_name = "N")]
+        max_failures: Option<u32>,
+    },
+    /// Release a claim, record an optional note, and return the task to ready.
+    ///
+    /// The failure count increments. Another agent can claim the task. The
+    /// claim token is required. The note is optional.
+    Fail {
+        /// Task id.
+        id: i64,
+        /// Optional short note stored on the failure event.
+        #[arg(value_name = "NOTE")]
+        note: Option<String>,
+        /// Token printed by `q claim`.
+        #[arg(long)]
+        claim_token: String,
+    },
+    /// Append a short status line to a claimed task.
+    Note {
+        /// Task id.
+        id: i64,
+        /// Status line, such as `running tests`.
+        #[arg(value_name = "MESSAGE")]
+        message: String,
+        /// Token printed by `q claim`.
+        #[arg(long)]
+        claim_token: String,
     },
     /// Extend the lease for a matching, unexpired claim token.
     Heartbeat {
@@ -454,7 +518,7 @@ pub enum Commands {
         /// Token printed by `q claim`.
         #[arg(long)]
         claim_token: String,
-        /// New lease length in minutes. Default 45.
+        /// New lease length in minutes. Default 30.
         #[arg(long)]
         lease_minutes: Option<u64>,
     },
@@ -577,6 +641,10 @@ pub enum Commands {
         /// set this explicitly behind a reverse proxy. Agents need no Origin header.
         #[arg(long, value_name = "URL")]
         public_url: Option<String>,
+        /// Seconds between sweeps that release expired claim leases. Default 15.
+        /// Zero disables the sweep. The lease length itself is `--lease-minutes` on claim.
+        #[arg(long, default_value_t = q_core::DEFAULT_LEASE_SWEEP_SECS, value_name = "SECONDS")]
+        sweep_interval: u64,
     },
     /// Manage the token file that q serve authenticates with.
     Token {

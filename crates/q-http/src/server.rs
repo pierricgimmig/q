@@ -26,6 +26,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, Query, State};
@@ -34,7 +35,7 @@ use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
-use q_core::QueueService;
+use q_core::{Actor, QueueService, RecoverRequest};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -57,6 +58,9 @@ pub struct ServerOptions {
     pub signing_key: SigningKey,
     /// Directory MCP captures discover their repo and project from.
     pub base_dir: PathBuf,
+    /// How often to release claims whose lease has expired. Zero disables the sweep.
+    /// The sweep calls the same `recover_stale` path as the CLI.
+    pub sweep_interval: Duration,
 }
 
 impl ServerOptions {
@@ -68,6 +72,7 @@ impl ServerOptions {
             grants: Arc::new(crate::GrantStore::in_memory().expect("in-memory grant store")),
             signing_key: SigningKey::ephemeral(),
             base_dir: std::env::temp_dir(),
+            sweep_interval: Duration::from_secs(q_core::DEFAULT_LEASE_SWEEP_SECS),
         }
     }
 }
@@ -166,10 +171,33 @@ pub async fn serve_on(
         }
         options.public_url = Some(format!("http://{addr}"));
     }
+    let sweep_every = options.sweep_interval;
+    let sweeper = queue.clone();
     let app = router(queue, options).map_err(std::io::Error::other)?;
-    axum::serve(listener, app)
+    let sweep = tokio::spawn(async move {
+        if sweep_every.is_zero() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        let mut ticker = tokio::time::interval(sweep_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let queue = sweeper.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                queue.recover_stale(RecoverRequest {
+                    to: None,
+                    actor: Actor::system(),
+                })
+            })
+            .await;
+        }
+    });
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
-        .await
+        .await;
+    sweep.abort();
+    result
 }
 
 /// Resolve the caller. Raw token-file secrets and issued access tokens are

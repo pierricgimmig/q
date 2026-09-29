@@ -12,14 +12,15 @@ use std::time::Duration;
 
 use q_core::{
     acceptance_criteria, build_feature_forest, build_task_tree, default_lease, ensure_transition,
-    format_timestamp, lease_from_minutes, normalize_repo_url, parse_timestamp, Actor, Artifact,
-    ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest, Claim, ClaimLease,
-    ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest, CreateFeatureRequest,
-    DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest, EditRequest, Event,
-    Feature, HeartbeatRequest, HoldRequest, ListFilter, LogRequest, ProjectPolicy, QueueError,
-    QueueService, QueueStatus, ReadyOutcome, ReadyRequest, RecoverRequest, RecoveryRecord,
-    ReleaseRequest, RiskLevel, StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail,
-    TaskKind, TaskStatus, TaskSummary, TaskTree, TreeQuery, TreeTask,
+    format_timestamp, lease_from_minutes, normalize_repo_url, normalize_tags, parse_timestamp,
+    Actor, Artifact, ArtifactContent, ArtifactInput, BlockRequest, CancelRequest, CaptureRequest,
+    Claim, ClaimLease, ClaimOutcome, ClaimRequest, ClaimTask, CompleteRequest,
+    CreateFeatureRequest, DeleteFeatureOutcome, DeleteOutcome, DeleteRequest, EditFeatureRequest,
+    EditRequest, Event, FailRequest, Feature, HeartbeatRequest, HoldRequest, ListFilter,
+    LogRequest, NoteRequest, ProjectPolicy, QueueError, QueueService, QueueStatus, ReadyOutcome,
+    ReadyRequest, RecoverRequest, RecoveryRecord, ReleaseRequest, RiskLevel, StaleDisposition,
+    StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus, TaskSummary, TaskTree,
+    TreeQuery, TreeTask, LEASE_EXPIRED_REASON, NOTE_EVENT,
 };
 use q_dispatch::{is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -34,7 +35,7 @@ SELECT tasks.id, tasks.public_id, tasks.title, tasks.body, tasks.original_captur
 tasks.kind, tasks.priority, tasks.risk, tasks.project_name, tasks.repo, tasks.capture_path, \
 tasks.repo_relative_path, tasks.git_root, tasks.git_head, tasks.agent_pool, \
 tasks.required_capabilities_json, tasks.blocked_reason, tasks.created_at, tasks.updated_at, \
-tasks.feature_id, features.title, tasks.progress \
+tasks.feature_id, features.title, tasks.progress, tasks.failure_count, tasks.tags_json \
 FROM tasks \
 LEFT JOIN features ON features.id = tasks.feature_id";
 
@@ -46,7 +47,7 @@ FROM features";
 
 const CLAIM_SELECT: &str = "\
 SELECT id, task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at, \
-branch, worktree_path, released_at, release_reason \
+branch, worktree_path, released_at, release_reason, agent_model, agent_host \
 FROM claims";
 
 const EVENT_SELECT: &str = "\
@@ -229,9 +230,23 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         blocked_reason: row.get(17)?,
         feature_id: row.get(20)?,
         feature: row.get(21)?,
+        failure_count: failure_count_from(row.get(23)?),
+        tags: tags_from(row.get::<_, String>(24)?),
         created_at: parse_time(18, &created_at)?,
         updated_at: parse_time(19, &updated_at)?,
     })
+}
+
+fn failure_count_from(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn tags_from(value: impl AsRef<str>) -> Vec<String> {
+    serde_json::from_str(value.as_ref()).unwrap_or_default()
+}
+
+fn tags_json(tags: &[String]) -> Result<String, QueueError> {
+    serde_json::to_string(tags).map_err(|err| QueueError::InvalidInput(err.to_string()))
 }
 
 /// A stored percent, clamped to 0..=100.
@@ -334,8 +349,16 @@ fn map_claim(row: &rusqlite::Row<'_>, now: &str) -> rusqlite::Result<Claim> {
         worktree_path: row.get(8)?,
         released_at: released,
         release_reason: row.get(10)?,
+        agent_model: blank_to_none(row.get(11)?),
+        agent_host: blank_to_none(row.get(12)?),
         active: released.is_none() && lease_expires_at.as_str() > now,
     })
+}
+
+fn blank_to_none(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn load_latest_claim(
@@ -717,6 +740,7 @@ fn recover_expired(
                 "from": from.as_str(),
                 "to": to.as_str(),
                 "agent_id": agent_id,
+                "reason": LEASE_EXPIRED_REASON,
             }),
             now,
         )?;
@@ -757,6 +781,8 @@ fn select_eligible(conn: &Connection, request: &ClaimRequest) -> Result<Option<i
             agent_pool: task.agent_pool.clone(),
             required_capabilities: task.required_capabilities.clone(),
             dependency_statuses,
+            tags: task.tags.clone(),
+            failure_count: task.failure_count,
         };
         if is_eligible(
             &candidate,
@@ -1067,6 +1093,8 @@ impl QueueService for Queue {
             .map(str::to_string);
         let caps = serde_json::to_string(&dedupe_strings(&request.required_capabilities))
             .map_err(|err| QueueError::InvalidInput(err.to_string()))?;
+        let tag_list = normalize_tags(&request.tags)?;
+        let tags = tags_json(&tag_list)?;
         let mut conn = open_connection(&self.path)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1096,8 +1124,8 @@ impl QueueService for Queue {
                 public_id, title, body, original_capture, status, kind, priority, risk,
                 project_id, project_name, repo, capture_path, repo_relative_path, git_root,
                 git_head, agent_pool, required_capabilities_json, blocked_reason, feature_id,
-                created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                created_at, updated_at, tags_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
             params![
                 public_id,
                 title,
@@ -1118,7 +1146,8 @@ impl QueueService for Queue {
                 caps,
                 feature_id,
                 &now,
-                &now
+                &now,
+                tags
             ],
         )
         .db()?;
@@ -1141,6 +1170,7 @@ impl QueueService for Queue {
                 "feature_id": feature_id,
                 "capture_path": request.capture_path,
                 "source": request.context_source,
+                "tags": tag_list,
             }),
             &now,
         )?;
@@ -1164,6 +1194,14 @@ impl QueueService for Queue {
         // `include_terminal` applies only when status is unset. An explicit
         // status, including done or cancelled, is honored on its own.
         let include_terminal = i64::from(filter.include_terminal);
+        let tag_filter = {
+            let tags = normalize_tags(&filter.tags)?;
+            if tags.is_empty() {
+                None
+            } else {
+                Some(tags_json(&tags)?)
+            }
+        };
         let mut stmt = conn
             .prepare(
                 "SELECT tasks.id, tasks.public_id, tasks.title, tasks.status, tasks.kind, \
@@ -1171,15 +1209,36 @@ impl QueueService for Queue {
                  tasks.created_at, tasks.updated_at, tasks.feature_id, features.title, \
                  tasks.progress, \
                  (SELECT value FROM artifacts WHERE artifacts.task_id = tasks.id \
-                    AND artifacts.kind = 'pr' ORDER BY artifacts.id DESC LIMIT 1) \
+                    AND artifacts.kind = 'pr' ORDER BY artifacts.id DESC LIMIT 1), \
+                 tasks.tags_json, tasks.failure_count, \
+                 active_claim.agent_model, active_claim.agent_host, active_claim.heartbeat_at, \
+                 CASE WHEN active_claim.id IS NULL THEN NULL ELSE ( \
+                   SELECT json_extract(e.payload_json, '$.message') FROM events e \
+                   WHERE e.task_id = tasks.id AND e.event_type = 'task_note' \
+                     AND json_extract(e.payload_json, '$.message') IS NOT NULL \
+                     AND TRIM(json_extract(e.payload_json, '$.message')) != '' \
+                   ORDER BY e.id DESC LIMIT 1 \
+                 ) END \
                  FROM tasks \
                  LEFT JOIN features ON features.id = tasks.feature_id \
+                 LEFT JOIN claims active_claim ON active_claim.id = ( \
+                   SELECT c.id FROM claims c \
+                   WHERE c.task_id = tasks.id AND c.released_at IS NULL \
+                   ORDER BY c.id DESC LIMIT 1 \
+                 ) \
                  WHERE ((?1 IS NOT NULL AND tasks.status = ?1) \
                      OR (?1 IS NULL AND (?6 != 0 OR tasks.status NOT IN ('done', 'cancelled')))) \
                    AND (?2 IS NULL OR tasks.project_name = ?2) \
                    AND (?3 IS NULL OR tasks.repo = ?3) \
                    AND (?4 IS NULL OR tasks.kind = ?4) \
                    AND (?7 IS NULL OR tasks.feature_id = ?7) \
+                   AND (?8 IS NULL OR NOT EXISTS ( \
+                     SELECT 1 FROM json_each(?8) AS wanted \
+                     WHERE NOT EXISTS ( \
+                       SELECT 1 FROM json_each(tasks.tags_json) AS have \
+                       WHERE LOWER(have.value) = LOWER(wanted.value) \
+                     ) \
+                   )) \
                  ORDER BY \
                    CASE \
                      WHEN features.title IS NULL OR TRIM(features.title) = '' THEN 1 \
@@ -1211,7 +1270,8 @@ impl QueueService for Queue {
                     kind,
                     limit,
                     include_terminal,
-                    feature_id
+                    feature_id,
+                    tag_filter
                 ],
                 |row| {
                     let public_id: String = row.get(1)?;
@@ -1220,6 +1280,8 @@ impl QueueService for Queue {
                     let risk: String = row.get(6)?;
                     let created_at: String = row.get(10)?;
                     let updated_at: String = row.get(11)?;
+                    let heartbeat: Option<String> = row.get(20)?;
+                    let note: Option<String> = row.get(21)?;
                     Ok(TaskSummary {
                         id: row.get(0)?,
                         public_id: parse_uuid(1, &public_id)?,
@@ -1229,6 +1291,15 @@ impl QueueService for Queue {
                         priority: row.get(5)?,
                         risk: parse_risk(6, &risk)?,
                         progress: progress_from(row.get::<_, Option<i64>>(14)?),
+                        failure_count: failure_count_from(row.get(17)?),
+                        tags: tags_from(row.get::<_, String>(16)?),
+                        agent_model: blank_to_none(row.get(18)?),
+                        agent_host: blank_to_none(row.get(19)?),
+                        heartbeat_at: heartbeat
+                            .as_deref()
+                            .map(|value| parse_time(20, value))
+                            .transpose()?,
+                        latest_note: blank_to_none(note),
                         pr_url: row.get(15)?,
                         project: row.get(7)?,
                         repo: row.get(8)?,
@@ -1260,6 +1331,11 @@ impl QueueService for Queue {
         if request.clear_feature && request.feature.is_some() {
             return Err(QueueError::InvalidInput(
                 "pass either a feature or clear_feature, not both".into(),
+            ));
+        }
+        if request.clear_tags && request.tags.is_some() {
+            return Err(QueueError::InvalidInput(
+                "pass either tags or clear_tags, not both".into(),
             ));
         }
         let mut conn = open_connection(&self.path)?;
@@ -1357,13 +1433,21 @@ impl QueueService for Queue {
             task.feature_id = Some(resolve_feature_id(&tx, selector)?);
             fields.push("feature");
         }
+        if request.clear_tags {
+            task.tags.clear();
+            fields.push("tags");
+        } else if let Some(tags) = &request.tags {
+            task.tags = normalize_tags(tags)?;
+            fields.push("tags");
+        }
         let caps = serde_json::to_string(&task.required_capabilities)
             .map_err(|err| QueueError::InvalidInput(err.to_string()))?;
+        let tags = tags_json(&task.tags)?;
         tx.execute(
             "UPDATE tasks SET
                 title = ?, body = ?, kind = ?, priority = ?, risk = ?, project_id = ?,
                 project_name = ?, repo = ?, agent_pool = ?, required_capabilities_json = ?,
-                feature_id = ?, updated_at = ?
+                feature_id = ?, tags_json = ?, updated_at = ?
              WHERE id = ?",
             params![
                 task.title,
@@ -1377,6 +1461,7 @@ impl QueueService for Queue {
                 task.agent_pool,
                 caps,
                 task.feature_id,
+                tags,
                 now,
                 id
             ],
@@ -1613,6 +1698,11 @@ impl QueueService for Queue {
             return Err(QueueError::InvalidInput("agent_id is required".into()));
         }
         let lease = lease_or_default(request.lease)?;
+        if let Some(0) = request.max_failures {
+            return Err(QueueError::InvalidInput(
+                "max_failures must be at least 1; omit it for no cap".into(),
+            ));
+        }
         let request = ClaimRequest {
             agent_id: agent_id.to_string(),
             capabilities: dedupe_strings(&request.capabilities),
@@ -1636,6 +1726,10 @@ impl QueueService for Queue {
                 .map(str::to_string),
             maximum_risk: request.maximum_risk,
             lease,
+            agent_model: blank_to_none(request.agent_model),
+            agent_host: blank_to_none(request.agent_host),
+            max_failures: request.max_failures,
+            tags: normalize_tags(&request.tags)?,
         };
         let mut conn = open_connection(&self.path)?;
         let tx = conn
@@ -1663,9 +1757,19 @@ impl QueueService for Queue {
         let token = Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO claims (
-                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-            params![task_id, &request.agent_id, &token, &now, &now, &expires],
+                task_id, agent_id, claim_token, claimed_at, heartbeat_at, lease_expires_at,
+                agent_model, agent_host
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                task_id,
+                &request.agent_id,
+                &token,
+                &now,
+                &now,
+                &expires,
+                &request.agent_model,
+                &request.agent_host
+            ],
         )
         .db()?;
         insert_event(
@@ -1677,6 +1781,8 @@ impl QueueService for Queue {
                 "from": "ready",
                 "to": "claimed",
                 "agent_id": request.agent_id,
+                "agent_model": request.agent_model,
+                "agent_host": request.agent_host,
                 "lease_expires_at": expires,
             }),
             &now,
@@ -1695,8 +1801,87 @@ impl QueueService for Queue {
                 token,
                 lease_expires_at: parse_timestamp(&expires)?,
                 agent_id: request.agent_id,
+                agent_model: request.agent_model,
+                agent_host: request.agent_host,
             }),
         })
+    }
+
+    fn fail(&self, request: FailRequest) -> Result<Task, QueueError> {
+        let note = blank_to_none(request.note);
+        if let Some(text) = note.as_deref() {
+            if text.chars().count() > 500 {
+                return Err(QueueError::InvalidInput(
+                    "failure note must be 500 characters or fewer".into(),
+                ));
+            }
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        ensure_transition(task.status, TaskStatus::Ready)?;
+        let claim = require_active_claim(&tx, task.id, &request.claim_token, &now)?;
+        set_status(&tx, task.id, task.status, TaskStatus::Ready, &now)?;
+        set_progress(&tx, task.id, None, &now)?;
+        let failures = task.failure_count.saturating_add(1);
+        tx.execute(
+            "UPDATE tasks SET failure_count = ? WHERE id = ?",
+            params![i64::from(failures), task.id],
+        )
+        .db()?;
+        retire_claim(&tx, claim.id, &now)?;
+        insert_event(
+            &tx,
+            Some(task.id),
+            "task_failed",
+            &Actor::agent(&claim.agent_id),
+            json!({
+                "from": task.status.as_str(),
+                "to": "ready",
+                "failure_count": failures,
+                "note": note,
+            }),
+            &now,
+        )?;
+        tx.commit().db()?;
+        self.with_conn(|conn| load_task(conn, request.task_id))
+    }
+
+    fn note(&self, request: NoteRequest) -> Result<TaskDetail, QueueError> {
+        let message = request.message.trim();
+        if message.is_empty() {
+            return Err(QueueError::InvalidInput("note message is required".into()));
+        }
+        if message.chars().count() > 500 {
+            return Err(QueueError::InvalidInput(
+                "note must be 500 characters or fewer".into(),
+            ));
+        }
+        let mut conn = open_connection(&self.path)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .db()?;
+        let (_, now) = now_parts();
+        let task = load_task_in(&tx, request.task_id)?;
+        let claim = require_active_claim(&tx, task.id, &request.claim_token, &now)?;
+        tx.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            params![now, task.id],
+        )
+        .db()?;
+        insert_event(
+            &tx,
+            Some(task.id),
+            NOTE_EVENT,
+            &Actor::agent(&claim.agent_id),
+            json!({"message": message}),
+            &now,
+        )?;
+        tx.commit().db()?;
+        self.get(request.task_id)
     }
 
     fn heartbeat(&self, request: HeartbeatRequest) -> Result<Claim, QueueError> {
