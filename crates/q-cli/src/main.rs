@@ -2641,7 +2641,7 @@ fn print_detail(detail: &q_core::TaskDetail, paint: Paint) {
         );
         let when = task
             .escalated_at
-            .map(|at| format_timestamp(at))
+            .map(format_timestamp)
             .unwrap_or_else(|| "-".to_string());
         meta(paint, &format!("escalated_at: {when}"));
     }
