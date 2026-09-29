@@ -680,6 +680,7 @@ fn dispatch(
             },
         ),
         Commands::Claim {
+            id,
             agent,
             capability,
             kind,
@@ -692,6 +693,7 @@ fn dispatch(
             max_failures,
         } => {
             let mut request = ClaimRequest::new(agent);
+            request.task_id = id;
             let (model, host) = q_core::local_worker_identity(model, host);
             request.agent_model = model;
             request.agent_host = host;

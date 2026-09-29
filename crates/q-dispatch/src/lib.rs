@@ -27,20 +27,39 @@ pub fn is_eligible(
     max_parallel_jobs: Option<i64>,
     allow_external_actions: bool,
 ) -> bool {
+    ineligible_reason(
+        task,
+        request,
+        active_in_project,
+        max_parallel_jobs,
+        allow_external_actions,
+    )
+    .is_none()
+}
+
+/// Why `task` cannot be claimed by `request`, or `None` when it can. The
+/// wording is shown to an agent that asked for this task by id.
+pub fn ineligible_reason(
+    task: &EligibilityTask,
+    request: &ClaimRequest,
+    active_in_project: i64,
+    max_parallel_jobs: Option<i64>,
+    allow_external_actions: bool,
+) -> Option<String> {
     if task.status != TaskStatus::Ready {
-        return false;
+        return Some(format!("status is {}, not ready", task.status.as_str()));
     }
     if !request.allowed_repos.is_empty() {
         let repo = match task.repo.as_deref() {
             Some(repo) => normalize_repo_url(repo),
-            None => return false,
+            None => return Some("task has no repo but the claim restricts repos".into()),
         };
         let allowed = request
             .allowed_repos
             .iter()
             .any(|candidate| normalize_repo_url(candidate) == repo);
         if !allowed {
-            return false;
+            return Some(format!("repo {repo} is not in the claim's allowed repos"));
         }
     }
     if !request.allowed_projects.is_empty() {
@@ -50,11 +69,19 @@ pub fn is_eligible(
                     .allowed_projects
                     .iter()
                     .any(|candidate| candidate == project) => {}
-            _ => return false,
+            Some(project) => {
+                return Some(format!(
+                    "project {project} is not in the claim's allowed projects"
+                ))
+            }
+            None => return Some("task has no project but the claim restricts projects".into()),
         }
     }
     if !request.allowed_kinds.is_empty() && !request.allowed_kinds.contains(&task.kind) {
-        return false;
+        return Some(format!(
+            "kind {} is not in the claim's allowed kinds",
+            task.kind.as_str()
+        ));
     }
     if let Some(pool) = request
         .agent_pool
@@ -68,14 +95,21 @@ pub fn is_eligible(
             .map(str::trim)
             .filter(|pool| !pool.is_empty());
         if task_pool != Some(pool) {
-            return false;
+            return Some(match task_pool {
+                Some(task_pool) => format!("agent pool is {task_pool}, not {pool}"),
+                None => format!("task has no agent pool, the claim asks for {pool}"),
+            });
         }
     }
     if task.risk > request.maximum_risk {
-        return false;
+        return Some(format!(
+            "risk {} is above the claim's maximum {}; raise --max-risk",
+            task.risk.as_str(),
+            request.maximum_risk.as_str()
+        ));
     }
     if task.risk == RiskLevel::ExternalAction && !allow_external_actions {
-        return false;
+        return Some("external_action needs allow_external_actions on the project".into());
     }
     for required in &task.required_capabilities {
         if !request
@@ -83,7 +117,7 @@ pub fn is_eligible(
             .iter()
             .any(|capability| capability == required)
         {
-            return false;
+            return Some(format!("required capability {required} is missing"));
         }
     }
     if task
@@ -91,16 +125,21 @@ pub fn is_eligible(
         .iter()
         .any(|status| *status != TaskStatus::Done)
     {
-        return false;
+        return Some("a dependency is not done".into());
     }
     if let Some(max) = max_parallel_jobs {
         if active_in_project >= max {
-            return false;
+            return Some(format!(
+                "project is at max_parallel_jobs ({active_in_project} of {max})"
+            ));
         }
     }
     if let Some(max_failures) = request.max_failures {
         if task.failure_count >= max_failures {
-            return false;
+            return Some(format!(
+                "failure count {} is at the claim's max_failures {max_failures}",
+                task.failure_count
+            ));
         }
     }
     if !request.tags.is_empty() {
@@ -113,10 +152,10 @@ pub fn is_eligible(
             let key = tag.trim().to_ascii_lowercase();
             !have.iter().any(|have| have == &key)
         }) {
-            return false;
+            return Some("a tag the claim requires is missing".into());
         }
     }
-    true
+    None
 }
 
 #[cfg(test)]
@@ -147,6 +186,21 @@ mod tests {
         let mut candidate = task();
         candidate.status = TaskStatus::Held;
         assert!(!is_eligible(&candidate, &request(), 0, None, false));
+    }
+
+    #[test]
+    fn ineligible_reason_names_the_first_failing_rule() {
+        assert_eq!(ineligible_reason(&task(), &request(), 0, None, false), None);
+        let mut candidate = task();
+        candidate.risk = RiskLevel::High;
+        let reason = ineligible_reason(&candidate, &request(), 0, None, false).unwrap();
+        assert!(reason.contains("risk high"), "{reason}");
+        candidate.risk = RiskLevel::Low;
+        candidate.required_capabilities = vec!["rust".into()];
+        let reason = ineligible_reason(&candidate, &request(), 0, None, false).unwrap();
+        assert!(reason.contains("rust"), "{reason}");
+        let reason = ineligible_reason(&task(), &request(), 2, Some(2), false).unwrap();
+        assert!(reason.contains("max_parallel_jobs"), "{reason}");
     }
 
     #[test]

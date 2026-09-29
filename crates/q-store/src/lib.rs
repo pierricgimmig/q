@@ -22,7 +22,7 @@ use q_core::{
     StaleDisposition, StartRequest, StatusCounts, Task, TaskDetail, TaskKind, TaskStatus,
     TaskSummary, TaskTree, TreeQuery, TreeTask, LEASE_EXPIRED_REASON, NOTE_EVENT,
 };
-use q_dispatch::{is_eligible, EligibilityTask};
+use q_dispatch::{ineligible_reason, is_eligible, EligibilityTask};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -771,7 +771,63 @@ fn recover_expired(
     Ok(recovered)
 }
 
+/// Check one task the agent asked for by id. Anything short of a claimable
+/// task is an error, so the caller learns why instead of a silent `found:false`.
+fn select_requested(
+    conn: &Connection,
+    request: &ClaimRequest,
+    task_id: i64,
+) -> Result<i64, QueueError> {
+    let task = load_task(conn, task_id)?;
+    if matches!(task.status, TaskStatus::Claimed | TaskStatus::InProgress) {
+        let (_, now) = now_parts();
+        let holder = load_latest_claim(conn, task_id, &now)?
+            .map(|claim| format!(" by {}", claim.agent_id))
+            .unwrap_or_default();
+        return Err(QueueError::Conflict(format!(
+            "task {task_id} is already {}{holder}",
+            task.status.as_str()
+        )));
+    }
+    if task.status != TaskStatus::Ready {
+        return Err(QueueError::InvalidTransition {
+            from: task.status,
+            to: TaskStatus::Claimed,
+        });
+    }
+    let meta = project_meta(conn, task.project.as_deref())?;
+    let active = active_in_project(conn, task.project.as_deref())?;
+    let dependency_statuses = dependency_statuses(conn, &task.dependencies)?;
+    let candidate = EligibilityTask {
+        status: task.status,
+        kind: task.kind,
+        risk: task.risk,
+        project: task.project.clone(),
+        repo: task.repo.clone(),
+        agent_pool: task.agent_pool.clone(),
+        required_capabilities: task.required_capabilities.clone(),
+        dependency_statuses,
+        tags: task.tags.clone(),
+        failure_count: task.failure_count,
+    };
+    match ineligible_reason(
+        &candidate,
+        request,
+        active,
+        meta.max_parallel_jobs,
+        meta.allow_external_actions,
+    ) {
+        None => Ok(task_id),
+        Some(reason) => Err(QueueError::Conflict(format!(
+            "task {task_id} is not eligible for this claim: {reason}"
+        ))),
+    }
+}
+
 fn select_eligible(conn: &Connection, request: &ClaimRequest) -> Result<Option<i64>, QueueError> {
+    if let Some(task_id) = request.task_id {
+        return select_requested(conn, request, task_id).map(Some);
+    }
     let mut stmt = conn
         .prepare(
             "SELECT id FROM tasks WHERE status = 'ready' ORDER BY priority DESC, created_at ASC, id ASC",
@@ -1733,6 +1789,7 @@ impl QueueService for Queue {
         }
         let request = ClaimRequest {
             agent_id: agent_id.to_string(),
+            task_id: request.task_id,
             capabilities: dedupe_strings(&request.capabilities),
             allowed_repos: request
                 .allowed_repos

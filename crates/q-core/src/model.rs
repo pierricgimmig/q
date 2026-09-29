@@ -873,6 +873,10 @@ pub struct DeleteOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
     pub agent_id: String,
+    /// Claim this task instead of the best eligible one. The task must still
+    /// be ready and pass every filter below; the store errors otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<i64>,
     pub capabilities: Vec<String>,
     pub allowed_repos: Vec<String>,
     pub allowed_projects: Vec<String>,
@@ -898,6 +902,7 @@ impl ClaimRequest {
     pub fn new(agent_id: impl Into<String>) -> Self {
         Self {
             agent_id: agent_id.into(),
+            task_id: None,
             capabilities: Vec::new(),
             allowed_repos: Vec::new(),
             allowed_projects: Vec::new(),
@@ -1098,6 +1103,21 @@ mod tests {
         assert_eq!(value["id"], 184);
         assert_eq!(value["created_at"], "2026-09-22T00:00:00Z");
         assert!(value.get("body").is_none());
+    }
+
+    #[test]
+    fn claim_request_task_id_is_optional_on_the_wire() {
+        let old_client = serde_json::to_value(ClaimRequest::new("agent-1")).unwrap();
+        assert!(old_client.get("task_id").is_none());
+        let parsed: ClaimRequest = serde_json::from_value(old_client).unwrap();
+        assert_eq!(parsed.task_id, None);
+
+        let mut targeted = ClaimRequest::new("agent-1");
+        targeted.task_id = Some(184);
+        let value = serde_json::to_value(&targeted).unwrap();
+        assert_eq!(value["task_id"], 184);
+        let parsed: ClaimRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.task_id, Some(184));
     }
 
     #[test]
