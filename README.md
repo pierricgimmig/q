@@ -47,8 +47,9 @@ q ls -a
 
 ![q ls -a](docs/images/q-ls.png)
 
-`q top` is the same table, redrawn every second with ages to the second, with the last changes
-underneath. Press `q` to leave it.
+`q top` is that same table, redrawn every second with ages to the second and the last changes
+underneath. Press `q` to leave it. Without `-a` it hides done and cancelled tasks; the columns
+stay, including the completion percent.
 
 ## The log
 
