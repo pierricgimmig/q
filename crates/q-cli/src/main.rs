@@ -3633,72 +3633,39 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
 
     #[test]
     fn top_rows_use_the_all_layout_including_progress() {
-        fn row(
-            id: &str,
-            status: &str,
-            progress: &str,
-            pr: Option<&str>,
-            host: &str,
-            note: &str,
-            beat: &str,
-            escalated: &str,
-            title: &str,
-        ) -> TaskListRow {
+        fn row(id: &str, status: &str, title: &str) -> TaskListRow {
             TaskListRow {
                 id: id.into(),
                 status: status.into(),
                 feature: "(none)".into(),
                 project: "alpha".into(),
                 priority: "0".into(),
-                progress: progress.into(),
+                progress: String::new(),
                 updated: "1s ago".into(),
-                pr_url: pr.map(str::to_string),
+                pr_url: None,
                 tags: String::new(),
                 fails: String::new(),
                 model: String::new(),
-                host: host.into(),
-                note: note.into(),
-                beat: beat.into(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
                 stale: String::new(),
-                escalated: escalated.into(),
+                escalated: String::new(),
                 title: title.into(),
                 activity: String::new(),
             }
         }
 
-        let active = row(
-            "1",
-            "in_progress",
-            "40%",
-            None,
-            "cursor",
-            "halfway",
-            "1s ago",
-            "",
-            "Active work",
-        );
-        let done = row(
-            "2",
-            "done",
-            "100%",
-            Some("https://example.com/pr/2"),
-            "",
-            "",
-            "",
-            "",
-            "Finished work",
-        );
-        let escalated = row(
-            "3",
-            "escalated",
-            "",
-            None,
-            "",
-            "",
-            "",
-            "agent:bot · 1s ago · too big",
-            "Needs a human",
-        );
+        let mut active = row("1", "in_progress", "Active work");
+        active.progress = "40%".into();
+        active.host = "cursor".into();
+        active.note = "halfway".into();
+        active.beat = "1s ago".into();
+        let mut done = row("2", "done", "Finished work");
+        done.progress = "100%".into();
+        done.pr_url = Some("https://example.com/pr/2".into());
+        let mut escalated = row("3", "escalated", "Needs a human");
+        escalated.escalated = "agent:bot · 1s ago · too big".into();
         let layout = [escalated.clone(), done, active.clone()];
         let reference = render_task_rows_painted(&layout, Paint::plain(), true);
         let active_table = render_task_rows_with_layout(
