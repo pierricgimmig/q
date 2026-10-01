@@ -27,8 +27,8 @@ pub struct ToolContext {
     /// Recorded on events. stdio sessions are the agent `mcp`; `q serve`
     /// sets the authenticated principal.
     pub actor: Actor,
-    /// Expose `queue_ready` and `queue_reopen`. Only `q serve` sets this, for
-    /// human tokens, so a local stdio agent never sees a ready tool.
+    /// Expose `queue_ready`, `queue_hold`, and `queue_reopen`. Only `q serve`
+    /// sets this, for human tokens, so a local stdio agent never sees them.
     pub human_tools: bool,
     /// Reject a `capture_path` outside `base_dir`. `q serve` sets this: a
     /// remote token holder must not be able to run discovery (git, config
@@ -207,6 +207,12 @@ impl Session {
                 "invalid params",
                 Some(json!({"code": "invalid_input", "error": message})),
             ),
+            Err(ToolFailure::Forbidden(message)) => rpc_error(
+                id.clone(),
+                -32602,
+                "forbidden",
+                Some(json!({"code": "forbidden", "error": message})),
+            ),
             Err(ToolFailure::Domain(error)) => rpc_result(id.clone(), tool_error(&error)),
         }
     }
@@ -230,6 +236,8 @@ pub async fn serve(queue: Arc<dyn QueueService>, base_dir: PathBuf) -> std::io::
 
 enum ToolFailure {
     Invalid(String),
+    /// The caller is not a human session on `q serve`.
+    Forbidden(String),
     Domain(QueueError),
 }
 
@@ -242,9 +250,11 @@ impl From<QueueError> for ToolFailure {
     }
 }
 
-/// Tools that make work claimable. Listed and callable only for human
-/// principals over `q serve`.
-pub const HUMAN_ONLY_TOOLS: &[&str] = &["queue_ready", "queue_reopen"];
+/// Tools only a human principal may call over `q serve`. Local stdio
+/// sessions leave [`ToolContext::human_tools`] false, so these are neither
+/// listed nor callable there. `queue_complete` stays available to agents;
+/// accepting a task already in review is refused inside that tool.
+pub const HUMAN_ONLY_TOOLS: &[&str] = &["queue_ready", "queue_hold", "queue_reopen"];
 
 fn dispatch_tool(
     queue: &dyn QueueService,
@@ -254,7 +264,7 @@ fn dispatch_tool(
 ) -> Result<Value, ToolFailure> {
     let args = arguments.as_object().expect("object checked by caller");
     if HUMAN_ONLY_TOOLS.contains(&name) && !ctx.human_tools {
-        return Err(ToolFailure::Invalid(format!(
+        return Err(ToolFailure::Forbidden(format!(
             "{name} is only available to a human signed in to q serve"
         )));
     }
@@ -269,6 +279,7 @@ fn dispatch_tool(
         "queue_feature_get" => queue_feature_get(queue, args),
         "queue_edit" => queue_edit(queue, ctx, args),
         "queue_ready" => queue_ready(queue, ctx, args),
+        "queue_hold" => queue_hold(queue, ctx, args),
         "queue_reopen" => queue_reopen(queue, ctx, args),
         "queue_cancel" => queue_cancel(queue, ctx, args),
         "queue_claim_next" => queue_claim_next(queue, ctx, args),
@@ -304,6 +315,19 @@ fn queue_ready(
         actor: ctx.actor.clone(),
     })?;
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+fn queue_hold(
+    queue: &dyn QueueService,
+    ctx: &ToolContext,
+    args: &Map<String, Value>,
+) -> Result<Value, ToolFailure> {
+    expect_keys(args, &["task_id", "id"])?;
+    let task = queue.hold(q_core::HoldRequest {
+        task_id: required_task_id(args)?,
+        actor: ctx.actor.clone(),
+    })?;
+    Ok(serde_json::to_value(task).unwrap_or(Value::Null))
 }
 
 fn queue_reopen(
@@ -790,8 +814,20 @@ fn queue_complete(
         None => None,
     };
     let artifacts = artifact_inputs(args)?;
+    let task_id = required_task_id(args)?;
+    // The store ignores a claim token once the task is in review, so an
+    // agent could accept it by sending any token. That acceptance is a
+    // human step. Agents still complete claimed and in-progress work here.
+    if !ctx.human_tools {
+        let detail = queue.get(task_id)?;
+        if detail.task.status == TaskStatus::Review {
+            return Err(ToolFailure::Forbidden(
+                "accepting a task in review requires a human token".into(),
+            ));
+        }
+    }
     let detail = queue.complete(CompleteRequest {
-        task_id: required_task_id(args)?,
+        task_id,
         claim_token: Some(required_string(args, "claim_token")?),
         summary: required_string(args, "summary")?,
         target,
@@ -1312,7 +1348,7 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
         ),
         tool(
             "queue_complete",
-            "Complete claimed work. Implementation tasks with require_pr land in review.",
+            "Complete claimed work. Implementation tasks with require_pr land in review. Accepting a task that is already in review requires a human signed in to q serve.",
             json!({
                 "type": "object",
                 "required": ["task_id", "claim_token", "summary"],
@@ -1441,8 +1477,18 @@ fn tool_definitions(human_tools: bool) -> Vec<Value> {
             }),
         ));
         tools.push(tool(
+            "queue_hold",
+            "Move a ready, blocked, or escalated task to held so agents cannot claim it.",
+            json!({
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {"task_id": {"type": "integer"}},
+                "additionalProperties": false
+            }),
+        ));
+        tools.push(tool(
             "queue_reopen",
-            "Move a done task back to ready.",
+            "Move a done task back to ready, or a cancelled task back to held.",
             json!({
                 "type": "object",
                 "required": ["task_id"],
@@ -2181,6 +2227,8 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap().to_string())
             .collect();
         assert!(!names.iter().any(|name| name == "queue_ready"));
+        assert!(!names.iter().any(|name| name == "queue_hold"));
+        assert!(!names.iter().any(|name| name == "queue_reopen"));
         assert!(names.iter().any(|name| name == "queue_edit"));
         assert!(names.iter().any(|name| name == "queue_cancel"));
         assert!(names.iter().any(|name| name == "queue_status"));
@@ -2200,10 +2248,20 @@ mod tests {
             json!({"name": "queue_ready", "arguments": {"task_id": id}}),
         );
         assert_eq!(denied["error"]["code"], -32602);
+        assert_eq!(denied["error"]["message"], "forbidden");
+        assert_eq!(denied["error"]["data"]["code"], "forbidden");
         assert!(denied["error"]["data"]["error"]
             .as_str()
             .unwrap()
             .contains("human"));
+        let held_denied = call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            11,
+            json!({"name": "queue_hold", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(held_denied["error"]["data"]["code"], "forbidden");
 
         // A human session over q serve lists it, runs it, and is recorded as
         // the human, not as the agent `mcp`.
@@ -2217,6 +2275,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "queue_ready"));
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "queue_hold"));
         let edited = call(
             &mut human,
             &queue,
@@ -2233,6 +2296,22 @@ mod tests {
             json!({"name": "queue_ready", "arguments": {"task_id": id}}),
         );
         assert_eq!(tool_body(&ready)["task"]["status"], "ready");
+        let held = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            11,
+            json!({"name": "queue_hold", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(tool_body(&held)["status"], "held");
+        let ready_again = call(
+            &mut human,
+            &queue,
+            "tools/call",
+            12,
+            json!({"name": "queue_ready", "arguments": {"task_id": id}}),
+        );
+        assert_eq!(tool_body(&ready_again)["task"]["status"], "ready");
         let status = call(
             &mut human,
             &queue,
@@ -2264,6 +2343,77 @@ mod tests {
             json!({"name": "queue_edit", "arguments": {"task_id": id}}),
         );
         assert_eq!(nothing["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn agents_cannot_accept_review_and_humans_can() {
+        let queue = temp_queue();
+        let mut agent = Session::new(std::env::temp_dir()).stateless();
+        let captured = tool_body(&call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            1,
+            json!({"name": "queue_capture", "arguments": {"title": "Needs a look"}}),
+        ));
+        let id = captured["id"].as_i64().unwrap();
+        let claimed = tool_body(&call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            2,
+            json!({"name": "queue_claim_next", "arguments": {"agent_id": "bot", "task_id": id}}),
+        ));
+        let token = claimed["claim"]["token"].as_str().unwrap();
+        let review = tool_body(&call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            3,
+            json!({"name": "queue_complete", "arguments": {
+                "task_id": id,
+                "claim_token": token,
+                "summary": "opening a pull request",
+                "status": "review"
+            }}),
+        ));
+        assert_eq!(review["status"], "review");
+
+        let denied = call(
+            &mut agent,
+            &queue,
+            "tools/call",
+            4,
+            json!({"name": "queue_complete", "arguments": {
+                "task_id": id,
+                "claim_token": token,
+                "summary": "looks good"
+            }}),
+        );
+        assert_eq!(denied["error"]["message"], "forbidden");
+        assert_eq!(denied["error"]["data"]["code"], "forbidden");
+        assert!(denied["error"]["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("review"));
+        assert_eq!(queue.get(id).unwrap().task.status, TaskStatus::Review);
+
+        let mut human = Session::new(std::env::temp_dir())
+            .with_actor(Actor::human(Some("pierric".into())))
+            .with_human_tools(true)
+            .stateless();
+        let accepted = tool_body(&call(
+            &mut human,
+            &queue,
+            "tools/call",
+            5,
+            json!({"name": "queue_complete", "arguments": {
+                "task_id": id,
+                "claim_token": "ignored",
+                "summary": "accepted"
+            }}),
+        ));
+        assert_eq!(accepted["status"], "done");
     }
 
     #[test]

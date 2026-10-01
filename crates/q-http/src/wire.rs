@@ -45,8 +45,13 @@ pub const METHODS: &[&str] = &[
     "tree",
 ];
 
-/// Methods that make work claimable. Only human tokens may call them.
-pub const HUMAN_ONLY_METHODS: &[&str] = &["mark_ready", "reopen"];
+/// Methods an agent token may not call.
+///
+/// `mark_ready` and `reopen` make work claimable. `hold` takes ready, blocked,
+/// or escalated work back out of the pool. Accepting a task that is already
+/// in `review` is gated inside `complete`, because agents still finish their
+/// own claims through that method.
+pub const HUMAN_ONLY_METHODS: &[&str] = &["mark_ready", "reopen", "hold"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthBody {

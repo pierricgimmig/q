@@ -50,7 +50,7 @@ sudo -u q q --db /var/lib/q/queue.db token create codex-vps --role agent
 
 `deploy/install.sh` installs the binary, creates a `q` system user, writes `deploy/q.service` and `deploy/Caddyfile` with your hostname, and starts both. Without Caddy, put any TLS proxy in front of `127.0.0.1:7777` and pass `--public-url https://your.host` to `q serve` so OAuth redirects use the right origin.
 
-`q token create` prints the secret once and writes it to `tokens.toml` next to the database. A server started with a token file picks up new and revoked tokens without a restart. An empty token file denies all access; revoking the last token keeps this file in place. Missing, unreadable, or invalid token files deny access until repaired. `q token ls` and `q token revoke NAME` manage the file. Secrets are random; nothing else is stored.
+`q token create` prints the secret once and stores it in plain text in `tokens.toml` next to the database. The file mode is `0600`, so only the owner can read the names, roles, and secrets. A server started with a token file picks up new and revoked tokens without a restart. An empty token file denies all access; revoking the last token keeps this file in place. Missing, unreadable, or invalid token files deny access until repaired. `q token ls` and `q token revoke NAME` manage the file. Each secret is random.
 
 ### Connect a chat app (Grok, Claude, ChatGPT)
 
@@ -58,7 +58,7 @@ sudo -u q q --db /var/lib/q/queue.db token create codex-vps --role agent
 2. The app discovers the OAuth endpoints and sends you to the q sign-in page.
 3. Paste your human token from `q token create` and click Allow.
 
-The connector now acts as you: it can capture, list, edit, cancel, and mark tasks ready. The `queue_ready` and `queue_reopen` tools only appear for human tokens. A connector signed in with an agent token never sees them, and the server refuses them anyway.
+The connector now acts as you: it can capture, list, edit, cancel, hold, and mark tasks ready, and it can accept a task in review. `queue_ready`, `queue_hold`, and `queue_reopen` appear only for human tokens. A connector signed in with an agent token never sees them, and the server refuses those methods anyway. Accepting review (`queue_complete` on a task already in `review`, or `POST /v1/complete` on that task) is refused for an agent token as well.
 
 Grok Bot and other clients that take a URL plus a static header instead of a sign-in flow work too: send `Authorization: Bearer <secret>` with a token-file secret.
 
@@ -106,7 +106,20 @@ role = "agent"
 secret = "..."
 ```
 
-Secrets must be at least 16 characters. `human` tokens may call everything. `agent` tokens cannot call `ready` or `reopen`, so an agent cannot make work claimable, and any actor an agent sends is recorded as an agent. The rule that only humans mark work ready is enforced by the server, not by convention.
+Secrets must be at least 16 characters. `human` tokens may call everything. `agent` tokens cannot call `ready`, `hold`, or `reopen`, and they cannot accept a task that is already in `review`. Any actor an agent sends is recorded as an agent. Those rules are enforced by the server, not by convention. A local `q` with no server has no tokens, so `q hold` and `q ready` work there the same way they always have.
+
+| Action | Human token | Agent token |
+|---|---|---|
+| `mark_ready` / `queue_ready` | yes | no |
+| `hold` / `queue_hold` | yes | no |
+| `reopen` / `queue_reopen` | yes | no |
+| Accept review (`complete` on a task already in `review`) | yes | no |
+| `complete` of claimed or in-progress work | yes | yes |
+| `capture`, `list`, `get`, `edit`, `claim_next`, `heartbeat`, `start`, `block`, `fail`, `escalate`, `note`, `log`, `release` | yes | yes |
+| `cancel`, `delete`, `recover_stale` | yes | yes |
+| Features, `tree`, `status`, `events`, `artifact` | yes | yes |
+
+`queue_ready`, `queue_hold`, and `queue_reopen` are offered only to a human session over `q serve`. A local stdio session (`q mcp` with no server) does not list them. `queue_complete` is offered to every session; the review-acceptance refusal above is what stops an agent from using it on a task that is already in `review`.
 
 Without a token file the server accepts every request as an anonymous human and refuses to bind anything but a loopback address. This local mode requires a restart to enable authentication after creating the first token. `--public-url` requires a token file. The systemd service always passes `--auth`, and the installer creates an empty token file before starting it. `GET /v1/health` and the OAuth discovery endpoints need no token.
 
@@ -218,7 +231,7 @@ ID  STATUS       PROJECT  PRI  PROG  UPDATED  TITLE               PR
  1  held         (none)     0        2d ago   Unassigned capture
 ```
 
-`q hold` and `q ready` are the human gate. `q hold ID` moves a ready or blocked task to `held`, where no agent can claim it. `q ready ID` releases a held or blocked task. Any task the state machine allows can be marked ready, including a sparse body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits. Neither command is exposed as an MCP tool, and a `q serve` agent token cannot call `ready`.
+`q hold` and `q ready` are the human gate. `q hold ID` moves a ready, blocked, or escalated task to `held`, where no agent can claim it. `q ready ID` releases a held, blocked, or escalated task. Any task the state machine allows can be marked ready, including a sparse body; the body's shape is never checked. The only readiness warning is for `high` or `external_action` risk, since default claims skip those tasks. The original capture text is kept after later edits. On `q serve`, `hold`, `mark_ready`, and `reopen` require a human token. MCP exposes them as `queue_hold`, `queue_ready`, and `queue_reopen`, and only to a human session; a local stdio session and an agent token do not see those tools. Accepting a task in `review` (`q complete ID` with no claim token, or `queue_complete` while the task is already in review) is the same kind of human step: an agent token is refused, even if it sends a claim token.
 
 `q ready`, `q cancel`, `q reopen`, and `q delete` take one or more ids: `q ready 11 12 13`. Ids are processed in order, each one in its own transaction. A failure on one id (not found, wrong status, active claim) is reported for that id and the remaining ids still run; the command exits non-zero at the end if any id failed. Human output prints the usual confirmation or error line per id as it happens. With `--json` and exactly one id the output is the same document as before, so existing callers do not change. With `--json` and several ids the output is a single `{"results":[...],"errors":[{"id":13,"error":"..."}]}` document, where each entry in `results` has the single-id shape (`{"task":...,"warnings":[...]}` for ready, the task for cancel and reopen, and the delete outcome for delete).
 
@@ -301,7 +314,7 @@ Default lease is 30 minutes (minimum 1 minute, maximum 24 hours), measured from 
 
 Default `--max-risk` is `medium`. High and `external_action` tasks are not selected unless the claim raises the ceiling. External-action tasks also require `allow_external_actions` on the project, which defaults to false. Empty repo, project, and kind filters mean unrestricted. Required capabilities must be a subset of the worker's capabilities. Dependencies must be `done`. A project's `max_parallel_jobs` counts claimed and in-progress tasks.
 
-If the project sets `require_pr` and the task kind is implementation, `complete` lands in `review` even when the requested target is `done`. A human can then accept it with `q complete ID` and no claim token. `q reopen ID` moves done work back to ready so it can be claimed again, or cancelled work back to held.
+If the project sets `require_pr` and the task kind is implementation, `complete` lands in `review` even when the requested target is `done`. A human accepts it with `q complete ID` and no claim token. On `q serve` an agent token is refused for that acceptance, including a `complete` that sends a claim token while the task is already in `review`. `q reopen ID` moves done work back to ready so it can be claimed again, or cancelled work back to held. An agent token cannot call `reopen` either.
 
 ## Task log and artifacts
 
@@ -361,7 +374,7 @@ q tree --feature "Cross-repo rollout" --json
 }
 ```
 
-Tools, all backed by the same service methods as the CLI:
+Tools, all backed by the same service methods as the CLI. `queue_ready`, `queue_hold`, and `queue_reopen` are human-only over `q serve` and are not offered on local stdio. Every other tool below is offered to stdio sessions and to agent tokens.
 
 | Tool | Purpose |
 |---|---|
@@ -376,17 +389,22 @@ Tools, all backed by the same service methods as the CLI:
 | `queue_tree` | Dependency tree for a task id, or a forest for a feature id or unique title. Children are tasks that must be done first. |
 | `queue_claim_next` | Atomically claim one eligible ready task, or return no work. Optional `tags`, `max_failures`, `agent_model`, `agent_host`. |
 | `queue_fail` | Release the claim, record an optional note, increment the failure count, and return the task to ready. |
+| `queue_escalate` | Release the claim and park the task as `escalated` with a required `reason`. A human returns it with `q ready`. |
 | `queue_note` | Append a short status message to a claimed task. |
 | `queue_heartbeat` | Extend a lease with task id and claim token. |
 | `queue_start` | Mark a claim in progress and record branch or worktree. |
 | `queue_block` | Block claimed work. Requires the claim token. |
-| `queue_complete` | Complete or send to review, with summary and artifacts. |
+| `queue_complete` | Complete claimed work, or send it to review, with a summary and artifacts. Accepting a task that is already in `review` works only for a human session on `q serve`. |
 | `queue_log` | Append a note, a `progress` percent, and/or artifacts to a task's log. Artifacts may carry `content` to store in the database. |
 | `queue_artifact` | Fetch one artifact by id with its stored content. |
 | `queue_release` | Return a claim to ready. Requires the claim token. |
 | `queue_delete` | Hard-delete a task. `force` clears an unexpired claim. |
+| `queue_cancel` | Cancel a task and keep its history. |
+| `queue_ready` | Human-only over `q serve`. Not offered on local stdio. Move a held or blocked task to ready. |
+| `queue_hold` | Human-only over `q serve`. Not offered on local stdio. Move a ready, blocked, or escalated task to held. |
+| `queue_reopen` | Human-only over `q serve`. Not offered on local stdio. Move a done task back to ready, or a cancelled task back to held. |
 
-Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Domain errors are a successful `tools/call` with `isError: true`. There is no free-form update tool.
+Unknown argument keys are rejected. Invalid tool arguments are JSON-RPC `-32602`. Calling `queue_ready`, `queue_hold`, or `queue_reopen` from local stdio or with an agent token, or accepting review with `queue_complete` in those sessions, is the same code with `message` `forbidden` and `data.code` `forbidden`. Domain errors are a successful `tools/call` with `isError: true`. There is no free-form update tool.
 
 `queue_claim_next` example:
 
@@ -429,7 +447,7 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 
 - Capture is local and creates a `ready` task at low risk unless you set a higher risk. Agents may claim it at once.
 - `q add --hold` (MCP `hold: true`) creates a `held` task instead. Held work is never claimable, and only a human `q ready` releases it. That is the safe capture for work you want to look at first.
-- Completion is still gated: high and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept.
+- Completion is still gated: high and `external_action` risk stay out of default claims, and a project with `require_pr` sends implementation work to `review` for a human to accept. On `q serve` an agent token cannot accept that review.
 - External action also needs the project policy flag.
 - `delete` removes the task from the database. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason.
