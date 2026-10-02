@@ -2294,6 +2294,12 @@ const TASK_COLUMNS: &[TaskColumn] = &[
         placeholders: &[],
     },
     TaskColumn {
+        header: "TITLE",
+        align_right: false,
+        fixed: true,
+        placeholders: &[],
+    },
+    TaskColumn {
         header: "PR",
         align_right: false,
         fixed: false,
@@ -2348,12 +2354,6 @@ const TASK_COLUMNS: &[TaskColumn] = &[
         placeholders: &[],
     },
     TaskColumn {
-        header: "TITLE",
-        align_right: false,
-        fixed: true,
-        placeholders: &[],
-    },
-    TaskColumn {
         header: "ACTIVITY",
         align_right: false,
         fixed: false,
@@ -2387,6 +2387,7 @@ fn task_cells(row: &TaskListRow, paint: Paint) -> Vec<(&str, Style, Option<&str>
         (row.priority.as_str(), dim, None),
         (row.progress.as_str(), status, None),
         (row.updated.as_str(), dim, None),
+        (row.title.as_str(), style::bold_style(), None),
         (pr_cell(row, paint), Style::new(), row.pr_url.as_deref()),
         (row.tags.as_str(), dim, None),
         (row.fails.as_str(), dim, None),
@@ -2400,7 +2401,6 @@ fn task_cells(row: &TaskListRow, paint: Paint) -> Vec<(&str, Style, Option<&str>
             style::status_style("escalated"),
             None,
         ),
-        (row.title.as_str(), style::bold_style(), None),
         (row.activity.as_str(), Style::new(), None),
     ]
 }
@@ -3232,12 +3232,9 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
             activity: String::new(),
         };
         let plain = render_task_rows(std::slice::from_ref(&row));
+        assert!(plain.contains("UPDATED  TITLE    PR"), "{plain}");
         assert!(
-            plain.contains("UPDATED  PR                        TITLE"),
-            "{plain}"
-        );
-        assert!(
-            plain.contains("1h ago   https://example.com/pr/9  Shipped"),
+            plain.contains("1h ago   Shipped  https://example.com/pr/9"),
             "{plain}"
         );
         let color = render_task_rows_painted(std::slice::from_ref(&row), Paint::color(), false);
@@ -3246,8 +3243,8 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
             "{color:?}"
         );
         let visible = anstream::adapter::strip_str(&color).to_string();
-        assert!(visible.contains("UPDATED  PR  TITLE"), "{visible}");
-        assert!(visible.contains("1h ago   PR  Shipped"), "{visible}");
+        assert!(visible.contains("UPDATED  TITLE    PR"), "{visible}");
+        assert!(visible.contains("1h ago   Shipped  PR"), "{visible}");
         row.pr_url = None;
         let none = render_task_rows(std::slice::from_ref(&row));
         assert!(none.contains("1h ago   Shipped"), "{none}");
@@ -3308,7 +3305,8 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
             ("HOST", "NOTE"),
             ("NOTE", "BEAT"),
             ("BEAT", "STALE"),
-            ("STALE", "TITLE"),
+            ("UPDATED", "TITLE"),
+            ("TITLE", "TAGS"),
         ] {
             assert!(
                 header.find(left).unwrap() < header.find(right).unwrap(),
