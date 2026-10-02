@@ -28,8 +28,29 @@ use time::OffsetDateTime;
 use crate::cli::{Commands, FeatureCommand, ProjectCommand, TokenCommand};
 use crate::style::Paint;
 
+fn main() {
+    // Windows gives the process main thread 1 MiB. Parsing this CLI and
+    // drawing `q top` both need more than that; the other platforms start
+    // the main thread at 8 MiB. Run the real entry point on that larger stack.
+    #[cfg(windows)]
+    {
+        const STACK: usize = 8 * 1024 * 1024;
+        let joined = std::thread::Builder::new()
+            .name("q".into())
+            .stack_size(STACK)
+            .spawn(cli_main)
+            .expect("failed to start q")
+            .join();
+        if let Err(payload) = joined {
+            std::panic::resume_unwind(payload);
+        }
+    }
+    #[cfg(not(windows))]
+    cli_main();
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn cli_main() {
     init_tracing();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = cli::preprocess(raw);
