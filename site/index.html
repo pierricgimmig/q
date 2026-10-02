@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>q — a work queue for coding agents</title>
+  <meta name="description" content="q is a local-first SQLite work queue for coding agents. Capture a task in one command, mark it ready when you mean it, and let idle agents claim it atomically.">
+  <meta name="color-scheme" content="dark light">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f1115'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='700' font-size='20' fill='%2334d399'%3Eq%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="q home"><span class="brand-mark">q</span><span class="brand-text">work queue for agents</span></a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#idea">Idea</a>
+      <a href="#try">Try it</a>
+      <a href="#features">Features</a>
+      <a href="https://github.com/pierricgimmig/q" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <p class="eyebrow">one binary · one SQLite file · zero daemons</p>
+      <h1>Capture work in one command.<br>Let idle agents claim it.</h1>
+      <p class="lede">
+        <strong>q</strong> is a local-first work queue for coding and research agents. You capture ideas into an inbox,
+        you decide what is <em>ready</em>, and agents take exactly one task at a time with an atomic claim, a lease,
+        and a token they must present to finish it.
+      </p>
+      <div class="install" role="group" aria-label="Install command">
+        <code id="install-cmd">cargo install --git https://github.com/pierricgimmig/q q-cli --locked</code>
+        <button type="button" class="copy" data-copy="#install-cmd" aria-label="Copy install command">copy</button>
+      </div>
+      <p class="hero-note">Installs the <code>q</code> binary. Requires a stable Rust toolchain (1.88+). No account, no server, no config.</p>
+      <div class="hero-actions">
+        <a class="btn primary" href="#try">Try the live queue</a>
+        <a class="btn" href="https://github.com/pierricgimmig/q#readme" rel="noopener">Read the README</a>
+      </div>
+    </section>
+
+    <section id="idea" class="idea">
+      <h2>The idea</h2>
+      <p class="section-lede">Agents are good at doing work and bad at deciding which work is theirs. <strong>q</strong> splits those two jobs with a single, explicit gate.</p>
+      <ol class="steps">
+        <li class="step">
+          <span class="step-num">1</span>
+          <h3>Capture</h3>
+          <p>A bare title is a capture. It lands in <span class="st st-inbox">inbox</span>, tagged with the repo and project discovered from your current directory. Inbox work is never claimable, so you can dump ideas freely.</p>
+          <pre class="snippet"><code><span class="prompt">$</span> q "Benchmark trace encoding variants"
+captured <span class="dim">#1</span> [<span class="st-inbox">inbox</span>] <b>Benchmark trace encoding variants</b></code></pre>
+        </li>
+        <li class="step">
+          <span class="step-num">2</span>
+          <h3>Ready</h3>
+          <p>A human runs <code>q ready</code>. That is the whole permission boundary: there is no MCP tool for it, and agent tokens on a shared server are refused. Nothing moves until you mean it.</p>
+          <pre class="snippet"><code><span class="prompt">$</span> q ready 1
+ready <span class="dim">#1</span> [<span class="st-ready">ready</span>] <b>Benchmark trace encoding variants</b></code></pre>
+        </li>
+        <li class="step">
+          <span class="step-num">3</span>
+          <h3>Agents claim</h3>
+          <p>Any idle agent asks for one task. The claim runs in one <code>BEGIN IMMEDIATE</code> transaction, so two agents can never take the same work. They start on a branch, heartbeat, and complete with a summary and artifacts.</p>
+          <pre class="snippet"><code><span class="prompt">$</span> q claim --agent codex-02
+claimed <span class="dim">#1</span> [<span class="st-claimed">claimed</span>] <b>Benchmark trace encoding variants</b>
+token: 7c0d…e41a
+<span class="dim">lease_expires_at: 2026-09-27T05:13:30Z</span></code></pre>
+        </li>
+      </ol>
+    </section>
+
+    <section id="try" class="try">
+      <div class="try-head">
+        <h2>Try it. Nothing leaves your browser.</h2>
+        <p class="section-lede">
+          This is a faithful simulation of the <code>q</code> CLI running against an in-memory queue, with three fake agents polling it.
+          Capture a task, mark it ready, and watch an agent claim it, start a branch, heartbeat, and finish.
+          Type <code>help</code> for the command list.
+        </p>
+      </div>
+
+      <div class="counts" id="counts" aria-live="polite" aria-label="Queue counts"></div>
+
+      <div class="playground">
+        <div class="terminal" id="terminal">
+          <div class="term-bar">
+            <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="term-title">you@laptop — q</span>
+            <button type="button" class="term-reset" id="reset" title="Reset the demo queue">reset</button>
+          </div>
+          <div class="term-body" id="term-body">
+            <div class="term-out" id="term-out"></div>
+            <form class="term-line" id="term-form" autocomplete="off">
+              <label class="prompt" for="term-input">$</label>
+              <input id="term-input" class="term-input" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" autocomplete="off" aria-label="Shell input. Type a q command." placeholder='q "Write the parser"'>
+            </form>
+          </div>
+          <div class="term-hint" id="hint" aria-live="polite"><span class="dim">try:</span> <button type="button" class="hint-cmd" id="hint-cmd">q ls</button></div>
+        </div>
+
+        <aside class="agents" aria-label="Fake agents">
+          <div class="agents-head">
+            <h3>agents</h3>
+            <span class="dim" id="agents-note">polling <code>q claim</code> on a timer</span>
+          </div>
+          <ul class="agent-list" id="agent-list"></ul>
+          <div class="agent-log-head"><h3>activity</h3><span class="dim">newest at the bottom</span></div>
+          <ol class="agent-log" id="agent-log" aria-live="polite"></ol>
+        </aside>
+      </div>
+      <p class="try-foot dim">
+        Tips: <kbd>↑</kbd>/<kbd>↓</kbd> for history, <kbd>Tab</kbd> completes subcommands, <code>clear</code> clears the screen.
+        Agents skip <code>high</code>-risk tasks by default and wait for dependencies to be <code>done</code>, exactly like the real thing.
+      </p>
+    </section>
+
+    <section id="features" class="features">
+      <h2>What you get</h2>
+      <p class="section-lede">Small surface, sharp edges. Everything below is one binary and one file.</p>
+      <ul class="grid">
+        <li class="card">
+          <h3>Local-first SQLite</h3>
+          <p>The queue is a single <code>queue.db</code> in your data directory: WAL mode, foreign keys, no daemon. Back it up with <code>cp</code>.</p>
+        </li>
+        <li class="card">
+          <h3>Human gate</h3>
+          <p>Capture always lands in <span class="st st-inbox">inbox</span>. Only <code>q ready</code> makes a task claimable, and only a human can run it.</p>
+        </li>
+        <li class="card">
+          <h3>Leases and claim tokens</h3>
+          <p>A claim is atomic and carries a 45-minute lease. Heartbeat to extend it; present the token to start, block, release, or complete. Expired claims are recovered.</p>
+        </li>
+        <li class="card">
+          <h3>MCP server</h3>
+          <p><code>q mcp</code> speaks JSON-RPC on stdio, so Claude Code, Cursor, and Codex get <code>queue_claim_next</code>, <code>queue_complete</code>, and friends with no network port.</p>
+        </li>
+        <li class="card">
+          <h3>q serve</h3>
+          <p>One HTTP authority for a fleet: point every CLI and MCP client at it with <code>--server</code>. Agent tokens cannot call <code>ready</code>; the server enforces the gate.</p>
+        </li>
+        <li class="card">
+          <h3>Features and trees</h3>
+          <p>Group tasks that span repos under a feature, declare dependencies, and read <code>q tree</code> downward to see what has to finish first.</p>
+        </li>
+        <li class="card">
+          <h3>Risk gating</h3>
+          <p>Tasks carry a risk level. Default claims stop at <code>medium</code>; <code>high</code> and <code>external_action</code> work needs an explicit ceiling and a project flag.</p>
+        </li>
+        <li class="card">
+          <h3>Watch it move</h3>
+          <p><code>q top</code> redraws counts, the table, and recent changes every two seconds. <code>--json</code> is global for scripts and agents.</p>
+        </li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p><strong>q</strong> is open source under the MIT license.
+      <a href="https://github.com/pierricgimmig/q" rel="noopener">github.com/pierricgimmig/q</a></p>
+    <p class="dim">The queue does not launch agents, create worktrees, open pull requests, merge, or deploy. It just remembers who is doing what.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
