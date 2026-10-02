@@ -56,6 +56,7 @@ The commands are `herdr tab create --label workers`, `herdr pane split --directi
 - Say what you are doing: `q heartbeat ID --claim-token TOKEN --activity "Bash: cargo test"` (MCP `queue_heartbeat` with `activity`) shows the current step live in `q top`. Claude Code users can install `tools/hooks/q-activity.sh` as a `PreToolUse` hook with `Q_TASK_ID` and `Q_CLAIM_TOKEN` exported, and it is sent for every tool call automatically.
 - Report progress, starting right after `q start`: `q log ID --progress 10 --claim-token TOKEN` (MCP `queue_log` with `progress`), then again at each milestone (plan made, code written, tests green, PR open), optionally with a message. The `PROG` column in `q top` and `q ls` stays blank until you do, and humans rely on it to see that work is moving. `q claim` and `q start` print the exact command. Use your honest estimate; do not report 100, completing the task sets that.
 - Humans may watch the queue in the Orbit profiler with `q orbit`. Your log notes are what it draws: write `@begin label` before a piece of work and `@end` after it to get a span on your thread, and prefix notes from a parallel sub-agent with `[name]` (`[explore] @begin Survey the API`, `[explore] @end`) so it gets its own thread. Plain notes are marks. Do not run `q orbit` yourself.
+- Run the processes you launch through `q exec ID --claim-token TOKEN -- CMD ARGS...` (builds, tests, git, gh, scripts). It passes the command's stdio and exit status through and logs `@exec CMD ARGS...` and `@exit CODE (DURATION) CMD ARGS...`, which Orbit draws as a scope named after the command under your thread, with the exit code. `--thread NAME` files it on a sub-thread. Export `Q_TASK_ID` and `Q_CLAIM_TOKEN` once you hold a claim and `q exec -- CMD` and `q log "note"` need no id or token. If your harness supports hooks, wire them so every shell command is recorded (`docs/orbit-integration.md` has the Claude Code recipe) and then do not double-record with `q exec`.
 - `q cancel` keeps the task and its history. `q delete` hard-deletes the task and cascaded claims, events, artifacts, and dependency rows. Delete is allowed from any status. An unexpired claim is rejected unless `--force` (CLI) or `force: true` (MCP) is set, which clears that claim in the same transaction.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason. Claim tokens are still required for claimed work.
 - `q ready`, `q cancel`, `q reopen`, and `q delete` accept one or more ids, processed in order. One failing id is reported and the rest still run; the exit status is non-zero if any failed. With `--json`, one id prints the usual single-task document and several ids print `{"results":[...],"errors":[{"id":..,"error":..}]}`.
@@ -97,6 +98,11 @@ q log 184 "Encoder read; varint path is the slow one" --claim-token TOKEN
 q log 184 --progress 40 --claim-token TOKEN
 q log 184 "[bench] @begin Run the encoder benchmarks" --claim-token TOKEN
 q log 184 "[bench] @end" --claim-token TOKEN
+q exec 184 --claim-token TOKEN -- cargo test --workspace
+export Q_TASK_ID=184 Q_CLAIM_TOKEN=TOKEN
+q exec -- gh pr create --fill
+q exec --thread bench -- cargo bench
+q log "tests green, opening the PR"
 q log 184 --claim-token TOKEN --attach report=./docs/benchmarks/trace-encoding.md --artifact pr=https://github.com/acme/x/pull/7
 q log 184
 q artifact 7
@@ -145,6 +151,7 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 | `q project init\|show` | Write or print `.agentqueue.toml` (`--yes`, `--force`). |
 | `q serve` / `q token create\|ls\|revoke` | Run the shared authority (`--bind`, `--auth FILE`, `--public-url`, `--sweep-interval SECONDS`) and manage its token file. Operators run these, not agents. The sweep releases expired leases. |
 | `q orbit` | Follow the queue live in the Orbit profiler (`--url`, `--history`, `--segment`, `--once`). Humans run this; agents do not. |
+| `q exec` | Run a command and log `@exec` / `@exit` so Orbit draws it (`--thread`, `$Q_TASK_ID`, `$Q_CLAIM_TOKEN`). |
 | `q mcp` | The stdio MCP server. |
 | `q skill [install --target NAME]` | Print or install this skill. |
 

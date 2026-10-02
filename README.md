@@ -88,6 +88,17 @@ q orbit --once --json
 
 `q orbit` shows queue activity on the [Orbit](https://github.com/pierricgimmig/orbit) profiler's live timeline. It tails the event log and posts to a running Orbit service (`POST /api/events`): each task is a process named `#id title`, each agent that claims it is a thread of that process, status changes are spans on the task's main thread, the claim and `in_progress` are spans on the agent's thread, and heartbeats, notes, and artifacts are marks. A note written as `[name] @begin label` ... `[name] @end` draws a span on a sub-thread called `name`, so parallel sub-agents appear as parallel threads; `@begin`/`@end` without a prefix nests on the agent's own thread. A task that depends on another shows `waits on #dep` until that task is done. Reported progress is a value lane.
 
+Every process the agent launches is a scope under its thread too, named `$ <command line>` with an `exit <code> (<duration>)` mark where it ends. `q exec` produces it:
+
+```bash
+q exec 184 --claim-token TOKEN -- cargo test --workspace
+export Q_TASK_ID=184 Q_CLAIM_TOKEN=TOKEN
+q exec -- gh pr create --fill                 # id and token from the environment
+q exec --thread bench -- cargo bench          # on a [bench] sub-thread
+```
+
+`q exec` writes `@exec <command line>` to the task log, runs the command with its stdin, stdout, and stderr passed through, then writes `@exit <code> (<duration>) <command line>` and returns the command's exit status (127 when the program was not found). The two notes are the whole convention, so a hook can write them for every command an agent runs; `docs/orbit-integration.md` has a Claude Code `PreToolUse`/`PostToolUse` recipe. `q log` takes `Q_TASK_ID` and `Q_CLAIM_TOKEN` the same way.
+
 It is off unless you run it. `--url` falls back to `Q_ORBIT_URL`, then `http://127.0.0.1:44766` (what `./rust.sh` in the Orbit repo serves). `--history` is how much of the past to draw at start (default `1h`; `all`, `30m`, `2d`, or `0`); older events still build the state, so work that is open now is drawn from its real start. Because Orbit's ring is append-only, an open span is drawn as segments every `--segment` seconds (default 10; `0` draws a span only when it ends). `--once` does one pass. A dead service fails at start; a later outage is retried with the batch kept. See `docs/orbit-integration.md` for the full mapping and what is not done.
 
 The bridge reads the log through `QueueService::events_since`, the queue-wide feed by event id, which `q serve` also exposes as `POST /v1/events_since`, so `q --server URL orbit` works too.

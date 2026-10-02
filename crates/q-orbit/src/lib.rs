@@ -10,9 +10,11 @@
 //! - an **agent** working the task is a thread of that process, named after
 //!   its agent id, with the claim as a span, `in_progress` nested inside it,
 //!   and notes, heartbeats and artifacts as instants; a `@begin`/`@end`
-//!   convention in log notes opens nested spans, and a `[name]` prefix files
-//!   a note on a named sub-thread, so parallel sub-agents show as parallel
-//!   threads;
+//!   convention in log notes opens nested spans, `@exec <command>` /
+//!   `@exit <code> <command>` (written by `q exec`) draws every process the
+//!   agent launches as a scope `$ <command>` with an `exit <code>` mark, and
+//!   a `[name]` prefix files a note on a named sub-thread, so parallel
+//!   sub-agents show as parallel threads;
 //! - **dependencies** are spans `waits on #dep` on the dependent task's main
 //!   thread, from when the bridge learns of the edge until the dependency is
 //!   done;

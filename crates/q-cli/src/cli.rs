@@ -2,15 +2,44 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-pub fn preprocess(mut args: Vec<String>) -> Vec<String> {
+/// Environment variable that stands in for the task id on `q log` and `q exec`.
+pub const TASK_ID_ENV: &str = "Q_TASK_ID";
+/// Environment variable that stands in for `--claim-token` on `q log` and `q exec`.
+pub const CLAIM_TOKEN_ENV: &str = "Q_CLAIM_TOKEN";
+
+pub fn preprocess(args: Vec<String>) -> Vec<String> {
+    let task_env = std::env::var(TASK_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    preprocess_with(args, task_env.as_deref())
+}
+
+/// Rewrite the raw arguments: a bare title becomes `add`, and `log` or
+/// `exec` without a task id gets `task_env` (`$Q_TASK_ID`) inserted, so an
+/// agent that exports its task can write `q log "note"` and `q exec -- cmd`.
+pub fn preprocess_with(mut args: Vec<String>, task_env: Option<&str>) -> Vec<String> {
     if let Some(index) = first_positional(&args) {
         let word = &args[index];
         if word != "--" && is_command(word) {
+            if let (true, Some(task)) = (takes_task_from_env(word), task_env) {
+                let after = index + 1;
+                let next = first_positional(&args[after..]).map(|offset| after + offset);
+                let has_id = next
+                    .map(|at| args[at].parse::<i64>().is_ok())
+                    .unwrap_or(false);
+                if !has_id {
+                    args.insert(next.unwrap_or(args.len()), task.trim().to_string());
+                }
+            }
             return args;
         }
         args.insert(0, "add".into());
     }
     args
+}
+
+fn takes_task_from_env(word: &str) -> bool {
+    matches!(word, "log" | "exec")
 }
 
 fn first_positional(args: &[String]) -> Option<usize> {
@@ -66,6 +95,7 @@ fn is_command(word: &str) -> bool {
             | "events"
             | "reopen"
             | "log"
+            | "exec"
             | "artifact"
             | "project"
             | "feature"
@@ -165,6 +195,7 @@ fn is_value_flag(arg: &str) -> bool {
             | "--max-failures"
             | "--stale-after"
             | "--sweep-interval"
+            | "--thread"
     )
 }
 
@@ -623,14 +654,15 @@ pub enum Commands {
     ///
     /// With a message or --artifact/--attach, append an entry. With neither,
     /// print every event for the task, oldest first: time, event, who, detail.
+    /// The id may be left out when $Q_TASK_ID is set.
     Log {
-        /// Task id.
+        /// Task id. Defaults to $Q_TASK_ID.
         id: i64,
         /// Note text, such as a thinking step or progress update.
         #[arg(value_name = "MESSAGE")]
         message: Option<String>,
         /// Token printed by `q claim`. Attributes the entry to that agent.
-        #[arg(long)]
+        #[arg(long, env = CLAIM_TOKEN_ENV, hide_env_values = true)]
         claim_token: Option<String>,
         /// Percent complete, 0 to 100. Shown in the PROG column of q ls and q top.
         #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(0..=100))]
@@ -642,6 +674,33 @@ pub enum Commands {
         /// KIND=PATH or PATH (kind defaults to report).
         #[arg(long = "attach", value_name = "[KIND=]PATH")]
         attach: Vec<PathBuf>,
+    },
+    /// Run a command and record it on the task's log as a launched process.
+    ///
+    /// Writes `@exec <command line>` before the command runs and `@exit <code>
+    /// (<duration>) <command line>` after it ends, so `q orbit` draws the
+    /// process as a scope under the agent's thread. The command's stdin,
+    /// stdout, and stderr pass through unchanged and its exit status is
+    /// returned. The id may be left out when $Q_TASK_ID is set; put `--`
+    /// before the command.
+    Exec {
+        /// Task id. Defaults to $Q_TASK_ID.
+        id: i64,
+        /// Token printed by `q claim`. Attributes the entries to that agent.
+        #[arg(long, env = CLAIM_TOKEN_ENV, hide_env_values = true)]
+        claim_token: Option<String>,
+        /// File the process under a sub-thread of the agent, as `[NAME]` does
+        /// in a note. No spaces.
+        #[arg(long, value_name = "NAME")]
+        thread: Option<String>,
+        /// The command and its arguments.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
     },
     /// Print an artifact's stored content. Ids are shown by `q show`.
     Artifact {
@@ -1124,5 +1183,94 @@ mod tests {
     fn double_dash_forces_capture() {
         let args = preprocess(vec!["--".into(), "claim".into()]);
         assert_eq!(args, vec!["add", "--", "claim"]);
+    }
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn log_and_exec_take_the_task_id_from_the_environment() {
+        // Missing id: inserted before the first positional, or appended.
+        assert_eq!(
+            preprocess_with(words(&["log", "a note"]), Some("22")),
+            vec!["log", "22", "a note"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["log"]), Some("22")),
+            vec!["log", "22"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["log", "--claim-token", "T", "a note"]), Some("22")),
+            vec!["log", "--claim-token", "T", "22", "a note"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["log", "--artifact", "pr=x"]), Some(" 22 ")),
+            vec!["log", "--artifact", "pr=x", "22"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["exec", "--", "cargo", "build"]), Some("22")),
+            vec!["exec", "22", "--", "cargo", "build"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["-j", "exec", "cargo", "build"]), Some("22")),
+            vec!["-j", "exec", "22", "cargo", "build"]
+        );
+        assert_eq!(
+            preprocess_with(
+                words(&["exec", "--thread", "bench", "--", "cargo", "bench"]),
+                Some("22")
+            ),
+            vec!["exec", "--thread", "bench", "22", "--", "cargo", "bench"]
+        );
+        // An explicit id wins; other commands and a bare title are untouched.
+        assert_eq!(
+            preprocess_with(words(&["log", "7", "a note"]), Some("22")),
+            vec!["log", "7", "a note"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["exec", "7", "--", "true"]), Some("22")),
+            vec!["exec", "7", "--", "true"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["heartbeat", "--claim-token", "T"]), Some("22")),
+            vec!["heartbeat", "--claim-token", "T"]
+        );
+        assert_eq!(
+            preprocess_with(words(&["exec the plan"]), Some("22")),
+            vec!["add", "exec the plan"]
+        );
+        // Without the variable nothing changes.
+        assert_eq!(
+            preprocess_with(words(&["log", "a note"]), None),
+            vec!["log", "a note"]
+        );
+
+        let parsed = Cli::try_parse_from([
+            "q", "exec", "22", "--thread", "bench", "--", "cargo", "bench", "--locked",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Exec {
+                id,
+                thread,
+                command,
+                ..
+            } => {
+                assert_eq!(id, 22);
+                assert_eq!(thread.as_deref(), Some("bench"));
+                assert_eq!(command, vec!["cargo", "bench", "--locked"]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let parsed =
+            Cli::try_parse_from(["q", "exec", "22", "cargo", "build", "--locked"]).unwrap();
+        match parsed.command {
+            Commands::Exec { command, .. } => {
+                assert_eq!(command, vec!["cargo", "build", "--locked"]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["q", "exec", "22"]).is_err());
     }
 }

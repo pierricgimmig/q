@@ -8,8 +8,10 @@
 //!
 //! Depths on the task's main thread: 0 status phase, 1 human and system
 //! instants, 2.. `waits on #dep` spans. Depths on an agent thread: 0
-//! `claimed`, 1 `in_progress`, 2.. notes, heartbeats, artifacts and user
-//! spans from `@begin`/`@end` notes.
+//! `claimed`, 1 `in_progress`, 2.. notes, heartbeats, artifacts, user
+//! spans from `@begin`/`@end` notes, and the processes the agent launches
+//! from `@exec <command>` / `@exit <code> <command>` notes (what `q exec`
+//! writes): a span `$ <command>` with an `exit <code>` mark where it ends.
 //!
 //! Open spans cannot be drawn until they end, since the ring in Orbit is
 //! append-only. With [`MapperOptions::segment`] set, [`Mapper::tick`] emits
@@ -44,6 +46,12 @@ const AGENT_INSTANT_DEPTH: u8 = 2;
 pub const BEGIN_MARKER: &str = "@begin";
 /// Marker that closes the innermost open span: `@end`.
 pub const END_MARKER: &str = "@end";
+/// Marker that opens a process span: `@exec <command line>`.
+pub const EXEC_MARKER: &str = "@exec";
+/// Marker that closes a process span: `@exit <code> [(<duration>)] [<command line>]`.
+pub const EXIT_MARKER: &str = "@exit";
+/// Prefix of a process span's name, before the command line.
+pub const PROCESS_PREFIX: &str = "$ ";
 
 #[derive(Debug, Clone)]
 pub struct MapperOptions {
@@ -54,6 +62,8 @@ pub struct MapperOptions {
     pub title_chars: usize,
     /// Characters of a note kept in its instant name.
     pub note_chars: usize,
+    /// Characters of a command line kept in a process span's name.
+    pub command_chars: usize,
 }
 
 impl Default for MapperOptions {
@@ -62,6 +72,7 @@ impl Default for MapperOptions {
             segment: Some(Duration::from_secs(10)),
             title_chars: 48,
             note_chars: 60,
+            command_chars: 120,
         }
     }
 }
@@ -97,6 +108,14 @@ struct OpenSpan {
     emitted_to_ns: u64,
 }
 
+/// An open span from a note on one thread: a `@begin` span, or a process
+/// span whose command line an `@exit` note names to close it.
+#[derive(Debug, Clone)]
+struct StackEntry {
+    key: SpanKey,
+    command: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct TaskState {
     pid: u32,
@@ -107,8 +126,8 @@ struct TaskState {
     thread_names: HashMap<u32, String>,
     /// The agent holding the active claim.
     agent: Option<String>,
-    /// Open `@begin` spans per thread, innermost last.
-    user_stacks: HashMap<u32, Vec<SpanKey>>,
+    /// Open `@begin` and `@exec` spans per thread, innermost last.
+    user_stacks: HashMap<u32, Vec<StackEntry>>,
     /// Dependencies already turned into wait spans.
     deps_seen: HashSet<i64>,
 }
@@ -595,8 +614,8 @@ impl Mapper {
     fn close_user_spans(&mut self, task_id: i64, end_ns: u64, out: &mut EventsBody, emit: bool) {
         let stacks = std::mem::take(&mut self.task(task_id).user_stacks);
         for (_, stack) in stacks {
-            for key in stack.into_iter().rev() {
-                self.close_span(&key, end_ns, out, emit);
+            for entry in stack.into_iter().rev() {
+                self.close_span(&entry.key, end_ns, out, emit);
             }
         }
     }
@@ -665,17 +684,7 @@ impl Mapper {
         let depth = base_depth.saturating_add(stack_len);
         match note.action {
             NoteAction::Begin(label) => {
-                self.user_seq += 1;
-                let key = SpanKey::User {
-                    task: task_id,
-                    tid,
-                    seq: self.user_seq,
-                };
-                self.task(task_id)
-                    .user_stacks
-                    .entry(tid)
-                    .or_default()
-                    .push(key.clone());
+                let key = self.push_stack(task_id, tid, None);
                 self.open_span(key, pid, tid, label, depth, ts);
             }
             NoteAction::End => {
@@ -685,8 +694,64 @@ impl Mapper {
                     .get_mut(&tid)
                     .and_then(Vec::pop);
                 match popped {
-                    Some(key) => self.close_span(&key, ts, out, emit),
+                    Some(entry) => self.close_span(&entry.key, ts, out, emit),
                     None => push_instant(out, emit, pid, tid, "@end without @begin", ts, depth),
+                }
+            }
+            NoteAction::Exec(command) => {
+                let name = format!(
+                    "{PROCESS_PREFIX}{}",
+                    trim(&command, self.options.command_chars)
+                );
+                let key = self.push_stack(task_id, tid, Some(command));
+                self.open_span(key, pid, tid, name, depth, ts);
+            }
+            NoteAction::Exit {
+                code,
+                duration,
+                command,
+            } => {
+                // The most recent open process with this command line, else
+                // the most recent open process, else nothing to close.
+                let stack = self.task(task_id).user_stacks.entry(tid).or_default();
+                let index = stack
+                    .iter()
+                    .rposition(|entry| entry.command.is_some() && entry.command == command)
+                    .or_else(|| stack.iter().rposition(|entry| entry.command.is_some()));
+                let popped = index.map(|index| stack.remove(index));
+                let mut label = format!("exit {code}");
+                if let Some(duration) = duration {
+                    label.push_str(&format!(" ({duration})"));
+                }
+                match popped {
+                    Some(entry) => {
+                        let span_depth = self
+                            .open
+                            .iter()
+                            .find(|span| span.key == entry.key)
+                            .map(|span| span.depth)
+                            .unwrap_or(depth);
+                        self.close_span(&entry.key, ts, out, emit);
+                        push_instant(
+                            out,
+                            emit,
+                            pid,
+                            tid,
+                            &label,
+                            ts,
+                            span_depth.saturating_add(1),
+                        );
+                    }
+                    None => {
+                        let name = match command {
+                            Some(command) => format!(
+                                "{label} without @exec: {}",
+                                trim(&command, self.options.command_chars)
+                            ),
+                            None => format!("{label} without @exec"),
+                        };
+                        push_instant(out, emit, pid, tid, &name, ts, depth);
+                    }
                 }
             }
             NoteAction::Text(text) => {
@@ -695,10 +760,30 @@ impl Mapper {
             }
         }
     }
+
+    /// Record a new note-opened span on a thread's stack and return its key.
+    fn push_stack(&mut self, task_id: i64, tid: u32, command: Option<String>) -> SpanKey {
+        self.user_seq += 1;
+        let key = SpanKey::User {
+            task: task_id,
+            tid,
+            seq: self.user_seq,
+        };
+        self.task(task_id)
+            .user_stacks
+            .entry(tid)
+            .or_default()
+            .push(StackEntry {
+                key: key.clone(),
+                command,
+            });
+        key
+    }
 }
 
 /// A parsed log note: optional `[thread]` prefix, then `@begin label`,
-/// `@end`, or plain text.
+/// `@end`, `@exec command`, `@exit code [(duration)] [command]`, or plain
+/// text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub thread: Option<String>,
@@ -709,13 +794,24 @@ pub struct Note {
 pub enum NoteAction {
     Begin(String),
     End,
+    /// A process was launched: the command line, whitespace collapsed.
+    Exec(String),
+    /// A process ended. `code` is the exit status as written (`0`, `101`,
+    /// `130`), `duration` the optional parenthesised text after it, and
+    /// `command` the command line that follows, if any.
+    Exit {
+        code: String,
+        duration: Option<String>,
+        command: Option<String>,
+    },
     Text(String),
 }
 
 /// Parse the note convention. `[explore] @begin Survey the API` opens a span
 /// named `Survey the API` on sub-thread `explore`; `[explore] @end` closes
-/// it; anything else is text. A `[thread]` prefix needs a non-empty name
-/// without spaces, otherwise it is text.
+/// it; `@exec cargo build` opens a process span and `@exit 0 (1.2s) cargo
+/// build` closes it; anything else is text. A `[thread]` prefix needs a
+/// non-empty name without spaces, otherwise it is text.
 pub fn parse_note(message: &str) -> Note {
     let trimmed = message.trim();
     let (thread, rest) = match trimmed.strip_prefix('[') {
@@ -738,10 +834,60 @@ pub fn parse_note(message: &str) -> Note {
         }
     } else if rest == END_MARKER || rest.starts_with(&format!("{END_MARKER} ")) {
         NoteAction::End
+    } else if let Some(command) = marker_rest(rest, EXEC_MARKER) {
+        let command = collapse(command);
+        if command.is_empty() {
+            NoteAction::Text(collapse(rest))
+        } else {
+            NoteAction::Exec(command)
+        }
+    } else if let Some(exit) = marker_rest(rest, EXIT_MARKER) {
+        parse_exit(exit).unwrap_or_else(|| NoteAction::Text(collapse(rest)))
     } else {
         NoteAction::Text(collapse(rest))
     };
     Note { thread, action }
+}
+
+/// The text after `marker` when `text` is the marker alone or the marker
+/// followed by whitespace; `@ending` is not `@end`.
+fn marker_rest<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(marker)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// `<code> [(<duration>)] [<command line>]`. The code is one token of
+/// digits, an optional leading minus, or `?` for unknown.
+fn parse_exit(text: &str) -> Option<NoteAction> {
+    let mut words = text.split_whitespace();
+    let code = words.next()?;
+    let digits = code.strip_prefix('-').unwrap_or(code);
+    let numeric = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    if code != "?" && !numeric {
+        return None;
+    }
+    let mut rest: Vec<&str> = words.collect();
+    let duration = match rest.first() {
+        Some(word) if word.starts_with('(') && word.ends_with(')') && word.len() > 2 => {
+            let word = rest.remove(0);
+            Some(word[1..word.len() - 1].to_string())
+        }
+        _ => None,
+    };
+    let command = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join(" "))
+    };
+    Some(NoteAction::Exit {
+        code: code.to_string(),
+        duration,
+        command,
+    })
 }
 
 fn collapse(text: &str) -> String {
@@ -1337,6 +1483,179 @@ mod tests {
         mapper.apply(&g, true);
         let body = mapper.apply(&events[9], true);
         assert_eq!(span(&body, "dangling").duration_ns, ns(90) - ns(47));
+    }
+
+    #[test]
+    fn exec_and_exit_notes_parse() {
+        assert_eq!(
+            parse_note("@exec cargo  build --locked"),
+            Note {
+                thread: None,
+                action: NoteAction::Exec("cargo build --locked".into()),
+            }
+        );
+        assert_eq!(
+            parse_note("[bench] @exit 0 (12.3s) cargo build --locked"),
+            Note {
+                thread: Some("bench".into()),
+                action: NoteAction::Exit {
+                    code: "0".into(),
+                    duration: Some("12.3s".into()),
+                    command: Some("cargo build --locked".into()),
+                },
+            }
+        );
+        assert_eq!(
+            parse_note("@exit 101"),
+            Note {
+                thread: None,
+                action: NoteAction::Exit {
+                    code: "101".into(),
+                    duration: None,
+                    command: None,
+                },
+            }
+        );
+        assert_eq!(
+            parse_note("@exit ? git push"),
+            Note {
+                thread: None,
+                action: NoteAction::Exit {
+                    code: "?".into(),
+                    duration: None,
+                    command: Some("git push".into()),
+                },
+            }
+        );
+        // Not the convention: a bare @exec, a non-numeric code, a longer word.
+        assert_eq!(parse_note("@exec").action, NoteAction::Text("@exec".into()));
+        assert_eq!(
+            parse_note("@exit soon").action,
+            NoteAction::Text("@exit soon".into())
+        );
+        assert_eq!(
+            parse_note("@executed the plan").action,
+            NoteAction::Text("@executed the plan".into())
+        );
+    }
+
+    #[test]
+    fn launched_processes_are_spans_under_the_agent_with_an_exit_mark() {
+        let mut mapper = Mapper::new(MapperOptions {
+            segment: None,
+            ..MapperOptions::default()
+        });
+        let events = lifecycle();
+        apply_all(&mut mapper, &events[..4]);
+        let pid = task_pid(21);
+        let agent = ("agent", Some("claude-1"));
+        let note = |id: i64, message: &str, seconds: i64| {
+            event(
+                id,
+                21,
+                "task_note",
+                agent,
+                json!({"message": message}),
+                seconds,
+            )
+        };
+        let mut body = EventsBody::unix();
+        for ev in [
+            // Inside a @begin span, a build that fails, then tests that pass.
+            note(40, "@begin Fix the parser", 40),
+            note(41, "@exec cargo build --locked", 41),
+            note(42, "@exit 101 (3.4s) cargo build --locked", 45),
+            note(43, "@exec cargo test --workspace", 46),
+            note(44, "@exit 0 (20.0s) cargo test --workspace", 66),
+            note(45, "@end", 67),
+        ] {
+            body.extend(mapper.apply(&ev, true));
+        }
+        // The process spans nest on the agent's thread under in_progress
+        // (depth 1) and the @begin span (depth 2).
+        let build = span(&body, "$ cargo build --locked");
+        assert_eq!((build.tid, build.depth), (pid + 1, AGENT_INSTANT_DEPTH + 1));
+        assert_eq!(
+            (build.start_ns, build.duration_ns),
+            (ns(41), ns(45) - ns(41))
+        );
+        let failed = instant(&body, "exit 101 (3.4s)");
+        assert_eq!(
+            (failed.tid, failed.timestamp_ns, failed.depth),
+            (pid + 1, ns(45), AGENT_INSTANT_DEPTH + 2),
+            "the exit mark sits inside the span, at its end"
+        );
+        let tests = span(&body, "$ cargo test --workspace");
+        assert_eq!(
+            (tests.depth, tests.start_ns, tests.duration_ns),
+            (AGENT_INSTANT_DEPTH + 1, ns(46), ns(66) - ns(46))
+        );
+        assert_eq!(instant(&body, "exit 0 (20.0s)").timestamp_ns, ns(66));
+        assert_eq!(span(&body, "Fix the parser").duration_ns, ns(67) - ns(40));
+        assert_eq!(mapper.open_spans(), 3, "phase, claim, in_progress");
+
+        // Overlapping processes close by command line, not by order; an
+        // @exit with no command closes the most recent process; an @exit
+        // with nothing open is a mark saying so.
+        let mut body = EventsBody::unix();
+        for ev in [
+            note(50, "@exec sleep 30", 70),
+            note(51, "@exec git push", 71),
+            note(52, "@exit 0 (5.0s) sleep 30", 75),
+            note(53, "@exit 1", 76),
+            note(54, "@exit 0 gh pr create", 77),
+        ] {
+            body.extend(mapper.apply(&ev, true));
+        }
+        let sleep = span(&body, "$ sleep 30");
+        assert_eq!(
+            (sleep.depth, sleep.duration_ns),
+            (AGENT_INSTANT_DEPTH, ns(75) - ns(70))
+        );
+        let push = span(&body, "$ git push");
+        assert_eq!(
+            (push.depth, push.duration_ns),
+            (AGENT_INSTANT_DEPTH + 1, ns(76) - ns(71))
+        );
+        assert_eq!(instant(&body, "exit 1").depth, AGENT_INSTANT_DEPTH + 2);
+        assert_eq!(
+            instant(&body, "exit 0 without @exec: gh pr create").depth,
+            AGENT_INSTANT_DEPTH
+        );
+
+        // On a sub-agent thread, and long command lines are trimmed.
+        let long = format!("@exec python3 {}", "x".repeat(200));
+        let mut body = EventsBody::unix();
+        for ev in [
+            note(60, "[bench] @exec cargo bench", 80),
+            note(61, "[bench] @exit 0 (60.0s) cargo bench", 140),
+            note(62, &long, 141),
+        ] {
+            body.extend(mapper.apply(&ev, true));
+        }
+        let bench = span(&body, "$ cargo bench");
+        assert_eq!((bench.tid, bench.depth), (pid + 2, AGENT_INSTANT_DEPTH));
+        assert_eq!(instant(&body, "exit 0 (60.0s)").tid, pid + 2);
+        assert_eq!(mapper.open_spans(), 4, "phase, claim, in_progress, python3");
+        // The dangling process closes with the claim.
+        let done = event(
+            70,
+            21,
+            "task_completed",
+            agent,
+            json!({"from": "in_progress", "to": "done", "summary": "ok"}),
+            150,
+        );
+        let body = mapper.apply(&done, true);
+        let python = body
+            .spans
+            .iter()
+            .find(|s| s.name.starts_with("$ python3 "))
+            .unwrap();
+        assert_eq!(python.name.chars().count(), 2 + 120);
+        assert!(python.name.ends_with('…'));
+        assert_eq!(python.duration_ns, ns(150) - ns(141));
+        assert_eq!(mapper.open_spans(), 0);
     }
 
     #[test]
