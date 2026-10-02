@@ -425,6 +425,52 @@ q skill install --target cursor --target agents
 
 Grok and similar agents that read Cursor skills or `~/.agents/skills` are covered by those two directories. `--target` accepts `agents`, `claude`, `cursor`, `codex`, or `all` (the default). `--force` is accepted; overwrite does not depend on it.
 
+## Spawn workers in herdr
+
+`q workers spawn N` opens a job-stealing pool in [herdr](https://herdr.dev). It does not dispatch tasks. Each worker claims the next ready task on its own through the same atomic `q claim` the single-agent loop uses, and an idle worker polls again after about 30 seconds. The phrase in the skill is **start the q worker with N workers** (or **start the queue loop with N workers**).
+
+```bash
+q workers spawn 8
+q workers spawn 8 --dry-run
+q workers spawn 9 --agent codex --columns 120 --rows 40
+```
+
+It has to run inside a herdr pane (`HERDR_ENV=1` and `HERDR_WORKSPACE_ID`). If `herdr` is not on `PATH`, the command says so and exits. `--dry-run` does not call herdr: it prints the grid and the planned commands, which is what CI runs. herdr is not a crate dependency and the test suite does not require it.
+
+What it creates, all in the current workspace:
+
+1. A tab named `workers` (`herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label workers --cwd … --focus`).
+2. N worker panes in a roughly square grid, named `worker 1` … `worker N`.
+3. One full-width pane named `q top` along the bottom of that same tab, under the whole grid. It runs `q top` with `--project` set from the same discovery as `q project show` (explicit `--project`, then `-C`, then `.agentqueue.toml` and the git remote). When discovery finds no project, `q top` is unfiltered.
+
+The grid picks columns and rows near `sqrt(N)`, then leans toward the terminal's aspect. Terminal cells are treated as about twice as tall as they are wide, so the panes come out roughly square on screen. Eight workers is 4×2 on a wide terminal (160×40) and 2×4 on a tall one (80×100). Nine is 3×3 either way. Odd counts use rows whose lengths differ by at most one, short row at the bottom of the grid, still above `q top`. The worker area keeps about 70% of a 40-row tab (the `q top` strip prefers 12 rows, clamped to 22%–40% of the height).
+
+herdr's split is binary. `herdr pane split PANE --direction right|down --ratio R --no-focus` keeps `PANE` as the first child with fraction `R` and returns the new pane at `.result.pane.pane_id`. `R` is clamped to `0.1..=0.9`, same as herdr. The root pane from `tab create` (`.result.root_pane.pane_id`) becomes worker 1. After the grid is renamed, `herdr pane run` starts `q top` in the bottom pane, then each worker gets `herdr agent start worker-N --kind KIND --pane PANE` and `herdr agent prompt`. The kind defaults to `claude` because that is herdr's kind for Claude Code. `--agent` or `$Q_WORKER_AGENT` overrides it (`codex` and `cursor` are the other kinds the README names; anything else must be one of herdr's documented `agent start` kinds). `--agent-arg` is repeated and passed after `--`.
+
+`worker-N` is both the herdr agent name and `q claim --agent`. The pane sets `Q_AGENT_HOST` to `worker N` (the pane label, including the space) and the prompt passes the same `--host`, so the `HOST` column in `q top` shows which pane claimed the task. `--model` / `$Q_AGENT_MODEL` is still the worker's own model; spawn does not invent one. `Q_SERVER_URL` and `Q_SERVER_TOKEN`, when set, are copied onto each new pane with `--env`. The dry-run prints the token as `$Q_SERVER_TOKEN` and does not echo the secret. An explicit `--db` is passed through when the queue is local. An explicit `--repo` is passed through; a repo discovered from git is not, because the scope is the project.
+
+A real run reads the tab size from `herdr pane layout --current` (the outer `area.width` / `area.height`) unless `--columns` and `--rows` are set. `--dry-run` skips that call and uses `--columns` / `--rows`, else `$COLUMNS` / `$LINES`, else 120×40. Up to 32 workers.
+
+`--dry-run` for 8 workers on a 160×40 terminal starts like this (cwd and env vary):
+
+```text
+# q workers spawn 8
+# job-stealing pool: each worker claims the next ready task on its own; there is no dispatcher
+# grid: 4x2
+#   worker 1 | worker 2 | worker 3 | worker 4
+#   worker 5 | worker 6 | worker 7 | worker 8
+#   q top (full width, below the grid; worker area ratio 0.7)
+# project: demo
+# agent: claude
+herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label workers --cwd /repo --focus --env 'Q_AGENT_HOST=worker 1'
+# $root = .result.root_pane.pane_id
+herdr pane split $root --direction down --ratio 0.7 --cwd /repo --no-focus
+# $qtop = .result.pane.pane_id
+herdr pane rename $qtop 'q top'
+```
+
+Nine workers on 120×40 prints `# grid: 3x3` and the same bottom `q top` pane. There is no second tab.
+
 ## Safety defaults
 
 - Capture is local and creates a `ready` task at low risk unless you set a higher risk. Agents may claim it at once.
@@ -433,7 +479,7 @@ Grok and similar agents that read Cursor skills or `~/.agents/skills` are covere
 - External action also needs the project policy flag.
 - `delete` removes the task from the database. `cancel` keeps the task. An active claim blocks `delete` unless `--force` is set.
 - `block`, `cancel`, `release`, `recover-stale`, and `delete` do not take a reason.
-- The queue does not launch agents, create worktrees, open pull requests, merge, deploy, or call GitHub or Linear.
+- The queue does not create worktrees, open pull requests, merge, deploy, or call GitHub or Linear. It does not launch agents either, except `q workers spawn`, which only asks herdr to start them and still does not assign tasks.
 
 ## Layout
 
