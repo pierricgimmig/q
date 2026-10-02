@@ -1349,6 +1349,207 @@ fn top_once_prints_counts_table_and_changes() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// `q top` and `q top --all` share a header and a row for the same task.
+/// Filtered modes (`--status`, `--escalated`, `--tag`, `--kind`) use that
+/// layout too; only the set of tasks changes.
+#[test]
+fn top_modes_share_the_all_table_layout() {
+    let root = temp_root("top-layout");
+    let db = root.join("queue.db");
+    let db_arg = db.to_str().unwrap();
+    let active = add_task(db_arg, "Active work", "alpha", None, None);
+    let finished = add_task(db_arg, "Finished work", "alpha", None, None);
+    let escalated = run(bin().args([
+        "--db",
+        db_arg,
+        "--json",
+        "--project",
+        "alpha",
+        "add",
+        "--kind",
+        "research",
+        "--tag",
+        "rust",
+        "Needs a human",
+    ]));
+    let escalated: Value = serde_json::from_slice(&escalated.stdout).unwrap();
+    let escalated = escalated["id"].as_i64().unwrap();
+
+    let claim = |id: i64, agent: &str| -> String {
+        let output = run(bin().args([
+            "--db",
+            db_arg,
+            "--json",
+            "claim",
+            &id.to_string(),
+            "--agent",
+            agent,
+        ]));
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["task"]["id"], id, "{body}");
+        body["claim"]["token"].as_str().unwrap().to_string()
+    };
+    let active_token = claim(active, "bot-active");
+    run(bin().args([
+        "--db",
+        db_arg,
+        "start",
+        &active.to_string(),
+        "--claim-token",
+        &active_token,
+    ]));
+    run(bin().args([
+        "--db",
+        db_arg,
+        "log",
+        &active.to_string(),
+        "halfway",
+        "--progress",
+        "40",
+        "--claim-token",
+        &active_token,
+    ]));
+    let finished_token = claim(finished, "bot-done");
+    run(bin().args([
+        "--db",
+        db_arg,
+        "start",
+        &finished.to_string(),
+        "--claim-token",
+        &finished_token,
+    ]));
+    run(bin().args([
+        "--db",
+        db_arg,
+        "complete",
+        &finished.to_string(),
+        "--claim-token",
+        &finished_token,
+        "--summary",
+        "shipped",
+        "--artifact",
+        "pr=https://example.com/pr/2",
+    ]));
+    let escalated_token = claim(escalated, "bot-esc");
+    run(bin().args([
+        "--db",
+        db_arg,
+        "escalate",
+        &escalated.to_string(),
+        "too big",
+        "--claim-token",
+        &escalated_token,
+    ]));
+
+    let frame = |args: &[&str]| -> String {
+        let mut cmd = bin();
+        cmd.args(["--db", db_arg, "--color", "never", "top", "--once"]);
+        cmd.args(args);
+        String::from_utf8(run(&mut cmd).stdout).unwrap()
+    };
+    let table_of = |text: &str| -> String {
+        let body = text.split("\n\n").nth(1).expect("table");
+        body.split("\nrecent changes")
+            .next()
+            .unwrap()
+            .trim_end()
+            .to_string()
+    };
+    let header_of =
+        |table: &str| -> String { table.lines().next().unwrap().trim_end().to_string() };
+    let row_of = |table: &str, title: &str| -> String {
+        table
+            .lines()
+            .find(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("missing {title} in {table}"))
+            .trim_end()
+            .to_string()
+    };
+    // Ages tick, but "0s ago" and "1s ago" are the same width, so the header
+    // stays put. The row compare ignores the digit.
+    let steady = |text: &str| -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index].is_ascii_digit() {
+                let start = index;
+                while index < chars.len() && chars[index].is_ascii_digit() {
+                    index += 1;
+                }
+                let tail: String = chars.iter().skip(index).take(5).collect();
+                if tail == "s ago" {
+                    out.push('T');
+                    out.push_str("s ago");
+                    index += 5;
+                    continue;
+                }
+                for ch in &chars[start..index] {
+                    out.push(*ch);
+                }
+                continue;
+            }
+            out.push(chars[index]);
+            index += 1;
+        }
+        out
+    };
+
+    let all = table_of(&frame(&["--all"]));
+    let plain = table_of(&frame(&[]));
+    let status = table_of(&frame(&["--status", "in_progress"]));
+    let only_escalated = table_of(&frame(&["--escalated"]));
+    let tagged = table_of(&frame(&["--tag", "rust"]));
+    let research = table_of(&frame(&["--kind", "research"]));
+    let all_header = header_of(&all);
+    assert!(
+        all_header.split_whitespace().any(|column| column == "PROG"),
+        "{all_header}"
+    );
+    assert!(
+        all_header.split_whitespace().any(|column| column == "PR"),
+        "{all_header}"
+    );
+    for (label, table) in [
+        ("plain", &plain),
+        ("status", &status),
+        ("escalated", &only_escalated),
+        ("tag", &tagged),
+        ("kind", &research),
+    ] {
+        assert_eq!(header_of(table), all_header, "{label}\n{table}\n{all}");
+    }
+    assert_eq!(
+        steady(&row_of(&plain, "Active work")),
+        steady(&row_of(&all, "Active work")),
+        "plain vs --all\n{plain}\n{all}"
+    );
+    assert!(row_of(&plain, "Active work").contains("40%"), "{plain}");
+    assert_eq!(
+        steady(&row_of(&status, "Active work")),
+        steady(&row_of(&all, "Active work")),
+        "{status}\n{all}"
+    );
+    assert_eq!(
+        steady(&row_of(&tagged, "Needs a human")),
+        steady(&row_of(&all, "Needs a human")),
+        "{tagged}\n{all}"
+    );
+    assert_eq!(
+        steady(&row_of(&only_escalated, "Needs a human")),
+        steady(&row_of(&all, "Needs a human")),
+        "{only_escalated}\n{all}"
+    );
+    assert_eq!(
+        steady(&row_of(&research, "Needs a human")),
+        steady(&row_of(&all, "Needs a human")),
+        "{research}\n{all}"
+    );
+    assert!(row_of(&all, "Finished work").contains("100%"), "{all}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn top_loop_reports_additions_completions_and_deletions_until_interrupted() {

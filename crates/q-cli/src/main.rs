@@ -27,8 +27,29 @@ use time::OffsetDateTime;
 use crate::cli::{Commands, FeatureCommand, ProjectCommand, TokenCommand};
 use crate::style::Paint;
 
+fn main() {
+    // Windows gives the process main thread 1 MiB. Parsing this CLI and
+    // drawing `q top` both need more than that; the other platforms start
+    // the main thread at 8 MiB. Run the real entry point on that larger stack.
+    #[cfg(windows)]
+    {
+        const STACK: usize = 8 * 1024 * 1024;
+        let joined = std::thread::Builder::new()
+            .name("q".into())
+            .stack_size(STACK)
+            .spawn(cli_main)
+            .expect("failed to start q")
+            .join();
+        if let Err(payload) = joined {
+            std::panic::resume_unwind(payload);
+        }
+    }
+    #[cfg(not(windows))]
+    cli_main();
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn cli_main() {
     init_tracing();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = cli::preprocess(raw);
@@ -1682,6 +1703,47 @@ fn is_top_quit_key(key: &KeyEvent) -> bool {
     }
 }
 
+/// True when this list filter drops tasks that `q top --all` would still show.
+fn top_filter_changes_rows(filter: &ListFilter) -> bool {
+    filter.status.is_some()
+        || filter.kind.is_some()
+        || filter
+            .feature
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || !filter.tags.is_empty()
+}
+
+/// The `q top --all` query for this project and repo. Terminal tasks stay in,
+/// and status, kind, feature, and tag filters do not.
+fn top_layout_list_filter(filter: &ListFilter, limit: u32) -> ListFilter {
+    ListFilter {
+        status: None,
+        project: filter.project.clone(),
+        repo: filter.repo.clone(),
+        kind: None,
+        feature: None,
+        limit,
+        include_terminal: true,
+        tags: Vec::new(),
+    }
+}
+
+/// Rows that decide `q top` columns and widths: the same window `q top --all`
+/// prints. When the active filter already is that query, reuse `tasks`.
+fn top_layout_tasks(
+    queue: &dyn QueueService,
+    filter: &ListFilter,
+    tasks: &[TaskSummary],
+    limit: usize,
+) -> Result<Vec<TaskSummary>, CliError> {
+    if !top_filter_changes_rows(filter) {
+        return Ok(tasks.iter().take(limit).cloned().collect());
+    }
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+    Ok(queue.list(top_layout_list_filter(filter, limit))?)
+}
+
 /// Fetch the queue, record what changed since the last frame, and render.
 fn top_frame(
     queue: &dyn QueueService,
@@ -1722,6 +1784,12 @@ fn top_frame(
         .take(options.limit)
         .cloned()
         .collect();
+    // Columns and widths come from the rows `q top --all` would print, not
+    // from this mode's subset. A filter then only changes which lines appear.
+    let mut layout = top_layout_tasks(queue, filter, &tasks, options.limit)?;
+    if layout.is_empty() {
+        layout.clone_from(&visible);
+    }
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -1741,6 +1809,7 @@ fn top_frame(
         out.push_str("no tasks\n");
     } else {
         out.push_str(&render_task_table_precise(
+            &layout,
             &visible,
             paint,
             options.stale_after,
@@ -2022,6 +2091,7 @@ fn describe_event(event: &q_core::Event, paint: Paint) -> String {
 const TITLE_MAX_CHARS: usize = 64;
 const UNASSIGNED_PROJECT: &str = "(none)";
 
+#[derive(Clone)]
 struct TaskListRow {
     id: String,
     status: String,
@@ -2060,17 +2130,24 @@ fn print_task_list(tasks: &[TaskSummary], paint: Paint) {
 }
 
 /// The table as `q top` draws it: ages tick by the second.
+/// `layout_tasks` fix the columns and widths (the `q top --all` window);
+/// `tasks` are the rows drawn under that header.
 fn render_task_table_precise(
+    layout_tasks: &[TaskSummary],
     tasks: &[TaskSummary],
     paint: Paint,
     stale_after: std::time::Duration,
 ) -> String {
     let now = OffsetDateTime::now_utc();
+    let layout_rows: Vec<TaskListRow> = layout_tasks
+        .iter()
+        .map(|task| task_list_row_with(task, now, true, Some(stale_after)))
+        .collect();
     let rows: Vec<TaskListRow> = tasks
         .iter()
         .map(|task| task_list_row_with(task, now, true, Some(stale_after)))
         .collect();
-    render_task_rows_painted(&rows, paint, true)
+    render_task_rows_with_layout(&layout_rows, &rows, paint, true)
 }
 
 fn render_task_table(tasks: &[TaskSummary], paint: Paint) -> String {
@@ -2253,8 +2330,8 @@ fn render_task_rows(rows: &[TaskListRow]) -> String {
 }
 
 /// One column of the task table. `fixed` columns always show; the others
-/// appear only when some row has a real value, so a narrow terminal is not
-/// spent on columns that are blank for every task in view.
+/// appear only when some layout row has a real value, so a narrow terminal is not
+/// spent on columns that are blank for every task in that set.
 struct TaskColumn {
     header: &'static str,
     align_right: bool,
@@ -2419,6 +2496,23 @@ fn task_cells(row: &TaskListRow, paint: Paint) -> Vec<(&str, Style, Option<&str>
 }
 
 fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> String {
+    render_task_rows_with_layout(rows, rows, paint, wide)
+}
+
+/// `layout_rows` decide which columns exist and how wide they are. `rows` are
+/// the lines printed under that header. `q ls` passes the same slice for both.
+/// `q top` passes the `q top --all` rows as the layout and the filtered rows
+/// as `rows`, so a mode cannot grow or drop a column on its own.
+fn render_task_rows_with_layout(
+    layout_rows: &[TaskListRow],
+    rows: &[TaskListRow],
+    paint: Paint,
+    wide: bool,
+) -> String {
+    let layout: Vec<Vec<(&str, Style, Option<&str>)>> = layout_rows
+        .iter()
+        .map(|row| task_cells(row, paint))
+        .collect();
     let table: Vec<Vec<(&str, Style, Option<&str>)>> =
         rows.iter().map(|row| task_cells(row, paint)).collect();
     let shown: Vec<usize> = TASK_COLUMNS
@@ -2429,7 +2523,7 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
                 return false;
             }
             column.fixed
-                || table.iter().any(|cells| {
+                || layout.iter().any(|cells| {
                     let text = cells[*index].0;
                     !text.is_empty() && !column.placeholders.contains(&text)
                 })
@@ -2440,7 +2534,12 @@ fn render_task_rows_painted(rows: &[TaskListRow], paint: Paint, wide: bool) -> S
     let align_right: Vec<bool> = shown.iter().map(|&i| TASK_COLUMNS[i].align_right).collect();
     let widths: Vec<usize> = shown
         .iter()
-        .map(|&i| column_width(TASK_COLUMNS[i].header, table.iter().map(|cells| cells[i].0)))
+        .map(|&i| {
+            column_width(
+                TASK_COLUMNS[i].header,
+                layout.iter().map(|cells| cells[i].0),
+            )
+        })
         .collect();
     let header_styles = vec![style::dim_style(); shown.len()];
     let mut lines = Vec::with_capacity(rows.len() + 1);
@@ -2946,8 +3045,8 @@ impl From<std::io::Error> for CliError {
 mod tests {
     use super::{
         capture_line, display_project, format_list_title, heartbeat_cells, is_top_quit_key,
-        render_task_rows, render_task_rows_painted, render_tree, render_tree_with, screen_frame,
-        truncate_chars, TaskListRow, TITLE_MAX_CHARS,
+        render_task_rows, render_task_rows_painted, render_task_rows_with_layout, render_tree,
+        render_tree_with, screen_frame, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3551,6 +3650,112 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
             roots: vec![],
         };
         assert_eq!(render_tree(&empty), "no tasks in Empty");
+    }
+
+    #[test]
+    fn top_rows_use_the_all_layout_including_progress() {
+        fn row(id: &str, status: &str, title: &str) -> TaskListRow {
+            TaskListRow {
+                id: id.into(),
+                status: status.into(),
+                feature: "(none)".into(),
+                project: "alpha".into(),
+                priority: "0".into(),
+                progress: String::new(),
+                updated: "1s ago".into(),
+                pr_url: None,
+                tags: String::new(),
+                fails: String::new(),
+                model: String::new(),
+                host: String::new(),
+                note: String::new(),
+                beat: String::new(),
+                stale: String::new(),
+                escalated: String::new(),
+                title: title.into(),
+                activity: String::new(),
+            }
+        }
+
+        let mut active = row("1", "in_progress", "Active work");
+        active.progress = "40%".into();
+        active.host = "cursor".into();
+        active.note = "halfway".into();
+        active.beat = "1s ago".into();
+        let mut done = row("2", "done", "Finished work");
+        done.progress = "100%".into();
+        done.pr_url = Some("https://example.com/pr/2".into());
+        let mut escalated = row("3", "escalated", "Needs a human");
+        escalated.escalated = "agent:bot · 1s ago · too big".into();
+        let layout = [escalated.clone(), done, active.clone()];
+        let reference = render_task_rows_painted(&layout, Paint::plain(), true);
+        let active_table = render_task_rows_with_layout(
+            &layout,
+            std::slice::from_ref(&active),
+            Paint::plain(),
+            true,
+        );
+        let escalated_table = render_task_rows_with_layout(
+            &layout,
+            std::slice::from_ref(&escalated),
+            Paint::plain(),
+            true,
+        );
+        let ref_lines: Vec<&str> = reference.lines().collect();
+        assert_eq!(
+            active_table.lines().next(),
+            Some(ref_lines[0]),
+            "{reference}"
+        );
+        assert_eq!(
+            escalated_table.lines().next(),
+            Some(ref_lines[0]),
+            "{reference}"
+        );
+        assert!(ref_lines[0]
+            .split_whitespace()
+            .any(|column| column == "PROG"));
+        assert!(ref_lines[0].split_whitespace().any(|column| column == "PR"));
+        let ref_active = ref_lines
+            .iter()
+            .copied()
+            .find(|line| line.contains("Active work"))
+            .unwrap();
+        let ref_escalated = ref_lines
+            .iter()
+            .copied()
+            .find(|line| line.contains("Needs a human"))
+            .unwrap();
+        assert_eq!(active_table.lines().nth(1), Some(ref_active));
+        assert_eq!(escalated_table.lines().nth(1), Some(ref_escalated));
+        assert!(ref_active.contains("40%"), "{ref_active}");
+        // No percent of its own, but the column stays because the done task is 100%.
+        let prog_at = char_index(ref_lines[0], "PROG");
+        let prog_cell: String = chars_at(ref_escalated, prog_at).chars().take(4).collect();
+        assert_eq!(prog_cell.trim(), "", "{ref_escalated}");
+
+        let alone = render_task_rows_painted(std::slice::from_ref(&active), Paint::plain(), true);
+        let alone_header = alone.lines().next().unwrap();
+        assert!(
+            !alone_header.split_whitespace().any(|column| column == "PR"),
+            "{alone_header}"
+        );
+        assert_ne!(Some(alone_header), Some(ref_lines[0]));
+
+        let colored = render_task_rows_painted(&layout, Paint::color(), true);
+        let colored_active = render_task_rows_with_layout(
+            &layout,
+            std::slice::from_ref(&active),
+            Paint::color(),
+            true,
+        );
+        let colored_line = colored
+            .lines()
+            .find(|line| line.contains("Active work"))
+            .unwrap();
+        assert_eq!(colored_active.lines().next(), colored.lines().next());
+        assert_eq!(colored_active.lines().nth(1), Some(colored_line));
+        assert!(colored_line.contains('\u{1b}'), "{colored_line:?}");
     }
 
     fn char_index(line: &str, needle: &str) -> usize {
