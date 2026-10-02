@@ -527,3 +527,19 @@ fn unreachable_server_is_a_transport_error() {
     assert!(error.to_string().contains("cannot reach"), "{error}");
     assert!(RemoteQueue::new("ftp://x", None).is_err());
 }
+
+#[test]
+fn events_since_streams_the_queue_wide_log() {
+    let server = Server::start(None);
+    let queue = server.client(None);
+    let a = queue.capture(capture("a", Actor::human(None))).unwrap();
+    let b = queue.capture(capture("b", Actor::human(None))).unwrap();
+    let all = queue.events_since(0, 100).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].task_id, Some(a.id));
+    assert_eq!(all[1].task_id, Some(b.id));
+    let tail = queue.events_since(all[0].id, 100).unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].id, all[1].id);
+    assert!(queue.events_since(all[1].id, 100).unwrap().is_empty());
+}

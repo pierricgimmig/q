@@ -940,6 +940,39 @@ fn load_artifact_content(
     Ok(ArtifactContent { artifact, content })
 }
 
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+    let payload: String = row.get(5)?;
+    let created_at: String = row.get(6)?;
+    let payload: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+    Ok(Event {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        event_type: row.get(2)?,
+        actor_type: row.get(3)?,
+        actor_id: row.get(4)?,
+        payload,
+        created_at: parse_time(6, &created_at)?,
+    })
+}
+
+/// Events of every task with `id > after_id`, oldest first.
+fn load_events_after(
+    conn: &Connection,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<Event>, QueueError> {
+    let sql = format!("{EVENT_SELECT} WHERE id > ? ORDER BY id ASC LIMIT ?");
+    let mut stmt = conn.prepare(&sql).db()?;
+    let mapped = stmt
+        .query_map(params![after_id, limit], event_from_row)
+        .db()?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.db()?);
+    }
+    Ok(rows)
+}
+
 fn load_events(
     conn: &Connection,
     task_id: Option<i64>,
@@ -963,20 +996,7 @@ fn load_events(
     };
     let mut stmt = conn.prepare(&sql).db()?;
     let mut rows = Vec::new();
-    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Event> {
-        let payload: String = row.get(5)?;
-        let created_at: String = row.get(6)?;
-        let payload: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
-        Ok(Event {
-            id: row.get(0)?,
-            task_id: row.get(1)?,
-            event_type: row.get(2)?,
-            actor_type: row.get(3)?,
-            actor_id: row.get(4)?,
-            payload,
-            created_at: parse_time(6, &created_at)?,
-        })
-    };
+    let map = event_from_row;
     if let Some(task_id) = param_task {
         let mapped = stmt.query_map(params![task_id, limit], map).db()?;
         for row in mapped {
@@ -2302,6 +2322,11 @@ impl QueueService for Queue {
         let conn = open_connection(&self.path)?;
         ensure_exists(&conn, task_id)?;
         load_events(&conn, Some(task_id), false, 1000)
+    }
+
+    fn events_since(&self, after_id: i64, limit: u32) -> Result<Vec<Event>, QueueError> {
+        let conn = open_connection(&self.path)?;
+        load_events_after(&conn, after_id, i64::from(limit.max(1)))
     }
 
     fn status(&self) -> Result<QueueStatus, QueueError> {

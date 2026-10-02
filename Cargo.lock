@@ -940,6 +940,7 @@ dependencies = [
  "q-core",
  "q-http",
  "q-mcp",
+ "q-orbit",
  "q-project",
  "q-store",
  "rusqlite",
@@ -1001,6 +1002,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "q-orbit"
+version = "0.1.0"
+dependencies = [
+ "q-core",
+ "q-store",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]

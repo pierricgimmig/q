@@ -1,0 +1,19 @@
+[package]
+name = "q-orbit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Bridge from the q event log to the Orbit live timeline"
+
+[dependencies]
+q-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+q-store.workspace = true
+uuid.workspace = true

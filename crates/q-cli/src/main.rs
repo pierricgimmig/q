@@ -230,6 +230,22 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             let cwd = base_dir(directory.as_deref())?;
             workers::run(&cli, &context, &cwd).map_err(CliError::message)
         }
+        Commands::Orbit {
+            url,
+            interval,
+            history,
+            segment,
+            once,
+        } => {
+            let options = orbit_options(*interval, history, *segment, *once)?;
+            let url = url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| env_nonempty(q_orbit::ORBIT_URL_ENV))
+                .unwrap_or_else(|| q_orbit::DEFAULT_ORBIT_URL.to_string());
+            let (queue, backend) = open_service(&cli)?;
+            run_orbit(queue, &backend, &url, options, &ui).await
+        }
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
@@ -260,6 +276,148 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             )
         }
     }
+}
+
+/// `q orbit`: tail the log and push it to Orbit until Ctrl-C.
+async fn run_orbit(
+    queue: Arc<dyn QueueService>,
+    backend: &Backend,
+    url: &str,
+    options: q_orbit::BridgeOptions,
+    ui: &Ui,
+) -> Result<(), CliError> {
+    let client =
+        q_orbit::OrbitClient::new(url).map_err(|err| CliError::message(err.to_string()))?;
+    let json = ui.json;
+    let paint = ui.out;
+    if !json {
+        println!(
+            "{} {}  orbit: {}  every {}  {}",
+            paint.bold("q orbit"),
+            backend.describe(paint),
+            paint.dim(client.url()),
+            paint.dim(&format!("{:.1}s", options.interval.as_secs_f64())),
+            if options.once {
+                paint.dim("one pass")
+            } else {
+                paint.dim("Ctrl-C quits")
+            },
+        );
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    if !options.once {
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    let worker = tokio::task::spawn_blocking(move || {
+        let stop = move || stop.load(std::sync::atomic::Ordering::Relaxed);
+        let mut on_batch = |batch: &q_orbit::bridge::BatchReport| {
+            if json {
+                return;
+            }
+            let dropped = if batch.dropped_before_start > 0 {
+                format!(", {} before capture start", batch.dropped_before_start)
+            } else {
+                String::new()
+            };
+            println!(
+                "  {}  pushed {} events, {} names (accepted {}{dropped})  {} open spans, {} active claims  {}",
+                paint.dim(&format_clock(OffsetDateTime::now_utc())),
+                batch.events,
+                batch.names,
+                batch.accepted,
+                batch.open_spans,
+                batch.active_claims,
+                paint.dim(&format!("through event {}", batch.last_event_id)),
+            );
+        };
+        q_orbit::run(queue.as_ref(), &client, &options, &stop, &mut on_batch)
+    });
+    let report = worker
+        .await
+        .map_err(|err| CliError::message(format!("orbit bridge stopped: {err}")))?
+        .map_err(|err| CliError::message(err.to_string()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "{} {} events seen, {} pushed in {} batches, {} tasks, {} open spans",
+            paint.bold("done:"),
+            report.events_seen,
+            report.pushed_events,
+            report.batches,
+            report.tasks,
+            report.open_spans,
+        );
+    }
+    Ok(())
+}
+
+fn orbit_options(
+    interval: f64,
+    history: &str,
+    segment: f64,
+    once: bool,
+) -> Result<q_orbit::BridgeOptions, CliError> {
+    if !interval.is_finite() || interval < 0.1 {
+        return Err(CliError::message("--interval must be at least 0.1 seconds"));
+    }
+    if !segment.is_finite() || segment < 0.0 {
+        return Err(CliError::message(
+            "--segment must be 0 or a positive number of seconds",
+        ));
+    }
+    let history = parse_age(history)?;
+    let mut options = q_orbit::BridgeOptions {
+        interval: std::time::Duration::from_secs_f64(interval),
+        history,
+        once,
+        ..q_orbit::BridgeOptions::default()
+    };
+    options.mapper.segment = if segment == 0.0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs_f64(segment))
+    };
+    Ok(options)
+}
+
+/// `all`, or a number with an optional unit: s, m, h, d. A bare number is seconds.
+fn parse_age(value: &str) -> Result<Option<std::time::Duration>, CliError> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    let (number, unit) = match value.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(index) => value.split_at(index),
+        None => (value, "s"),
+    };
+    let amount: f64 = number.parse().map_err(|_| {
+        CliError::message(format!(
+            "invalid duration {value:?}; use 30m, 1h, 2d, or all"
+        ))
+    })?;
+    let seconds = match unit.trim() {
+        "s" | "sec" | "secs" => amount,
+        "m" | "min" | "mins" => amount * 60.0,
+        "h" | "hr" | "hrs" => amount * 3600.0,
+        "d" | "day" | "days" => amount * 86_400.0,
+        _ => {
+            return Err(CliError::message(format!(
+                "invalid duration {value:?}; use 30m, 1h, 2d, or all"
+            )))
+        }
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(CliError::message(format!("invalid duration {value:?}")));
+    }
+    Ok(Some(std::time::Duration::from_secs_f64(seconds)))
 }
 
 /// Token file next to the database unless overridden.
@@ -1029,7 +1187,8 @@ fn dispatch(
         | Commands::Serve { .. }
         | Commands::Token { .. }
         | Commands::Skill { .. }
-        | Commands::Workers { .. } => {
+        | Commands::Workers { .. }
+        | Commands::Orbit { .. } => {
             unreachable!("handled before queue open")
         }
     }
@@ -3052,8 +3211,9 @@ impl From<std::io::Error> for CliError {
 mod tests {
     use super::{
         capture_line, display_project, format_list_title, heartbeat_cells, is_top_quit_key,
-        render_task_rows, render_task_rows_painted, render_task_rows_with_layout, render_tree,
-        render_tree_with, screen_frame, truncate_chars, TaskListRow, TITLE_MAX_CHARS,
+        orbit_options, parse_age, render_task_rows, render_task_rows_painted,
+        render_task_rows_with_layout, render_tree, render_tree_with, screen_frame, truncate_chars,
+        TaskListRow, TITLE_MAX_CHARS,
     };
     use crate::style::Paint;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -3763,6 +3923,26 @@ ID  STATUS  PROJECT  PRI  UPDATED  TITLE
         assert_eq!(colored_active.lines().next(), colored.lines().next());
         assert_eq!(colored_active.lines().nth(1), Some(colored_line));
         assert!(colored_line.contains('\u{1b}'), "{colored_line:?}");
+    }
+
+    #[test]
+    fn orbit_history_ages_parse() {
+        let secs = |value: &str| parse_age(value).unwrap().map(|d| d.as_secs());
+        assert_eq!(secs("0"), Some(0));
+        assert_eq!(secs("90"), Some(90));
+        assert_eq!(secs("30m"), Some(1800));
+        assert_eq!(secs("1h"), Some(3600));
+        assert_eq!(secs("2d"), Some(172_800));
+        assert_eq!(secs("1.5h"), Some(5400));
+        assert_eq!(secs(" all "), None);
+        assert!(parse_age("soon").is_err());
+        assert!(parse_age("1w").is_err());
+        assert!(parse_age("-1h").is_err());
+        let options = orbit_options(2.0, "1h", 0.0, true).unwrap();
+        assert_eq!(options.mapper.segment, None);
+        assert!(options.once);
+        assert!(orbit_options(0.0, "1h", 10.0, false).is_err());
+        assert!(orbit_options(2.0, "1h", -1.0, false).is_err());
     }
 
     fn char_index(line: &str, needle: &str) -> usize {

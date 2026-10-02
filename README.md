@@ -77,6 +77,21 @@ q tree --feature "Live viewer 1.0"
 
 ![q tree](docs/images/q-tree.png)
 
+## Following the queue in Orbit
+
+```bash
+q orbit
+q orbit --url http://orbit-host:44766 --history all
+q orbit --history 0 --segment 5 -i 1
+q orbit --once --json
+```
+
+`q orbit` shows queue activity on the [Orbit](https://github.com/pierricgimmig/orbit) profiler's live timeline. It tails the event log and posts to a running Orbit service (`POST /api/events`): each task is a process named `#id title`, each agent that claims it is a thread of that process, status changes are spans on the task's main thread, the claim and `in_progress` are spans on the agent's thread, and heartbeats, notes, and artifacts are marks. A note written as `[name] @begin label` ... `[name] @end` draws a span on a sub-thread called `name`, so parallel sub-agents appear as parallel threads; `@begin`/`@end` without a prefix nests on the agent's own thread. A task that depends on another shows `waits on #dep` until that task is done. Reported progress is a value lane.
+
+It is off unless you run it. `--url` falls back to `Q_ORBIT_URL`, then `http://127.0.0.1:44766` (what `./rust.sh` in the Orbit repo serves). `--history` is how much of the past to draw at start (default `1h`; `all`, `30m`, `2d`, or `0`); older events still build the state, so work that is open now is drawn from its real start. Because Orbit's ring is append-only, an open span is drawn as segments every `--segment` seconds (default 10; `0` draws a span only when it ends). `--once` does one pass. A dead service fails at start; a later outage is retried with the batch kept. See `docs/orbit-integration.md` for the full mapping and what is not done.
+
+The bridge reads the log through `QueueService::events_since`, the queue-wide feed by event id, which `q serve` also exposes as `POST /v1/events_since`, so `q --server URL orbit` works too.
+
 ## What keeps it safe
 
 - Only a human runs `q ready` and `q hold`. There is no MCP tool for either,

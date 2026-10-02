@@ -61,6 +61,12 @@ pub trait QueueService: Send + Sync {
     fn artifact(&self, artifact_id: i64) -> Result<ArtifactContent, QueueError>;
     /// Every event for a task, oldest first. This is the task's log.
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError>;
+    /// The queue-wide event feed: events of every task with an id greater
+    /// than `after_id`, oldest first, at most `limit` rows.
+    ///
+    /// Event ids are monotonic, so a consumer tails the queue by passing the
+    /// last id it saw. Used by exporters such as `q orbit`.
+    fn events_since(&self, after_id: i64, limit: u32) -> Result<Vec<Event>, QueueError>;
     fn status(&self) -> Result<QueueStatus, QueueError>;
     fn reopen(&self, id: i64, actor: crate::model::Actor) -> Result<Task, QueueError>;
 

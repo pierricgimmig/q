@@ -2629,3 +2629,40 @@ fn heartbeat_records_the_agent_activity_and_list_shows_it() {
     let row = rows.iter().find(|task| task.id == id).unwrap();
     assert_eq!(row.activity, None);
 }
+
+#[test]
+fn events_since_pages_the_whole_log_by_id() {
+    let (queue, _) = queue();
+    let first = capture(&queue, "first");
+    let second = capture(&queue, "second");
+    make_ready(&queue, first);
+    let outcome = claim(&queue, "agent-a");
+    assert!(outcome.found);
+
+    let all = queue.events_since(0, 100).unwrap();
+    assert!(all.len() >= 5, "{all:#?}");
+    let ids: Vec<i64> = all.iter().map(|event| event.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "oldest first");
+    let tasks: std::collections::HashSet<i64> =
+        all.iter().filter_map(|event| event.task_id).collect();
+    assert!(
+        tasks.contains(&first) && tasks.contains(&second),
+        "every task"
+    );
+    assert_eq!(all[0].event_type, "task_created");
+    assert_eq!(all.last().unwrap().event_type, "task_claimed");
+
+    // Paging: the cursor is the last id seen; a limit of 0 still returns one row.
+    let page = queue.events_since(0, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    let rest = queue.events_since(page[1].id, 100).unwrap();
+    assert_eq!(rest.len(), all.len() - 2);
+    assert_eq!(rest[0].id, all[2].id);
+    assert_eq!(queue.events_since(0, 0).unwrap().len(), 1);
+    assert!(queue
+        .events_since(all.last().unwrap().id, 100)
+        .unwrap()
+        .is_empty());
+}

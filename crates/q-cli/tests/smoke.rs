@@ -2536,3 +2536,63 @@ fn workers_spawn_fails_outside_herdr() {
     assert!(stderr.to_lowercase().contains("herdr"), "{stderr}");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn orbit_is_a_command_and_fails_fast_without_a_service() {
+    let root = temp_root("orbit");
+    let db = root.join("queue.db");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    // `orbit` is not rewritten into `add orbit`.
+    let output = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "orbit",
+            "--url",
+            &url,
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot reach Orbit"), "{stderr}");
+    assert!(!stderr.contains("unexpected argument"), "{stderr}");
+    let listed = run(bin().args(["--db", db.to_str().unwrap(), "ls", "--json"]));
+    let value: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        value["tasks"].as_array().unwrap().len(),
+        0,
+        "no task was captured"
+    );
+
+    // Bad durations and intervals are refused before anything is opened.
+    let output = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "orbit",
+            "--history",
+            "soon",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid duration"));
+    let output = bin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "orbit",
+            "--interval",
+            "0",
+            "--once",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--interval"));
+}

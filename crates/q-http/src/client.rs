@@ -16,8 +16,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::wire::{
-    EditBody, EditFeatureBody, EmptyBody, ErrorEnvelope, HealthBody, IdBody, ReopenBody,
-    API_PREFIX, HEALTH_PATH,
+    EditBody, EditFeatureBody, EmptyBody, ErrorEnvelope, EventsSinceBody, HealthBody, IdBody,
+    ReopenBody, API_PREFIX, HEALTH_PATH,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -188,6 +188,10 @@ impl QueueService for RemoteQueue {
 
     fn events(&self, task_id: i64) -> Result<Vec<Event>, QueueError> {
         self.call("events", &IdBody { id: task_id })
+    }
+
+    fn events_since(&self, after_id: i64, limit: u32) -> Result<Vec<Event>, QueueError> {
+        self.call("events_since", &EventsSinceBody { after_id, limit })
     }
 
     fn status(&self) -> Result<QueueStatus, QueueError> {
