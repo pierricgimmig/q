@@ -2234,3 +2234,104 @@ fn heartbeat_activity_shows_in_top_ls_and_show() {
     assert!(row["activity_at"].is_string());
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn workers_spawn_dry_run_does_not_need_herdr_or_the_database() {
+    let root = temp_root("workers");
+    init_repo(&root);
+    let db = root.join("no-such-queue.db");
+    let output = run(bin()
+        .current_dir(&root)
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("Q_SERVER_URL")
+        .env_remove("Q_SERVER_TOKEN")
+        .env_remove("Q_WORKER_AGENT")
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "workers",
+            "spawn",
+            "8",
+            "--dry-run",
+            "--columns",
+            "160",
+            "--rows",
+            "40",
+        ]));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("# grid: 4x2"), "{stdout}");
+    assert!(stdout.contains("job-stealing pool"), "{stdout}");
+    assert_eq!(stdout.matches("herdr tab create").count(), 1, "{stdout}");
+    assert!(stdout.contains("--label workers"), "{stdout}");
+    assert!(
+        stdout.contains("herdr pane rename $qtop 'q top'"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("--label 'q top'"), "{stdout}");
+    assert!(
+        stdout.contains("worker 1 | worker 2 | worker 3 | worker 4"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("--project profiler-core"), "{stdout}");
+    assert!(
+        stdout.contains("herdr agent start worker-1 --kind claude"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("herdr agent start worker-8 --kind claude"),
+        "{stdout}"
+    );
+    assert!(!db.exists(), "dry-run must not open the queue database");
+
+    let nine = run(bin()
+        .current_dir(&root)
+        .env_remove("HERDR_ENV")
+        .env_remove("Q_WORKER_AGENT")
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--json",
+            "workers",
+            "spawn",
+            "9",
+            "--dry-run",
+            "--columns",
+            "120",
+            "--rows",
+            "40",
+        ]));
+    let doc: Value = serde_json::from_slice(&nine.stdout).expect("dry-run json");
+    assert_eq!(doc["dry_run"], true);
+    assert_eq!(doc["workers"], 9);
+    assert_eq!(doc["columns"], 3);
+    assert_eq!(doc["rows"], 3);
+    assert_eq!(doc["project"], "profiler-core");
+    let script = doc["script"].as_str().unwrap();
+    assert!(script.contains("# grid: 3x3"), "{script}");
+    assert!(script.contains("q top"), "{script}");
+    assert_eq!(script.matches("herdr tab create").count(), 1, "{script}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workers_spawn_fails_outside_herdr() {
+    let root = temp_root("workers-out");
+    init_repo(&root);
+    let output = bin()
+        .current_dir(&root)
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .args(["workers", "spawn", "2", "--columns", "80", "--rows", "24"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.to_lowercase().contains("herdr"), "{stderr}");
+    let _ = fs::remove_dir_all(root);
+}

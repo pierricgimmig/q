@@ -73,6 +73,7 @@ fn is_command(word: &str) -> bool {
             | "serve"
             | "token"
             | "skill"
+            | "workers"
             | "fail"
             | "escalate"
             | "note"
@@ -681,10 +682,52 @@ pub enum Commands {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Spawn a job-stealing pool of q workers in the current herdr workspace.
+    ///
+    /// There is no dispatcher. Each worker claims the next ready task on its own.
+    Workers {
+        #[command(subcommand)]
+        command: WorkersCommand,
+    },
     /// Print or install the agent skill for q.
     Skill {
         #[command(subcommand)]
         command: Option<SkillCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkersCommand {
+    /// Open a herdr tab named "workers": N agent panes, and q top along the bottom.
+    ///
+    /// The panes form a roughly square grid. A full-width `q top` pane sits under
+    /// that grid, filtered to the current project. Each agent runs the worker loop
+    /// on its own (`worker-1` .. `worker-N`). Requires a herdr pane unless `--dry-run`.
+    Spawn {
+        /// How many workers to start.
+        #[arg(value_name = "N", value_parser = crate::workers::parse_worker_count)]
+        count: u32,
+        /// Print the herdr commands and the grid. Does not require herdr.
+        #[arg(long)]
+        dry_run: bool,
+        /// Herdr agent kind (`herdr agent start --kind`). Defaults to $Q_WORKER_AGENT or claude.
+        #[arg(long, value_name = "KIND")]
+        agent: Option<String>,
+        /// Extra argument for the agent executable, after `--`. Repeatable.
+        #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
+        agent_arg: Vec<String>,
+        /// Terminal width in columns, used to shape the grid.
+        ///
+        /// Default on a real run: the herdr tab area, else $COLUMNS, else 120.
+        /// `--dry-run` skips herdr and uses $COLUMNS or 120 unless this is set.
+        #[arg(long, value_name = "COLS", value_parser = crate::workers::parse_term_extent)]
+        columns: Option<u32>,
+        /// Terminal height in rows, used to shape the grid.
+        ///
+        /// Default on a real run: the herdr tab area, else $LINES, else 40.
+        /// `--dry-run` skips herdr and uses $LINES or 40 unless this is set.
+        #[arg(long, value_name = "ROWS", value_parser = crate::workers::parse_term_extent)]
+        rows: Option<u32>,
     },
 }
 
@@ -801,6 +844,17 @@ mod tests {
                 "research"
             ]
         );
+    }
+
+    #[test]
+    fn workers_spawn_is_not_rewritten_as_capture() {
+        let args = preprocess(vec![
+            "workers".into(),
+            "spawn".into(),
+            "8".into(),
+            "--dry-run".into(),
+        ]);
+        assert_eq!(args, vec!["workers", "spawn", "8", "--dry-run"]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: q
-description: Use the local-first q agent work queue (CLI + MCP) to capture ready or held tasks, claim/heartbeat/complete work with claim tokens, and respect the human gate plus risk/lease safety. Use when the user mentions q, the agent work queue, claiming tasks, or the held/ready workflow.
+description: Use the local-first q agent work queue (CLI + MCP) to capture ready or held tasks, claim/heartbeat/complete work with claim tokens, and respect the human gate plus risk/lease safety. Use when the user mentions q, the agent work queue, claiming tasks, the held/ready workflow, or starting the q worker (including a herdr pool via `q workers spawn`).
 ---
 
 # q agent work queue
@@ -9,7 +9,9 @@ description: Use the local-first q agent work queue (CLI + MCP) to capture ready
 
 ## Start
 
-Say **start the q worker** to run this loop. There is no `q work` command: you do the work, and `q` only tracks it.
+Say **start the q worker** to run this loop in the current session. There is no `q work` command: you do the work, and `q` only tracks it.
+
+Say **start the q worker with N workers**, or **start the queue loop with N workers**, to spawn that many independent copies of this loop in herdr instead of running it here. Run `q workers spawn N`. See [Spawn a pool](#spawn-a-pool).
 
 1. Claim one ready task with `q claim --agent ID` (MCP `queue_claim_next`). That claim is the mutual-exclusion step and it is atomic. Do not list tasks and then claim by id. If the claim finds nothing, another agent took the only eligible task or the queue is empty: wait about 30 seconds and try again.
 2. Do that one task. Do not claim a second task while this one is open, and do not abandon a claim without `q complete`, `q escalate`, `q fail`, or `q release`.
@@ -22,6 +24,24 @@ Escalated work is a human queue. Review it with `q ls --escalated` or `q top --e
 A specialized agent claims only tagged work: `q claim --agent ID --tag rust` (repeat `--tag`; MCP and HTTP `tags`). The task must carry every tag. Omit the filter to take any eligible task. Set tags at capture with `q add --tag rust` or later with `q edit ID --tag rust`. `--max-failures N` skips tasks that have already failed at least N times; omit it for no cap.
 
 `--model` or `$Q_AGENT_MODEL` records the model. The hostname is detected on this machine unless you pass `--host` or set `$Q_AGENT_HOST`. A remote `q serve` stores the host and model the client sends, not the server's hostname.
+
+## Spawn a pool
+
+`q workers spawn N` is a job-stealing pool. It does not dispatch tasks and it does not sit in the middle. It opens one herdr tab named `workers` in the current workspace (the pane's `HERDR_WORKSPACE_ID`) and tiles N panes in a roughly square grid, with one full-width pane named `q top` along the bottom. That bottom pane runs `q top` scoped to the current project (the same discovery as `q project show`: `--project`, then `-C`, then `.agentqueue.toml` and git). Each worker pane is named `worker 1` … `worker N`. herdr starts a coding agent in each one and sends it this loop. The herdr agent name and the claim `--agent` are `worker-1` … `worker-N`. The pane's `Q_AGENT_HOST` is the pane name (`worker 1`, with the space), and the prompt passes that same `--host`, so `q top` shows which pane is which.
+
+Each worker claims the next ready task itself through `q claim` / `queue_claim_next`. That claim is the steal, and it is atomic. There is no central assigner. An idle worker waits about 30 seconds and claims again. Workers do not share a task and they do not wait for a dispatcher to hand them one.
+
+```bash
+q workers spawn 8
+q workers spawn 8 --dry-run
+q workers spawn 8 --agent codex
+```
+
+`--dry-run` prints the grid and the herdr commands and does not run them, so it works without herdr installed. A real spawn fails with a clear message when `herdr` is not on `PATH`, or when this process is not a herdr pane (`HERDR_ENV=1` and `HERDR_WORKSPACE_ID`). herdr is optional: `q` shells out to the CLI and does not link against it.
+
+`--agent KIND` or `$Q_WORKER_AGENT` selects the herdr agent kind. The default is `claude` (`herdr agent start --kind claude`). `codex` and `cursor` are the other kinds named in the README; the full set is the one herdr documents for `agent start`. Repeat `--agent-arg` for arguments after `--` (for example `--agent-arg -m --agent-arg gpt-5.4`). `--columns` and `--rows` override the terminal size used to pick 4x2 versus 2x4. Eight workers is 4 columns by 2 rows on a wide terminal and 2 by 4 on a tall one. Nine is 3x3. Odd counts use rows whose lengths differ by at most one, with the short row at the bottom of the grid, still above `q top`.
+
+The commands are `herdr tab create --label workers`, `herdr pane split --direction right|down --ratio`, `herdr pane rename`, `herdr pane run` for `q top`, then `herdr agent start` and `herdr agent prompt` in each worker pane. Pane ids come back in the JSON (`.result.root_pane.pane_id`, `.result.pane.pane_id`). The split ratio is the share kept by the first child.
 
 ## Rules
 
@@ -45,7 +65,7 @@ A specialized agent claims only tagged work: `q claim --agent ID --tag rust` (re
 - No eligible work is success, not an error: `found` is false and `reason` is `no_eligible_ready_tasks`.
 - Prefer `q --json` for machine output. Logs belong on stderr. In MCP mode, stdout is protocol only.
 - If `Q_SERVER_URL` is set, every `q` command and `q mcp` talk to a shared `q serve` authority with the bearer token in `Q_SERVER_TOKEN`. Do not pass `--db` in that case. Agent tokens cannot run `q ready` or `q reopen`; the server rejects them. Clients that speak MCP over HTTP can use `$Q_SERVER_URL/mcp` with the same bearer token instead of `q mcp`.
-- The queue does not launch agents, create worktrees, open pull requests, merge, or deploy.
+- The queue does not create worktrees, open pull requests, merge, or deploy. It does not launch agents either, except `q workers spawn`, which only asks herdr to start them and still does not dispatch tasks.
 - A **feature** is an optional group of tasks that may span repos. Each task keeps its own repo and project. Pass a feature id or unique title to `q add --feature`, `q edit --feature`, `q ls --feature`, `q tree --feature`, or MCP `feature`. `q edit --clear-feature` detaches a task. Deleting a feature clears that link and keeps the tasks.
 - Every task carries a **repo** and **project** found at capture time: `--repo`/`--project` win, then `-C DIR`, then the current directory's git remote and `HEAD`, then `.agentqueue.toml` at the git root (with path rules), then the global map in `$XDG_CONFIG_HOME/q/path-map.toml`. Capture never fails outside git; the task is just unassigned. `q project show` prints what discovery found; `q project init` writes `.agentqueue.toml` (keys: `project`, `repo`, `default_kind`, `default_agent_pool`, `max_parallel_jobs`, `require_pr`, `allow_external_actions`, `stale_disposition` = `ready|blocked`, and `[[paths]]` rules). `max_parallel_jobs` counts claimed plus in-progress tasks per project.
 - Give a captured task enough to work from: `--kind` (implementation, research, review, benchmark, documentation, other), `--priority N` (higher first), `--risk` (low, medium, high, external_action), a Markdown `--body` or `--body-file PATH` with the goal, scope, deliverable and acceptance criteria (`-e` opens `$EDITOR` on a template), `--depends-on IDS`, `--capability NAME`, `--agent-pool POOL`, `--tag NAME` (repeatable). `q edit ID` changes any of these later, and `--clear-project`, `--clear-repo`, `--clear-agent-pool`, `--clear-feature`, `--clear-tags` unset them.
@@ -60,6 +80,7 @@ q ls
 q ls --all
 q ls --status held
 q top
+q workers spawn 8 --dry-run
 q show 184
 q tree 184
 q tree --feature "Cross-repo rollout"
@@ -98,6 +119,7 @@ Global flags go before the subcommand: `--db PATH`, `--server URL`, `--token TOK
 | `q "title"` / `q add TITLE` | Capture. `--hold` (`-w`, `--wait`), `--kind`, `--priority`, `--risk`, `--body`, `--body-file PATH`, `-e`/`--edit`, `--capability` (repeatable), `--agent-pool`, `--depends-on IDS`, `--feature ID\|TITLE`, `--tag` (repeatable). |
 | `q ls` (`list`) | Table of open tasks. `--status`, `--escalated`, `--kind`, `--feature`, `--tag` (every tag must match), `-a`/`--all`, `-n N`. Columns: id, status, feature, project, priority, `PROG`, updated, `PR` (a clickable link on a terminal, the URL when piped), `TAGS`, title. |
 | `q top` | Live view for humans: counts, table, recent changes. `-i SECONDS`, `--once`, `--stale-after SECONDS` (default 120), `--escalated`, `--tag`, plus the other `q ls` filters. The wide table adds `FAILS`, `MODEL`, `HOST`, `NOTE`, `BEAT`, `STALE`, and `ESCALATED` (who, when, and why). A worker whose last heartbeat is older than the threshold is marked `stale`. `q`, Esc, or Ctrl-C quits. |
+| `q workers spawn N` | Open a herdr tab named `workers` with N agent panes in a grid and a full-width `q top` pane under it, scoped to the current project. Job-stealing: each worker claims on its own. `--dry-run`, `--agent KIND` (`$Q_WORKER_AGENT`, default `claude`), `--agent-arg`, `--columns`, `--rows`. |
 | `q show ID` | One task with body, acceptance criteria, claim, artifacts (with ids and stored sizes), recent events. |
 | `q tree ID` / `q tree --feature X` | What must be done first. |
 | `q edit ID` | `--title`, `--body`, `--body-file`, `-e`, `--kind`, `--priority`, `--risk`, `--capability`, `--agent-pool`, `--depends-on`, `--feature`, `--tag`, `--clear-tags`, `--clear-*`. With no flags, opens the editor on the body. |

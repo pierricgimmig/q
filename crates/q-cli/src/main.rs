@@ -1,6 +1,7 @@
 mod cli;
 mod skill;
 mod style;
+mod workers;
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -203,6 +204,11 @@ async fn run(cli: cli::Cli) -> Result<(), CliError> {
             .await
         }
         Commands::Token { command } => token_command(&cli, command, &ui),
+        Commands::Workers { .. } => {
+            let context = resolve_context(directory.as_deref(), repo, project)?;
+            let cwd = base_dir(directory.as_deref())?;
+            workers::run(&cli, &context, &cwd).map_err(CliError::message)
+        }
         Commands::Skill { command } => match command {
             None => skill::print_skill(ui.json).map_err(CliError::message),
             Some(cli::SkillCommand::Install { target, force }) => {
@@ -1001,7 +1007,8 @@ fn dispatch(
         | Commands::Top { .. }
         | Commands::Serve { .. }
         | Commands::Token { .. }
-        | Commands::Skill { .. } => {
+        | Commands::Skill { .. }
+        | Commands::Workers { .. } => {
             unreachable!("handled before queue open")
         }
     }

@@ -85,18 +85,29 @@ q tree --feature "Live viewer 1.0"
 - `high` and `external_action` risk stay out of default claims, and a project
   with `require_pr` sends finished implementation work to `review` for a
   person to accept.
-- The queue never launches agents, opens pull requests, merges or deploys.
+- The queue never opens pull requests, merges, or deploys. It does not launch
+  agents either, except `q workers spawn`, which only asks herdr to start them.
 
 ## Agents
 
 `q skill install` writes the agent skill into `~/.claude`, `~/.codex`,
 `~/.cursor` and `~/.agents`. After it is loaded, say **start the q worker**.
 The agent claims one ready task, heartbeats about every minute, notes
-meaningful steps, then marks the task done or failed and looks again. An
-empty queue waits about 30 seconds. There is no `q work` command: the agent
-does the work, and `q` only tracks it. A failed task goes back to ready so
-another agent can take it. A task that is too big, or that the worker cannot
-do, is escalated instead and waits for a human.
+meaningful steps, then marks the task done, escalates it, or fails it, and
+looks again. An empty queue waits about 30 seconds. There is no `q work`
+command: the agent does the work, and `q` only tracks it. A failed task goes
+back to ready so another agent can take it. A task that is too big, or that
+the worker cannot do, is escalated instead and waits for a human.
+
+Say **start the q worker with 8 workers** from a pane inside
+[herdr](https://herdr.dev) and the skill runs `q workers spawn 8`. That opens
+one tab named `workers` in the current workspace: a roughly square grid of
+agent panes, and one full-width `q top` pane along the bottom scoped to the
+current project. It is a job-stealing pool. There is no dispatcher. Each
+worker claims the next ready task on its own, and idle workers keep polling.
+`--dry-run` prints the grid and the herdr commands. herdr is optional; `q`
+shells out to the `herdr` CLI and does not link against it. Outside a herdr
+pane, or if `herdr` is not installed, the command stops with an error.
 
 For MCP clients, point them at the binary:
 
