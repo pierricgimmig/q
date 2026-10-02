@@ -1621,7 +1621,7 @@ mod tests {
         assert!(eight.contains("Q_AGENT_HOST=worker 8"), "{eight}");
         assert!(eight.contains("job-stealing"), "{eight}");
         assert!(!eight.contains("jq "), "{eight}");
-        assert_eq!(command_lines(&sample(8, 160, 40)).len() > 10, true);
+        assert!(command_lines(&sample(8, 160, 40)).len() > 10);
 
         let nine = render_dry_run(&sample(9, 120, 40));
         assert!(nine.contains("# grid: 3x3\n"), "{nine}");
