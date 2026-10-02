@@ -78,8 +78,11 @@ q tree --feature "Live viewer 1.0"
 
 ## What keeps it safe
 
-- Only a human runs `q ready` and `q hold`. There is no MCP tool for either,
-  and a `q serve` agent token cannot call them.
+- Only a human runs `q ready`, `q hold`, and `q reopen`, and only a human
+  accepts a task in `review` (`q complete` with no claim token). On `q serve`
+  an agent token is refused for those. `queue_ready`, `queue_hold`, and
+  `queue_reopen` are MCP tools for a human session on `q serve` only; local
+  stdio does not offer them.
 - A claim is one `BEGIN IMMEDIATE` transaction with a lease. Two agents cannot
   take the same task; an agent that goes quiet loses it when the lease ends.
 - `high` and `external_action` risk stay out of default claims, and a project

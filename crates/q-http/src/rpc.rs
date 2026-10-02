@@ -4,7 +4,7 @@ use q_core::{
     Actor, ActorKind, BlockRequest, CancelRequest, CaptureRequest, ClaimRequest, CompleteRequest,
     CreateFeatureRequest, DeleteRequest, FailRequest, HeartbeatRequest, HoldRequest, ListFilter,
     LogRequest, NoteRequest, QueueError, QueueService, ReadyRequest, RecoverRequest,
-    ReleaseRequest, StartRequest, TreeQuery,
+    ReleaseRequest, StartRequest, TaskStatus, TreeQuery,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -98,6 +98,14 @@ pub fn dispatch(
         }
         "complete" => {
             let mut request: CompleteRequest = parse(body)?;
+            // Agents finish claimed work here, including a completion that
+            // lands in review. Accepting a task that is already in review
+            // (`q complete` with no claim token) is a human step. The store
+            // ignores any claim token on that path, so the status is what
+            // decides, not whether a token was sent.
+            if principal.role == Role::Agent {
+                deny_agent_review_acceptance(queue, request.task_id)?;
+            }
             stamp(&mut request.actor, principal);
             reply(queue.complete(request))
         }
@@ -166,6 +174,18 @@ pub fn dispatch(
             "not_found",
             format!("unknown method {other}"),
         )),
+    }
+}
+
+/// Refuse `complete` when an agent would be accepting a task already in review.
+fn deny_agent_review_acceptance(queue: &dyn QueueService, task_id: i64) -> Result<(), ErrorBody> {
+    match queue.get(task_id) {
+        Ok(detail) if detail.task.status == TaskStatus::Review => Err(ErrorBody::new(
+            "forbidden",
+            "accepting a task in review requires a human token",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) => Err(ErrorBody::from(&error)),
     }
 }
 
@@ -323,6 +343,7 @@ mod tests {
         .unwrap();
         let denied = dispatch(&Never, "mark_ready", &body, &agent).unwrap_err();
         assert_eq!(denied.code, "forbidden");
+        assert!(denied.message.contains("human token"));
         let reopen = serde_json::to_vec(&ReopenBody {
             id: 1,
             actor: Actor::human(None),
@@ -334,6 +355,14 @@ mod tests {
                 .code,
             "forbidden"
         );
+        let hold = serde_json::to_vec(&HoldRequest {
+            task_id: 1,
+            actor: Actor::human(None),
+        })
+        .unwrap();
+        let held = dispatch(&Never, "hold", &hold, &agent).unwrap_err();
+        assert_eq!(held.code, "forbidden");
+        assert!(held.message.contains("hold requires a human token"));
         assert_eq!(
             dispatch(&Never, "nope", b"{}", &agent).unwrap_err().code,
             "not_found"

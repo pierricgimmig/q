@@ -1,8 +1,10 @@
 //! `POST /mcp`: MCP over Streamable HTTP, stateless.
 //!
 //! Each request builds a fresh [`Session`] for the authenticated principal.
-//! Human principals get the triage tools (`queue_ready`, `queue_reopen`);
-//! agents do not. The session records events as the principal, so a human
+//! Human principals get the triage tools (`queue_ready`, `queue_hold`,
+//! `queue_reopen`); agents do not. Accepting a task already in `review` is
+//! refused for an agent session inside `queue_complete`. The session records
+//! events as the principal, so a human
 //! triaging from a chat app shows up as that human, not as an agent.
 //!
 //! Only the JSON response mode is implemented. `GET /mcp` (a server-push

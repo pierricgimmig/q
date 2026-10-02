@@ -107,7 +107,8 @@ impl AuthConfig {
     }
 
     /// Add a token with a fresh random secret to `path`, creating the file if
-    /// needed. Returns the secret; it is not stored anywhere else.
+    /// needed. Returns the secret. That same secret is stored in plain text
+    /// in the file (mode 0600); it is not written anywhere else.
     pub fn create_token(path: &Path, name: &str, role: Role) -> Result<String, String> {
         let name = name.trim();
         if name.is_empty() {

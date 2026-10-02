@@ -17,8 +17,9 @@
 //! Requests carry `Authorization: Bearer <value>`, where the value is either
 //! a secret from the token file or an access token this server issued. Tokens
 //! have a role. `human` tokens may call everything. `agent` tokens may not
-//! call the methods in [`crate::wire::HUMAN_ONLY_METHODS`], and any actor
-//! they send is stamped as an agent. Without a token file the server accepts
+//! call the methods in [`crate::wire::HUMAN_ONLY_METHODS`], and they may not
+//! accept a task that is already in `review`. Any actor they send is stamped
+//! as an agent. Without a token file the server accepts
 //! unauthenticated requests as an anonymous human and refuses to bind
 //! anything but a loopback address.
 

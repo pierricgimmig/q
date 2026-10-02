@@ -313,11 +313,230 @@ fn tokens_gate_access_and_roles() {
             actor: Actor::human(None),
         })
         .unwrap();
+
+    // Only humans pull work back out of the pool.
+    let held = agent
+        .hold(HoldRequest {
+            task_id: task.id,
+            actor: Actor::human(None),
+        })
+        .unwrap_err();
+    assert!(held.to_string().contains("forbidden"), "{held}");
+    assert!(
+        held.to_string().contains("hold requires a human token"),
+        "{held}"
+    );
+    assert_eq!(human.get(task.id).unwrap().task.status, TaskStatus::Ready);
+
     let claimed = agent.claim_next(ClaimRequest::new("vps-agent")).unwrap();
     assert!(claimed.found);
+    let token = claimed.claim.unwrap().token;
 
     let reopened = agent.reopen(task.id, Actor::human(None)).unwrap_err();
     assert!(reopened.to_string().contains("forbidden"), "{reopened}");
+
+    // An agent may finish claimed work into review, but not accept it.
+    let review = agent
+        .complete(CompleteRequest {
+            task_id: task.id,
+            claim_token: Some(token.clone()),
+            summary: "opening a pull request".into(),
+            target: Some(TaskStatus::Review),
+            artifacts: vec![],
+            actor: Actor::agent("vps-agent"),
+        })
+        .unwrap();
+    assert_eq!(review.task.status, TaskStatus::Review);
+
+    let accepted = agent
+        .complete(CompleteRequest {
+            task_id: task.id,
+            claim_token: None,
+            summary: "looks good".into(),
+            target: None,
+            artifacts: vec![],
+            actor: Actor::human(None),
+        })
+        .unwrap_err();
+    assert!(accepted.to_string().contains("forbidden"), "{accepted}");
+    assert!(accepted.to_string().contains("review"), "{accepted}");
+    // A claim token does not bypass the gate: the store ignores it on review.
+    let bypass = agent
+        .complete(CompleteRequest {
+            task_id: task.id,
+            claim_token: Some(token),
+            summary: "looks good".into(),
+            target: None,
+            artifacts: vec![],
+            actor: Actor::agent("vps-agent"),
+        })
+        .unwrap_err();
+    assert!(bypass.to_string().contains("forbidden"), "{bypass}");
+    assert_eq!(human.get(task.id).unwrap().task.status, TaskStatus::Review);
+
+    let done = human
+        .complete(CompleteRequest {
+            task_id: task.id,
+            claim_token: None,
+            summary: "accepted".into(),
+            target: None,
+            artifacts: vec![],
+            actor: Actor::human(Some("pierric".into())),
+        })
+        .unwrap();
+    assert_eq!(done.task.status, TaskStatus::Done);
+}
+
+#[test]
+fn mcp_over_http_gates_hold_and_review_acceptance() {
+    use serde_json::json;
+
+    let server = Server::start(Some(auth()));
+    let human = server.client(Some(HUMAN_SECRET));
+    let agent = server.client(Some(AGENT_SECRET));
+
+    let mut task = capture("From chat", Actor::human(None));
+    task.hold = false;
+    let task = human.capture(task).unwrap();
+    assert_eq!(task.status, TaskStatus::Ready);
+
+    let listed = mcp_call(
+        &server.url,
+        AGENT_SECRET,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+        }),
+    );
+    let names = tool_names(&listed);
+    assert!(!names.iter().any(|name| name == "queue_hold"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "queue_ready"), "{names:?}");
+    assert!(names.iter().any(|name| name == "queue_complete"));
+    assert!(names.iter().any(|name| name == "queue_cancel"));
+
+    let denied = mcp_call(
+        &server.url,
+        AGENT_SECRET,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "queue_hold", "arguments": {"task_id": task.id}}
+        }),
+    );
+    assert_eq!(denied["error"]["message"], "forbidden");
+    assert_eq!(denied["error"]["data"]["code"], "forbidden");
+    assert_eq!(agent.get(task.id).unwrap().task.status, TaskStatus::Ready);
+
+    let human_tools = mcp_call(
+        &server.url,
+        HUMAN_SECRET,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list"
+        }),
+    );
+    let human_names = tool_names(&human_tools);
+    assert!(human_names.iter().any(|name| name == "queue_hold"));
+    assert!(human_names.iter().any(|name| name == "queue_ready"));
+    assert!(human_names.iter().any(|name| name == "queue_reopen"));
+
+    let held = tool_text(&mcp_call(
+        &server.url,
+        HUMAN_SECRET,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "queue_hold", "arguments": {"task_id": task.id}}
+        }),
+    ));
+    assert_eq!(held["status"], "held");
+    let ready = tool_text(&mcp_call(
+        &server.url,
+        HUMAN_SECRET,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "queue_ready", "arguments": {"task_id": task.id}}
+        }),
+    ));
+    assert_eq!(ready["task"]["status"], "ready");
+
+    let claimed = agent.claim_next(ClaimRequest::new("vps-agent")).unwrap();
+    assert!(claimed.found);
+    let token = claimed.claim.unwrap().token;
+    let review = agent
+        .complete(CompleteRequest {
+            task_id: task.id,
+            claim_token: Some(token.clone()),
+            summary: "opening a pull request".into(),
+            target: Some(TaskStatus::Review),
+            artifacts: vec![],
+            actor: Actor::agent("vps-agent"),
+        })
+        .unwrap();
+    assert_eq!(review.task.status, TaskStatus::Review);
+
+    let refused = mcp_call(
+        &server.url,
+        AGENT_SECRET,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "queue_complete", "arguments": {
+                "task_id": task.id,
+                "claim_token": token,
+                "summary": "looks good"
+            }}
+        }),
+    );
+    assert_eq!(refused["error"]["data"]["code"], "forbidden");
+    assert!(refused["error"]["data"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("review"));
+    assert_eq!(human.get(task.id).unwrap().task.status, TaskStatus::Review);
+
+    let accepted = tool_text(&mcp_call(
+        &server.url,
+        HUMAN_SECRET,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "queue_complete", "arguments": {
+                "task_id": task.id,
+                "claim_token": "ignored",
+                "summary": "accepted"
+            }}
+        }),
+    ));
+    assert_eq!(accepted["status"], "done");
+}
+
+fn mcp_call(url: &str, bearer: &str, message: serde_json::Value) -> serde_json::Value {
+    ureq::post(&format!("{url}/mcp"))
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .send_json(message)
+        .unwrap()
+        .into_json()
+        .unwrap()
+}
+
+fn tool_names(listed: &serde_json::Value) -> Vec<String> {
+    listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn tool_text(body: &serde_json::Value) -> serde_json::Value {
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
 }
 
 #[test]
