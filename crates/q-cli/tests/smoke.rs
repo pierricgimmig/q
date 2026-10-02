@@ -2647,14 +2647,22 @@ fn exec_runs_the_command_and_logs_exec_and_exit_notes() {
         notes.iter().all(|(actor, _)| actor == "bot-3"),
         "{notes:#?}"
     );
-    assert_eq!(notes[0].1, format!("@exec {q} --version"));
+    // Windows paths contain `\`, which the note quotes. Unix paths do not.
+    let q_shown = if q.contains('\\') {
+        format!("'{q}'")
+    } else {
+        q.to_string()
+    };
+    assert_eq!(notes[0].1, format!("@exec {q_shown} --version"));
     let exit = &notes[1].1;
     assert!(
-        exit.starts_with("@exit 0 (") && exit.ends_with(&format!(") {q} --version")),
+        exit.starts_with("@exit 0 (") && exit.ends_with(&format!(") {q_shown} --version")),
         "{exit}"
     );
     assert!(
-        notes[2].1.starts_with(&format!("[check] @exec {q} --db ")),
+        notes[2]
+            .1
+            .starts_with(&format!("[check] @exec {q_shown} --db ")),
         "{}",
         notes[2].1
     );
